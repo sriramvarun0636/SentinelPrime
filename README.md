@@ -1,51 +1,138 @@
-# Meta Quant - Algorithmic Trading Backtesting Framework
+# Sentinel PRIME V2: An Autonomous, Multi-Regime Options Trading System
 
-![Language](https://img.shields.io/badge/Python-3.9%2B-blue.svg) ![Libraries](https://img.shields.io/badge/Libraries-Pandas%20%7C%20NumPy%20%7C%20PyTZ-orange.svg) ![Status](https://img.shields.io/badge/Status-Development-green.svg)
+![Python](https://img.shields.io/badge/python-3.9+-blue.svg) ![License](https://img.shields.io/badge/license-MIT-green.svg) ![Status](https://img.shields.io/badge/status-production_ready-brightgreen.svg)
 
-Meta Quant is a sophisticated, event-driven backtesting framework designed to test and validate algorithmic options trading strategies on Indian market indices. This project moves beyond simple signal generation to build a complete, institutional-grade simulation environment that prioritizes **adaptive risk management** and **realistic execution**.
+**Sentinel PRIME** is a professional-grade, fully autonomous, intraday options-buying system designed for the Indian equity indices (NIFTY & BANKNIFTY). It is not a simple script, but a complete, stateful, and resilient trading application built with a focus on architectural stability and sophisticated, multi-layered risk management.
 
-The system is engineered to be modular and extensible, serving as a robust platform for quantitative strategy research. It simulates trading on a minute-by-minute basis, from data ingestion and caching to dynamic position sizing and performance attribution.
+This project was developed as a deep dive into the practical challenges of building mission-critical, real-time financial systems, solving complex issues including concurrency deadlocks, low-level data handling crashes, and state corruption.
 
 ---
 
-### ► Core Philosophy: Risk-First, Adaptive Trading
+## 1. System Architecture: The "Planner-Trigger" Model
 
-The central thesis of this framework is that long-term profitability is a function of superior risk management, not just superior signals. The `PortfolioManager` is the brain of the system, enforcing a "risk-first" approach inspired by professional trading desks.
+The system's architecture is designed to solve the classic trade-off between analytical complexity and low-latency execution. It employs a decoupled **Producer-Consumer ("Planner-Trigger")** pattern to ensure stability and responsiveness. This design decouples heavy thinking from fast acting, virtually eliminating the risk of concurrency deadlocks and ensuring the system remains responsive under high load.
 
-Unlike static backtesters, Meta Quant is built on a dynamic core that adjusts to changing market conditions in real-time.
+```mermaid
+%%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#1a1a1a', 'primaryTextColor': '#e6e6e6', 'lineColor': '#8f8f8f', 'secondaryColor': '#2a2a2a'}}}%%
+graph TD
+    subgraph "Real-Time Data Plane"
+        A[KiteTicker WebSocket] -->|Live Ticks| B(PriceBus);
+        B -->|Ticks| C{TickProcessor Thread};
+        C -->|1-Min Bar Close| D((on_new_bar));
+    end
 
-### ► Key Features
+    subgraph "Strategic Planning Plane (Every 60s)"
+        E[Scheduler] -->|Triggers| F(run_strategic_planner);
+        F -->|Analyzes Data| G[RegimeClassifier];
+        G -->|Sets Context| H{{Engine State}};
+    end
+    
+    subgraph "Execution & State Plane"
+        D -- Reads --> H;
+        D -->|Signal Found| I{Strategy.evaluate};
+        I -->|Trade Params| J[risk_ok];
+        J -- Approved --> K(Trader);
+        K -->|Places/Manages Order| L[Kite Connect REST API];
+        L -->|Order Updates| A;
+        M[SQLite DB] <--> K;
+    end
 
-*   **Multi-Strategy Portfolio:** Implements a portfolio of three distinct trading models to capitalize on different market conditions:
-    1.  **`AlphaPredator` (Trend-Following):** Utilizes EMA crossovers and ADX for trading in strong, directional markets.
-    2.  **`SMCPredator` (Smart-Money Concepts):** Identifies high-probability reversals from institutional order blocks.
-    3.  **`MeanReversion` (Range-Trading):** Uses Bollinger Bands to trade pullbacks in choppy, non-trending markets.
+    subgraph "Observability Plane"
+        H -- Reports --> N[Prometheus Metrics];
+        K -- Reports --> N;
+        A -- Reports --> N;
+        D -. Alerts .-> O[Telegram];
+        K -. Alerts .-> O;
+    end
 
-*   **Adaptive Regime Engine:**
-    *   Dynamically classifies the market into **Trend (Bullish/Bearish) or Chop** regimes.
-    *   Classifies market volatility into **High, Normal, or Low** regimes.
-    *   These regimes are used to intelligently activate/deactivate strategies and modify risk parameters.
+    style A fill:#0077c8,stroke:#fff,stroke-width:2px
+    style L fill:#0077c8,stroke:#fff,stroke-width:2px
+    style B fill:#3c3c3c,stroke:#ccc
+    style C fill:#3c3c3c,stroke:#ccc
+    style E fill:#3c3c3c,stroke:#ccc
+    style F fill:#3c3c3c,stroke:#ccc
+    style D fill:#e65100,stroke:#ff9800,stroke-width:3px,color:#fff
+    style I fill:#4caf50,stroke:#fff
+    style J fill:#f44336,stroke:#fff
+    style K fill:#9c27b0,stroke:#fff
+    style G fill:#2196f3,stroke:#fff
+    style M fill:#795548,stroke:#fff
+    style H fill:#ffc107,stroke:#000,color:#000
+    style N fill:#e6522c,stroke:#fff
+    style O fill:#229ed9,stroke:#fff
+```
 
-*   **Sophisticated Risk & Position Sizing:**
-    *   **Per-Trade Risk Control:** Position size is calculated based on a fixed percentage of capital at risk.
-    *   **Dynamic Sizing Modifiers:** Position size is adaptively adjusted based on **strategy allocation, signal confidence score, and market volatility**, allowing the system to take larger risks on high-conviction setups in stable environments.
-    *   **Drawdown Circuit Breaker:** Automatically halts new trading for the day if a maximum daily drawdown limit is breached.
+*   **The Planner (`run_strategic_planner`):** A lower-priority, scheduled task that runs every 60 seconds. It performs all computationally expensive work: regime classification, multi-index analysis, and strategy selection, setting a single, clear strategic context (`active_token` and `active_strategy`).
+*   **The Trigger (`on_new_bar`):** A high-priority, real-time function that fires instantly on every 1-minute bar close. It is extremely fast, reading the pre-computed plan and performing a final, lightweight tactical signal check before execution.
 
-*   **Realistic Execution Simulation:**
-    *   **Slippage & Brokerage:** Models real-world trading costs by incorporating configurable slippage (in basis points) and per-trade brokerage fees.
-    *   **Option Delta Hedging:** Translates stop-losses from the underlying futures price to the traded option's price using an estimated delta, ensuring risk is managed on the correct instrument.
-    *   **Conservative Fill Logic:** Assumes stop-losses are hit before take-profits in ambiguous candles, preventing over-optimistic results.
+## 2. Key Features
 
-*   **Efficient Data Handling:**
-    *   **`kiteconnect` Integration:** Designed to work with the Zerodha Kite Connect API for fetching historical data and instrument lists. Includes a mock API for offline development.
-    *   **Performance Caching:** Caches instrument lists and OHLC data to the highly efficient **Parquet** format, dramatically speeding up subsequent runs and reducing API calls.
-    *   **Timezone-Aware:** All operations are strictly handled in the `Asia/Kolkata` timezone using `pytz` to prevent critical timing errors.
+### A. Adaptive Strategy Framework
+The system does not rely on a single strategy. It uses a master `RegimeClassifier` to deploy the right tool for the job based on real-time market conditions.
 
-### ► System Architecture
+| Market Regime | Strategy Deployed | Description |
+| :--- | :--- | :--- |
+| **`TRENDING_UP / DOWN`** | `TrendPullbackStrategy` | Enters on low-risk pullbacks to a key EMA during a confirmed, multi-timeframe trend. |
+| **`COMPRESSION`** | `MomentumBreakoutStrategy`| Identifies periods of low volatility (Bollinger Band "squeeze") and enters on high-volume breakouts. |
+| **`CHOP`** | `MeanReversionStrategy` | Buys on closes below the lower Bollinger Band and sells on closes above, aiming for a reversion to the mean. |
 
-The framework is architected using Object-Oriented principles to ensure modularity and extensibility.
+### B. Institutional-Grade Risk Management
+Risk control is the foundational pillar of this system, managed through multiple, automated layers.
 
-1.  **Data Layer (`fetch_*`)**: Handles all interaction with the data source (real or mock), including caching.
-2.  **Strategy Layer (`StrategyBase` subclasses)**: Encapsulates the signal generation logic for each trading model. A new strategy can be added simply by creating a new class.
-3.  **Risk Layer (`PortfolioManager`)**: The central control unit. It maintains state (capital, PnL), enforces risk rules, and has final veto power on all trading decisions.
-4.  **Orchestration Layer (`run_apex_backtest`)**: The main event loop that simulates the passage of time, feeding data to the strategies and passing signals to the portfolio manager.
+*   **Dynamic Position Sizing:** A sophisticated function that calculates trade size based on a blend of four factors:
+    1.  **Account Performance:** Uses a `performance_score` to switch between `defensive`, `standard`, and `aggressive` risk tiers.
+    2.  **Market Volatility:** Adjusts risk based on the current `VIX` level.
+    3.  **Instrument Volatility:** Normalizes position size based on the underlying's `ATR`.
+    4.  **Losing Streaks:** Automatically reduces a `risk_factor` after consecutive losses to force a cool-down period.
+
+*   **Hard Circuit Breakers:** The system enforces non-negotiable drawdown limits:
+    *   **Daily Drawdown:** A hard stop at a configurable % of the daily high-water mark, which automatically liquidates all positions and halts trading for the day.
+    *   **Weekly Drawdown:** A soft stop which forces the system into the `defensive` risk tier for the remainder of the week.
+
+### C. Production-Grade Reliability & Safety
+The system is engineered to handle real-world failures gracefully.
+
+*   **Atomic State Persistence:** Uses a "Persist Then Act" pattern with an SQLite database to prevent "ghost orders" in the event of a crash.
+*   **Startup Integrity Check:** Validates the database is readable and writeable on startup to prevent catastrophic failures like the incorrect liquidation of a live portfolio.
+*   **Graceful Shutdown:** Intercepts `Ctrl+C` signals to ensure all open positions are safely closed before the application exits.
+*   **Live Reconciliation:** A scheduled task periodically compares the bot's internal state with the broker's and will automatically flatten any "rogue" positions found.
+*   **Hardened Data Flow:** Includes a "Data Sanitization Firewall" to prevent low-level interpreter crashes and a "Stale Feed Check" to halt trading if market data is not being received.
+
+### D. Observability
+The bot integrates a lightweight **Prometheus metrics server** (via Flask + Waitress) that exposes critical real-time health and performance indicators, including:
+*   Realized & Unrealized P&L
+*   Current Daily Drawdown (%)
+*   WebSocket Connection Status
+*   Live Market Data Feed Age (seconds)
+*   Trading Halted Status
+
+This allows for professional, quantitative monitoring via a Grafana dashboard.
+
+## 3. Technology Stack
+
+*   **Language:** Python 3.9+
+*   **Core Libraries:** Pandas, NumPy, Pandas TA
+*   **API / Broker:** Zerodha Kite Connect API (REST + WebSocket)
+*   **Persistence:** SQLite
+*   **Observability:** Prometheus, Flask, Waitress
+*   **Concurrency:** Python `threading` module (with `RLock` for deadlock prevention)
+
+## 4. Performance
+
+_[This is where you will insert your results after the live paper-trading trial.]_
+
+**Example:**
+
+> The system was run in a live paper-trading environment from **[Start Date]** to **[End Date]**. The performance during this period was as follows:
+>
+> *   **Net Return:** +11.2%
+> *   **Profit Factor:** 1.82
+> *   **Win Rate:** 46%
+> *   **Average R:R:** 1 : 2.1
+> *   **Max Drawdown:** -3.5%
+>
+> A full, detailed performance report PDF is available upon request.
+
+---
+
+*This project is a personal exploration into the construction of robust, autonomous financial systems. It is not financial advice. All trading involves substantial risk.*
