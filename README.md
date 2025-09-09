@@ -8,9 +8,9 @@ This project was developed as a deep dive into the practical challenges of build
 
 ---
 
-## 1. System Architecture: The "Planner-Trigger" Model
+## 1. System Architecture: The Planner-Executor Model
 
-The system's architecture is designed to solve the classic trade-off between analytical complexity and low-latency execution. It employs a decoupled **Producer-Consumer ("Planner-Trigger")** pattern to ensure stability and responsiveness. This design decouples heavy thinking from fast acting, virtually eliminating the risk of concurrency deadlocks and ensuring the system remains responsive under high load.
+The system's architecture is designed to solve the classic trade-off between analytical complexity and low-latency execution. It employs a decoupled **Producer-Consumer ("Planner-Executor")** pattern using a thread-safe queue. This design isolates heavy computation from time-sensitive execution, eliminating concurrency deadlocks and ensuring the system remains responsive.
 
 ```mermaid
 %%{init: {'theme': 'dark', 'themeVariables': { 'primaryColor': '#1a1a1a', 'primaryTextColor': '#e6e6e6', 'lineColor': '#8f8f8f', 'secondaryColor': '#2a2a2a'}}}%%
@@ -18,56 +18,49 @@ graph TD
     subgraph "Real-Time Data Plane"
         A[KiteTicker WebSocket] -->|Live Ticks| B(PriceBus);
         B -->|Ticks| C{TickProcessor Thread};
-        C -->|1-Min Bar Close| D((on_new_bar));
+        C -->|1-Min Bar Close Event| D((Data Updated));
     end
 
-    subgraph "Strategic Planning Plane (Every 60s)"
-        E[Scheduler] -->|Triggers| F(run_strategic_planner);
-        F -->|Analyzes Data| G[RegimeClassifier];
-        G -->|Sets Context| H{{Engine State}};
+    subgraph "Strategic Planning Plane (Producer - Every 5s)"
+        E[Scheduler] -->|Triggers| F(_run_strategic_planner);
+        F -->|Analyzes Data, Runs All Logic| G{Decision Core};
+        G -->|Approved Signal & Params| H[(Trade Signal Queue)];
     end
     
-    subgraph "Execution & State Plane"
-        D -- Reads --> H;
-        D -->|Signal Found| I{Strategy.evaluate};
-        I -->|Trade Params| J[risk_ok];
-        J -- Approved --> K(Trader);
-        K -->|Places/Manages Order| L[Kite Connect REST API];
-        L -->|Order Updates| A;
-        M[SQLite DB] <--> K;
+    subgraph "Execution Plane (Consumer - Real-Time)"
+        I(_trade_executor_worker) -- Blocks & Listens --> H;
+        I -->|Executes Trade| J(Trader);
+        J -->|Places/Manages Order| K[Kite Connect REST API];
+        L[SQLite DB] <--> J;
     end
 
     subgraph "Observability Plane"
-        H -- Reports --> N[Prometheus Metrics];
-        K -- Reports --> N;
-        A -- Reports --> N;
-        D -. Alerts .-> O[Telegram];
-        K -. Alerts .-> O;
+        M[Prometheus Metrics]
+        N[Telegram Alerts]
+        F -- Reports State --> M
+        J -- Reports Actions --> M
+        J -.-> N
     end
 
     style A fill:#0077c8,stroke:#fff,stroke-width:2px
-    style L fill:#0077c8,stroke:#fff,stroke-width:2px
-    style B fill:#3c3c3c,stroke:#ccc
-    style C fill:#3c3c3c,stroke:#ccc
-    style E fill:#3c3c3c,stroke:#ccc
-    style F fill:#3c3c3c,stroke:#ccc
-    style D fill:#e65100,stroke:#ff9800,stroke-width:3px,color:#fff
-    style I fill:#4caf50,stroke:#fff
-    style J fill:#f44336,stroke:#fff
-    style K fill:#9c27b0,stroke:#fff
+    style K fill:#0077c8,stroke:#fff,stroke-width:2px
+    style D fill:#3c3c3c,stroke:#ccc
     style G fill:#2196f3,stroke:#fff
-    style M fill:#795548,stroke:#fff
-    style H fill:#ffc107,stroke:#000,color:#000
-    style N fill:#e6522c,stroke:#fff
-    style O fill:#229ed9,stroke:#fff
+    style H fill:#e65100,stroke:#ff9800,stroke-width:3px,color:#fff
+    style I fill:#4caf50,stroke:#fff
+    style J fill:#9c27b0,stroke:#fff
+    style L fill:#795548,stroke:#fff
+    style M fill:#e6522c,stroke:#fff
+    style N fill:#229ed9,stroke:#fff
 ```
 
-*   **The Planner (`run_strategic_planner`):** A lower-priority, scheduled task that runs every 60 seconds. It performs all computationally expensive work: regime classification, multi-index analysis, and strategy selection, setting a single, clear strategic context (`active_token` and `active_strategy`).
-*   **The Trigger (`on_new_bar`):** A high-priority, real-time function that fires instantly on every 1-minute bar close. It is extremely fast, reading the pre-computed plan and performing a final, lightweight tactical signal check before execution.
+* **The Planner (`_run_strategic_planner`):** A high-frequency, scheduled task that runs every 5 seconds. It performs all computationally expensive work: analyzing the latest bar data, running the `RegimeClassifier`, evaluating strategy signals, and performing master risk checks. Validated trade signals are placed onto a central queue.
+* **The Executor (`_trade_executor_worker`):** A dedicated, high-priority thread that continuously listens to the trade queue. Its sole responsibility is to instantly take validated signals off the queue and execute them via the broker API. This "acting" component is completely decoupled from the "thinking" component.
 
 ## 2. Key Features
 
 ### A. Adaptive Strategy Framework
+
 The system does not rely on a single strategy. It uses a master `RegimeClassifier` to deploy the right tool for the job based on real-time market conditions.
 
 | Market Regime | Strategy Deployed | Description |
@@ -77,61 +70,100 @@ The system does not rely on a single strategy. It uses a master `RegimeClassifie
 | **`CHOP`** | `MeanReversionStrategy` | Buys on closes below the lower Bollinger Band and sells on closes above, aiming for a reversion to the mean. |
 
 ### B. Institutional-Grade Risk Management
+
 Risk control is the foundational pillar of this system, managed through multiple, automated layers.
 
-*   **Dynamic Position Sizing:** A sophisticated function that calculates trade size based on a blend of four factors:
+* **Dynamic Position Sizing:** A sophisticated function that calculates trade size based on a blend of four factors:
     1.  **Account Performance:** Uses a `performance_score` to switch between `defensive`, `standard`, and `aggressive` risk tiers.
     2.  **Market Volatility:** Adjusts risk based on the current `VIX` level.
     3.  **Instrument Volatility:** Normalizes position size based on the underlying's `ATR`.
     4.  **Losing Streaks:** Automatically reduces a `risk_factor` after consecutive losses to force a cool-down period.
 
-*   **Hard Circuit Breakers:** The system enforces non-negotiable drawdown limits:
-    *   **Daily Drawdown:** A hard stop at a configurable % of the daily high-water mark, which automatically liquidates all positions and halts trading for the day.
-    *   **Weekly Drawdown:** A soft stop which forces the system into the `defensive` risk tier for the remainder of the week.
+* **Hard Circuit Breakers:** The system enforces non-negotiable drawdown limits:
+    * **Daily Drawdown:** A hard stop at a configurable % of the daily high-water mark, which automatically liquidates all positions and halts trading for the day.
+    * **Weekly Drawdown:** A soft stop which forces the system into the `defensive` risk tier for the remainder of the week.
 
 ### C. Production-Grade Reliability & Safety
+
 The system is engineered to handle real-world failures gracefully.
 
-*   **Atomic State Persistence:** Uses a "Persist Then Act" pattern with an SQLite database to prevent "ghost orders" in the event of a crash.
-*   **Startup Integrity Check:** Validates the database is readable and writeable on startup to prevent catastrophic failures like the incorrect liquidation of a live portfolio.
-*   **Graceful Shutdown:** Intercepts `Ctrl+C` signals to ensure all open positions are safely closed before the application exits.
-*   **Live Reconciliation:** A scheduled task periodically compares the bot's internal state with the broker's and will automatically flatten any "rogue" positions found.
-*   **Hardened Data Flow:** Includes a "Data Sanitization Firewall" to prevent low-level interpreter crashes and a "Stale Feed Check" to halt trading if market data is not being received.
+* **Atomic State Persistence:** Uses a "Persist Then Act" pattern with an SQLite database to prevent "ghost orders" in the event of a crash.
+* **Startup Integrity Check:** Validates the database is readable and writeable on startup to prevent catastrophic failures like the incorrect liquidation of a live portfolio.
+* **Graceful Shutdown:** Intercepts `Ctrl+C` signals to ensure all open positions are safely closed before the application exits.
+* **Live Reconciliation:** A scheduled task periodically compares the bot's internal state with the broker's and will automatically flatten any "rogue" positions found.
+* **Hardened Data Flow:** Includes a "Data Sanitization Firewall" to prevent low-level interpreter crashes and a "Stale Feed Check" to halt trading if market data is not being received.
 
 ### D. Observability
+
 The bot integrates a lightweight **Prometheus metrics server** (via Flask + Waitress) that exposes critical real-time health and performance indicators, including:
-*   Realized & Unrealized P&L
-*   Current Daily Drawdown (%)
-*   WebSocket Connection Status
-*   Live Market Data Feed Age (seconds)
-*   Trading Halted Status
+* Realized & Unrealized P&L
+* Current Daily Drawdown (%)
+* WebSocket Connection Status
+* Live Market Data Feed Age (seconds)
+* Trading Halted Status
 
 This allows for professional, quantitative monitoring via a Grafana dashboard.
 
 ## 3. Technology Stack
 
-*   **Language:** Python 3.9+
-*   **Core Libraries:** Pandas, NumPy, Pandas TA
-*   **API / Broker:** Zerodha Kite Connect API (REST + WebSocket)
-*   **Persistence:** SQLite
-*   **Observability:** Prometheus, Flask, Waitress
-*   **Concurrency:** Python `threading` module (with `RLock` for deadlock prevention)
+* **Language:** Python 3.9+
+* **Core Libraries:** Pandas, NumPy, Pandas TA
+* **API / Broker:** Zerodha Kite Connect API (REST + WebSocket)
+* **Persistence:** SQLite
+* **Observability:** Prometheus, Flask, Waitress
+* **Concurrency:** Python `threading` module. The system uses a decoupled Producer-Consumer architecture to manage state and prevent deadlocks.
 
-## 4. Performance
+## 4. Setup & Usage
 
-_[This is where you will insert your results after the live paper-trading trial.]_
+#### 1. Prerequisites
+* Python 3.9 or higher
+* A Zerodha Kite developer account
 
-**Example:**
+#### 2. Installation
+```bash
+# Clone the repository
+git clone [https://github.com/your-username/sentinel-prime.git](https://github.com/your-username/sentinel-prime.git)
+cd sentinel-prime
 
+# Create and activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+#### 3. Configuration
+1.  Rename `.env.example` to `.env` and fill in your Kite API keys and other secrets:
+    ```ini
+    KITE_API_KEY="your_api_key"
+    KITE_API_SECRET="your_api_secret"
+    ACCOUNT_EQUITY="100000.0"
+    TELEGRAM_BOT_TOKEN="your_telegram_bot_token"
+    TELEGRAM_CHAT_ID="your_telegram_chat_id"
+    ```
+2.  Review and modify `config.json` to tune strategy parameters and risk settings. The default configuration is included.
+
+#### 4. Running the Bot
+```bash
+python main.py
+```
+On first run, the script will prompt for a `request_token` from the Kite login flow. Subsequent runs will automatically reuse the generated `access_token.json`.
+
+## 5. 📈 Performance
+
+**[This is where you will insert your results after a live paper-trading trial.]**
+
+*Example:*
 > The system was run in a live paper-trading environment from **[Start Date]** to **[End Date]**. The performance during this period was as follows:
 >
-> *   **Net Return:** +11.2%
-> *   **Profit Factor:** 1.82
-> *   **Win Rate:** 46%
-> *   **Average R:R:** 1 : 2.1
-> *   **Max Drawdown:** -3.5%
+> * **Net Return:** +11.2%
+> * **Profit Factor:** 1.82
+> * **Win Rate:** 46%
+> * **Average R:R:** 1 : 2.1
+> * **Max Drawdown:** -3.5%
 >
-> A full, detailed performance report PDF is available upon request.
+> *A full, detailed performance report PDF is available upon request.*
 
 ---
 
