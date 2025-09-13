@@ -1,3 +1,0 @@
-timestamp,signal,entry_price,stop_loss,take_profit,position_size
-2023-01-01 11:40:00,BUY_CALL,99.15099969280256,0.95,393.75,10
-2023-01-01 13:37:00,BUY_PUT,98.52605085360992,98.58,98.38,18535
