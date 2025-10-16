@@ -71,10 +71,6 @@ def load_config(path: str = "config.json") -> Dict:
         if not all(key in config for key in required_keys):
             raise ValueError("Config file is missing one of the main keys: trading, timings, strategies, technical")
         
-        regime_params = config["strategies"]["regime_classifier"]
-        if "adx_trend_entry_threshold" not in regime_params or "adx_trend_exit_threshold" not in regime_params:
-            raise ValueError("Config is missing 'adx_trend_entry_threshold' or 'adx_trend_exit_threshold' in regime_classifier")
-        
         return config
     except FileNotFoundError:
         raise SystemExit(f"FATAL: Configuration file '{path}' not found.")
@@ -125,14 +121,18 @@ if Gauge:
     G_WS_CONNECTED = Gauge("sentinel_websocket_connected_status", "PriceBus WebSocket connection status (1 = Connected, 0 = Disconnected)")
     G_LAST_TICK_AGE_SECONDS = Gauge("sentinel_last_tick_age_seconds", "Age of the last received tick from the PriceBus in seconds")
     G_CURRENT_REGIME = Gauge("sentinel_market_regime_enum", "Current market regime as an Enum integer", labelnames=["regime_name"])
+    ### MODIFICATION START (IMPROVEMENT #4) ###
+    G_PORTFOLIO_DELTA = Gauge("sentinel_portfolio_net_delta", "Net Delta exposure of the entire portfolio")
+    G_PORTFOLIO_VEGA = Gauge("sentinel_portfolio_net_vega", "Net Vega exposure of the entire portfolio")
+    ### MODIFICATION END ###
     METRICS_APP = Flask(__name__)
     metrics = PrometheusMetrics(METRICS_APP, export_defaults=False)
 else:
     G_PNL_REALIZED = G_PNL_UNREALIZED = G_DAILY_DRAWDOWN_PCT = G_HALTED_STATUS = G_WS_CONNECTED = G_LAST_TICK_AGE_SECONDS = G_CURRENT_REGIME = None
+    G_PORTFOLIO_DELTA = G_PORTFOLIO_VEGA = None
     METRICS_APP = None
 
 def start_metrics_server(port: int = 9095):
-    """Runs the Waitress server for Flask/Prometheus in a separate daemon thread."""
     if not serve or not METRICS_APP:
         L.warning("Flask/Waitress not found. Prometheus metrics server is disabled.")
         return
@@ -235,6 +235,10 @@ class Position:
     high_price_since_entry: float = 0.0
     exit_price: Optional[float] = None
     scale_out_rules: List[ScaleOut] = field(default_factory=list)
+    ### MODIFICATION START (IMPROVEMENT #4) ###
+    # To store real-time greek values for portfolio management
+    greeks: Dict[str, float] = field(default_factory=dict)
+    ### MODIFICATION END ###
 
     def __post_init__(self):
         """Sanitizes numeric types to prevent silent crashes from NumPy types."""
@@ -260,9 +264,13 @@ class TradeSignal:
     side: OrderSide
     risk_points: float
     reward_points: float
+    ### MODIFICATION START (IMPROVEMENT #5) ###
+    # Pass vega for advanced risk sizing
+    vega: float = 0.0
+    ### MODIFICATION END ###
 
 # ==================================================================================================
-# UTILITIES & API GOVERNOR
+# UTILITIES & GREEK CALCULATIONS
 # ==================================================================================================
 def now_ist() -> datetime:
     return datetime.now(tz=IST)
@@ -284,56 +292,47 @@ def send_alert(text: str, level: str = "info"):
             L.warning(f"Telegram alert failed on attempt {attempt+1}: {e}")
             time.sleep(1)
 
-### MODIFICATION START ###
-# ADDED a more precise time-to-expiry calculation for better greeks.
 def _calculate_time_to_expiry(expiry_date: date, current_datetime: datetime, market_close_time: dtime) -> float:
     """Calculates a precise time to expiry in years for intraday greek calculations."""
     if expiry_date < current_datetime.date():
         return 1e-9
 
     trading_days_per_year = 252.0
-    
-    # Calculate full trading days remaining
     full_days_left = np.busday_count(current_datetime.date(), expiry_date)
     
-    # Calculate fraction of the current day remaining
     market_open_dt = current_datetime.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close_dt = current_datetime.replace(hour=market_close_time.hour, minute=market_close_time.minute, second=0, microsecond=0)
     
     if current_datetime < market_open_dt:
-        # Market not yet open, full day is ahead
         day_fraction = 1.0
     elif current_datetime >= market_close_dt:
-        # Market closed, no time left in this day
         day_fraction = 0.0
-        # If market is closed, busday_count might include today, which it shouldn't
         if expiry_date >= current_datetime.date():
              full_days_left = max(0, full_days_left -1)
     else:
-        # Market is open
         total_trading_seconds = (market_close_dt - market_open_dt).total_seconds()
         seconds_left = (market_close_dt - current_datetime).total_seconds()
         day_fraction = max(0.0, seconds_left / total_trading_seconds)
     
-    # If today is the expiry day, the day_fraction is the total time
     if full_days_left == 0 and expiry_date == current_datetime.date():
         return max(1e-9, day_fraction / trading_days_per_year)
 
-    # Total time is full days + fraction of today
     total_days = full_days_left + day_fraction
-    
     return max(1e-9, total_days / trading_days_per_year)
 
-### MODIFICATION END ###
-
-def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+def _get_d1_d2(S: float, K: float, T: float, r: float, sigma: float) -> Tuple[Optional[float], Optional[float]]:
     if T <= 1e-9 or sigma <= 1e-9 or S <= 0 or K <= 0:
-        return max(0.0, S - K) if is_call else max(0.0, K - S)
-    
+        return None, None
     try:
         d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
         d2 = d1 - sigma * math.sqrt(T)
+        return d1, d2
     except (ValueError, ZeroDivisionError):
+        return None, None
+
+def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
+    d1, d2 = _get_d1_d2(S, K, T, r, sigma)
+    if d1 is None:
         return max(0.0, S - K) if is_call else max(0.0, K - S)
         
     N = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
@@ -345,13 +344,33 @@ def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, is
     return price
 
 def bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
-    if T <= 1e-6 or sigma <= 1e-6 or S <= 0 or K <= 0:
+    d1, _ = _get_d1_d2(S, K, T, r, sigma)
+    if d1 is None:
         return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
-    try:
-        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-        return (0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))) if is_call else (0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0))) - 1.0)
-    except Exception:
-        return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
+    
+    N = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    return N(d1) if is_call else N(d1) - 1.0
+
+### MODIFICATION START (IMPROVEMENT #4 & #5) ###
+# Added Vega calculation for advanced risk management
+def bs_vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    d1, _ = _get_d1_d2(S, K, T, r, sigma)
+    if d1 is None:
+        return 0.0
+    
+    # N'(x) is the PDF of the standard normal distribution
+    n_prime = lambda x: (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * x**2)
+    
+    # Vega is returned per 1% change in IV, so we divide by 100
+    return S * n_prime(d1) * math.sqrt(T) / 100.0
+
+def calculate_greeks(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> Dict[str, float]:
+    """Calculates primary greeks for a given option."""
+    return {
+        "delta": bs_delta(S, K, T, r, sigma, is_call),
+        "vega": bs_vega(S, K, T, r, sigma)
+    }
+### MODIFICATION END ###
 
 def _get_underlying(tradingsymbol: str) -> str:
     upper_symbol = tradingsymbol.upper()
@@ -444,7 +463,6 @@ class Store:
         return sqlite3.connect(self.path, check_same_thread=False, timeout=10)
 
     def _initialize_db(self):
-        """Initializes and validates the database with migration and a write/read check."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("PRAGMA user_version")
@@ -485,6 +503,17 @@ class Store:
                 db_version = 2
                 L.info("Migration to version 2 complete.")
             
+            ### MODIFICATION START (IMPROVEMENT #4) ###
+            if db_version < 3:
+                L.info("Applying migration to version 3...")
+                try:
+                    cursor.execute("ALTER TABLE positions ADD COLUMN greeks TEXT DEFAULT '{}'")
+                except sqlite3.OperationalError as e:
+                    L.warning(f"Could not add greeks column in migration 3, it may already exist: {e}")
+                cursor.execute("PRAGMA user_version = 3")
+                L.info("Migration to version 3 complete.")
+            ### MODIFICATION END ###
+
             try:
                 validation_time = datetime.now(IST).isoformat()
                 cursor.execute("REPLACE INTO meta (key, value) VALUES ('db_startup_validation', ?)", (validation_time,))
@@ -500,13 +529,14 @@ class Store:
 
     def upsert_position(self, p: Position):
         sql = """
-            INSERT INTO positions (id, tradingsymbol, token, option_type, qty, initial_qty, entry_price, initial_sl_price, sl_price, tp_price, opened_at, strategy, market_regime_at_entry, underlying_sl_level, status, entry_order_id, slm_order_id, tp_order_id, scaled_out_qty, breakeven_armed, trailing_sl_armed, initial_risk_points, option_sl_points, option_tp_points, high_price_since_entry, scale_out_rules, exit_order_id, exit_reason, exit_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (id, tradingsymbol, token, option_type, qty, initial_qty, entry_price, initial_sl_price, sl_price, tp_price, opened_at, strategy, market_regime_at_entry, underlying_sl_level, status, entry_order_id, slm_order_id, tp_order_id, scaled_out_qty, breakeven_armed, trailing_sl_armed, initial_risk_points, option_sl_points, option_tp_points, high_price_since_entry, scale_out_rules, exit_order_id, exit_reason, exit_price, greeks)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                qty=excluded.qty, sl_price=excluded.sl_price, tp_price=excluded.tp_price, status=excluded.status, slm_order_id=excluded.slm_order_id, tp_order_id=excluded.tp_order_id, scaled_out_qty=excluded.scaled_out_qty, breakeven_armed=excluded.breakeven_armed, trailing_sl_armed=excluded.trailing_sl_armed, high_price_since_entry=excluded.high_price_since_entry, scale_out_rules=excluded.scale_out_rules, entry_price=excluded.entry_price, opened_at=excluded.opened_at, entry_order_id=excluded.entry_order_id, exit_order_id=excluded.exit_order_id, exit_reason=excluded.exit_reason, exit_price=excluded.exit_price
+                qty=excluded.qty, sl_price=excluded.sl_price, tp_price=excluded.tp_price, status=excluded.status, slm_order_id=excluded.slm_order_id, tp_order_id=excluded.tp_order_id, scaled_out_qty=excluded.scaled_out_qty, breakeven_armed=excluded.breakeven_armed, trailing_sl_armed=excluded.trailing_sl_armed, high_price_since_entry=excluded.high_price_since_entry, scale_out_rules=excluded.scale_out_rules, entry_price=excluded.entry_price, opened_at=excluded.opened_at, entry_order_id=excluded.entry_order_id, exit_order_id=excluded.exit_order_id, exit_reason=excluded.exit_reason, exit_price=excluded.exit_price, greeks=excluded.greeks
         """
         rules_json = json.dumps([s.__dict__ for s in p.scale_out_rules])
-        params = (p.id, p.tradingsymbol, p.token, p.option_type, p.qty, p.initial_qty, p.entry_price, p.initial_sl_price, p.sl_price, p.tp_price, p.opened_at.isoformat(), p.strategy, p.market_regime_at_entry, p.underlying_sl_level, p.status, p.entry_order_id, p.slm_order_id, p.tp_order_id, p.scaled_out_qty, int(p.breakeven_armed), int(p.trailing_sl_armed), p.initial_risk_points, p.option_sl_points, p.option_tp_points, p.high_price_since_entry, rules_json, p.exit_order_id, p.exit_reason, p.exit_price)
+        greeks_json = json.dumps(p.greeks)
+        params = (p.id, p.tradingsymbol, p.token, p.option_type, p.qty, p.initial_qty, p.entry_price, p.initial_sl_price, p.sl_price, p.tp_price, p.opened_at.isoformat(), p.strategy, p.market_regime_at_entry, p.underlying_sl_level, p.status, p.entry_order_id, p.slm_order_id, p.tp_order_id, p.scaled_out_qty, int(p.breakeven_armed), int(p.trailing_sl_armed), p.initial_risk_points, p.option_sl_points, p.option_tp_points, p.high_price_since_entry, rules_json, p.exit_order_id, p.exit_reason, p.exit_price, greeks_json)
         with self.lock, self._get_connection() as conn:
             conn.execute(sql, params)
             conn.commit()
@@ -530,8 +560,9 @@ class Store:
         positions = {}
         for r_dict in [dict(row) for row in rows]:
             scale_rules_data = json.loads(r_dict.get("scale_out_rules", '[]'))
+            greeks_data = json.loads(r_dict.get("greeks", '{}'))
             scale_rules = [ScaleOut(**data) for data in scale_rules_data]
-            pos = Position(id=r_dict["id"], tradingsymbol=r_dict["tradingsymbol"], token=r_dict["token"], option_type=r_dict["option_type"], qty=r_dict["qty"], initial_qty=r_dict["initial_qty"], entry_price=r_dict["entry_price"], initial_sl_price=r_dict["initial_sl_price"], sl_price=r_dict["sl_price"], tp_price=r_dict["tp_price"], opened_at=datetime.fromisoformat(r_dict["opened_at"]), strategy=r_dict["strategy"], market_regime_at_entry=r_dict["market_regime_at_entry"], underlying_sl_level=r_dict["underlying_sl_level"], status=r_dict["status"], entry_order_id=r_dict["entry_order_id"], slm_order_id=r_dict["slm_order_id"], tp_order_id=r_dict["tp_order_id"], scaled_out_qty=r_dict["scaled_out_qty"], breakeven_armed=bool(r_dict.get("breakeven_armed")), trailing_sl_armed=bool(r_dict.get("trailing_sl_armed")), initial_risk_points=r_dict["initial_risk_points"], option_sl_points=r_dict["option_sl_points"], option_tp_points=r_dict["option_tp_points"], high_price_since_entry=r_dict["high_price_since_entry"], scale_out_rules=scale_rules, exit_order_id=r_dict.get("exit_order_id"), exit_reason=r_dict.get("exit_reason"), exit_price=r_dict.get("exit_price"))
+            pos = Position(id=r_dict["id"], tradingsymbol=r_dict["tradingsymbol"], token=r_dict["token"], option_type=r_dict["option_type"], qty=r_dict["qty"], initial_qty=r_dict["initial_qty"], entry_price=r_dict["entry_price"], initial_sl_price=r_dict["initial_sl_price"], sl_price=r_dict["sl_price"], tp_price=r_dict["tp_price"], opened_at=datetime.fromisoformat(r_dict["opened_at"]), strategy=r_dict["strategy"], market_regime_at_entry=r_dict["market_regime_at_entry"], underlying_sl_level=r_dict["underlying_sl_level"], status=r_dict["status"], entry_order_id=r_dict["entry_order_id"], slm_order_id=r_dict["slm_order_id"], tp_order_id=r_dict["tp_order_id"], scaled_out_qty=r_dict["scaled_out_qty"], breakeven_armed=bool(r_dict.get("breakeven_armed")), trailing_sl_armed=bool(r_dict.get("trailing_sl_armed")), initial_risk_points=r_dict["initial_risk_points"], option_sl_points=r_dict["option_sl_points"], option_tp_points=r_dict["option_tp_points"], high_price_since_entry=r_dict["high_price_since_entry"], scale_out_rules=scale_rules, exit_order_id=r_dict.get("exit_order_id"), exit_reason=r_dict.get("exit_reason"), exit_price=r_dict.get("exit_price"), greeks=greeks_data)
             positions[pos.id] = pos
         return positions
 
@@ -562,7 +593,7 @@ class Store:
         return row[0] if row else default
 
 # ==================================================================================================
-# DATA MANAGEMENT
+# DATA MANAGEMENT (No changes in this section)
 # ==================================================================================================
 class InstrumentBook:
     def __init__(self, kite: GovernedKite, store: Store):
@@ -818,7 +849,12 @@ class RegimeClassifier:
         df.ta.adx(length=self.params["adx_period"], append=True)
         bbands = df.ta.bbands(length=self.params["bb_period"], append=True)
         df['bbw'] = (bbands[f'BBU_{self.params["bb_period"]}_2.0'] - bbands[f'BBL_{self.params["bb_period"]}_2.0']) / bbands[f'BBM_{self.params["bb_period"]}_2.0']
-        df['bbw_rank'] = df['bbw'].rolling(self.params["bbw_rank_period"]).rank(pct=True) * 100
+        ### MODIFICATION START (IMPROVEMENT #3) ###
+        # Using percentile ranks for adaptive thresholds
+        lookback = self.params.get("dynamic_regime_lookback", 200)
+        df['bbw_pct_rank'] = df['bbw'].rolling(lookback).rank(pct=True) * 100
+        df['adx_pct_rank'] = df[f'ADX_{self.params["adx_period"]}'].rolling(lookback).rank(pct=True) * 100
+        ### MODIFICATION END ###
         df['ema_fast'] = df.ta.ema(length=20)
         df['ema_slow'] = df.ta.ema(length=50)
         return df
@@ -826,16 +862,32 @@ class RegimeClassifier:
     def _get_scores(self, df: pd.DataFrame, current_regime_enum: Regime) -> Dict[str, int]:
         scores = {"trend_up": 0, "trend_down": 0, "chop": 0, "compression": 0}
         if len(df) < 60: return scores
-        adx_col, dmp_col, dmn_col = f'ADX_{self.params["adx_period"]}', f'DMP_{self.params["adx_period"]}', f'DMN_{self.params["adx_period"]}'
-        if df['bbw_rank'].iloc[-1] < self.params["compression_rank_threshold"]: scores["compression"] += 2
-        if df['bbw_rank'].iloc[-1] > 70: scores["chop"] += 1
-        adx_val = df[adx_col].iloc[-1]
-        if adx_val < self.params["adx_trend_exit_threshold"]: scores["chop"] += 1
+        dmp_col, dmn_col = f'DMP_{self.params["adx_period"]}', f'DMN_{self.params["adx_period"]}'
+
+        ### MODIFICATION START (IMPROVEMENT #3) ###
+        # Logic now uses percentile ranks from config instead of fixed values
+        compression_threshold = self.params.get("compression_rank_threshold_pct", 10.0)
+        adx_entry_threshold_pct = self.params.get("adx_trend_entry_percentile", 75.0)
+        adx_exit_threshold_pct = self.params.get("adx_trend_exit_percentile", 60.0)
+        
+        if df['bbw_pct_rank'].iloc[-1] < compression_threshold: 
+            scores["compression"] += 2
+        
         is_trending = current_regime_enum in [Regime.TRENDING_UP, Regime.TRENDING_DOWN]
-        adx_is_trending = adx_val > (self.params["adx_trend_exit_threshold"] if is_trending else self.params["adx_trend_entry_threshold"])
-        if adx_is_trending:
-            if df['ema_fast'].iloc[-1] > df['ema_slow'].iloc[-1] and df[dmp_col].iloc[-1] > df[dmn_col].iloc[-1]: scores["trend_up"] += 2
-            elif df['ema_fast'].iloc[-1] < df['ema_slow'].iloc[-1] and df[dmn_col].iloc[-1] > df[dmp_col].iloc[-1]: scores["trend_down"] += 2
+        adx_threshold = adx_exit_threshold_pct if is_trending else adx_entry_threshold_pct
+        
+        adx_pct_rank_val = df['adx_pct_rank'].iloc[-1]
+        
+        if adx_pct_rank_val < adx_exit_threshold_pct:
+            scores["chop"] += 1
+        
+        if adx_pct_rank_val > adx_threshold:
+            if df['ema_fast'].iloc[-1] > df['ema_slow'].iloc[-1] and df[dmp_col].iloc[-1] > df[dmn_col].iloc[-1]: 
+                scores["trend_up"] += 2
+            elif df['ema_fast'].iloc[-1] < df['ema_slow'].iloc[-1] and df[dmn_col].iloc[-1] > df[dmp_col].iloc[-1]: 
+                scores["trend_down"] += 2
+        ### MODIFICATION END ###
+        
         return scores
 
     def get_raw_classification(self, current_regime_enum: Regime) -> Tuple[Regime, Optional[int]]:
@@ -847,7 +899,7 @@ class RegimeClassifier:
             score_n, score_bn = self._get_scores(df_n, current_regime_enum), self._get_scores(df_bn, current_regime_enum)
             
             vix_ltp = self.prices.ltp(self.vix_token)
-            if vix_ltp and vix_ltp > self.params["vix_chaos_threshold"]: 
+            if vix_ltp and vix_ltp > self.params.get("vix_chaos_threshold", 24.0): 
                 return (Regime.CHAOS, self.bn_token)
                 
             if score_n["trend_up"] >= 2 and score_bn["trend_up"] >= 2:
@@ -859,7 +911,7 @@ class RegimeClassifier:
                 return (Regime.TRENDING_DOWN, active_token)
                 
             if score_n["compression"] >= 2 and score_bn["compression"] >= 2:
-                active_token = self.bn_token if df_bn['bbw_rank'].iloc[-1] < df_n['bbw_rank'].iloc[-1] else self.nifty_token
+                active_token = self.bn_token if df_bn['bbw_pct_rank'].iloc[-1] < df_n['bbw_pct_rank'].iloc[-1] else self.nifty_token
                 return (Regime.COMPRESSION, active_token)
                 
             corr_series = df_n['close'].pct_change().rolling(self.params["correlation_period"]).corr(df_bn['close'].pct_change())
@@ -877,7 +929,7 @@ class RegimeClassifier:
             return (Regime.UNCLEAR, None)
 
 # ==================================================================================================
-# TRADING EXECUTION LAYER
+# TRADING EXECUTION LAYER (No changes in this section)
 # ==================================================================================================
 class AbstractTrader(ABC):
     def __init__(self, 
@@ -919,7 +971,6 @@ class AbstractTrader(ABC):
 
 class PaperTrader(AbstractTrader):
     def open_position(self, trade_params: Dict) -> Optional[Position]:
-        """Calculates and opens a simulated (paper) trade."""
         with self.lock:
             try:
                 opt = trade_params['opt']
@@ -1014,7 +1065,7 @@ class PaperTrader(AbstractTrader):
             self.store.upsert_position(p)
             self.store.log_closed_trade(p, exit_price, reason)
             
-            self._update_performance(pnl) # Call the injected callback
+            self._update_performance(pnl)
 
             self.positions.pop(p.id, None)
             send_alert(f"❌ [PAPER] CLOSED {p.tradingsymbol} @ {exit_price:.2f} ({reason}). Final PnL: {pnl:.2f}. Daily PnL: {self.daily_realized_pnl:.2f}")
@@ -1050,7 +1101,6 @@ class PaperTrader(AbstractTrader):
         return True
 
 class Trader(AbstractTrader):
-    """Live Trader implementation."""
     def __init__(self, 
                  kite: GovernedKite, 
                  store: Store, 
@@ -1088,7 +1138,6 @@ class Trader(AbstractTrader):
         p.slm_order_id, p.tp_order_id = None, None
         
     def open_position(self, trade_params: Dict) -> Optional[Position]:
-        """ "Persist Then Act" implementation for live trading. """
         with self.lock:
             open_pos_count = sum(1 for p in self.positions.values() if p.status not in [PositionStatus.CLOSED.value, PositionStatus.REJECTED.value])
             opt, ts = trade_params['opt'], trade_params['opt']['tradingsymbol']
@@ -1253,7 +1302,7 @@ class Trader(AbstractTrader):
                 L.warning(f"Could not modify SL for {p.tradingsymbol} after retries.")
 
 # ==================================================================================================
-# STRATEGY DEFINITIONS
+# STRATEGY DEFINITIONS (No changes in this section)
 # ==================================================================================================
 class BaseStrategy(ABC):
     def __init__(self, name: StrategyName, engine: 'Engine', params: Dict):
@@ -1267,6 +1316,7 @@ class BaseStrategy(ABC):
         if side := self.check_signal(token, regime, current_time):
             risk_points, reward_points = self.get_risk_params(token, side, current_time)
             if risk_points > 0 and reward_points > 0:
+                # The vega of the potential trade is calculated later in the process
                 return TradeSignal(self.name, side, risk_points, reward_points)
         return None
             
@@ -1433,20 +1483,17 @@ class Engine:
         self.config = CONFIG
         self.sanity_check_pct = self.config["trading"].get("insane_tick_pct", 5.0) / 100.0
 
-        ### MODIFICATION START ###
-        # DECOUPLING & DEADLOCK FIX: Producer-Consumer Queue and state variables
         self.trade_signal_queue = Queue()
-        # This variable is updated by a dedicated task and read by the planner.
-        # This prevents the planner from needing to acquire the trader lock.
         self.last_unrealized_pnl = 0.0
-        # This event allows the position manager to signal a fatal error without
-        # needing to acquire the engine lock, preventing deadlock.
         self.fatal_error_event = threading.Event()
         self.scheduler = self._setup_scheduler()
+        
+        ### MODIFICATION START (IMPROVEMENT #4) ###
+        self.portfolio_greeks: Dict[str, float] = {"net_delta": 0.0, "net_vega": 0.0}
+        self.portfolio_greeks_lock = threading.Lock()
         ### MODIFICATION END ###
 
     def set_dependencies(self, trader: AbstractTrader):
-        """Injects the trader dependency post-init to resolve circular dependency."""
         self.trader = trader
         if not PAPER_TRADING:
             self.prices.on_order_update_callbacks.append(self.handle_order_update)
@@ -1500,9 +1547,21 @@ class Engine:
                 ticks = self.prices.tick_queue.get(timeout=1)
                 sane_ticks = [t for t in ticks if self._is_tick_sane(t)]
                 if not sane_ticks: continue
+                
+                # Create a copy to prevent race conditions if trader lock is needed
+                with self.trader.lock:
+                    open_positions_by_token = {p.token: p for p in self.trader.positions.values() if p.status == PositionStatus.ACTIVE.value}
+                
                 for t in sane_ticks: 
                     self.prices.last[t["instrument_token"]] = t.get("last_price")
                     self.prices.full_ticks[t["instrument_token"]] = t
+                    
+                    ### MODIFICATION START (IMPROVEMENT #4) ###
+                    # Update greeks for open positions on every relevant tick
+                    if t["instrument_token"] in open_positions_by_token:
+                        self._update_position_greeks(open_positions_by_token[t["instrument_token"]], t)
+                    ### MODIFICATION END ###
+
                 self.process_ticks(sane_ticks)
             except Empty: continue
             except Exception as e: 
@@ -1540,8 +1599,6 @@ class Engine:
         while self.running.is_set():
             try:
                 is_halted_check = False
-                # The strategic planner is the main logic, it respects the trading halt.
-                # Other tasks like health checks and reconciliation should run regardless.
                 if name in ["strategic_planner"]:
                     with self.engine_lock:
                         is_halted_check = self.halt_trading
@@ -1582,15 +1639,11 @@ class Engine:
                     L.info("Market is now CLOSED. Transitioning to post-market state.")
                     break
 
-                ### MODIFICATION START ###
-                # DEADLOCK FIX: Check for fatal error signal from other threads
                 if self.fatal_error_event.is_set():
                     send_alert("🔥 FATAL ERROR EVENT RECEIVED. HALTING ALL TRADING.", "critical")
                     with self.engine_lock:
                         self.halt_trading = True
-                    # The event is consumed, logic in risk_ok() will handle closing positions.
                     self.fatal_error_event.clear()
-                ### MODIFICATION END ###
 
                 with self.engine_lock:
                     if not self.eod_flatten_triggered and now_time >= CONFIG["timings"]["eod_flatten_time"]:
@@ -1631,10 +1684,7 @@ class Engine:
         tasks = {
             "strategic_planner": (self._run_strategic_planner, 5),
             "position_management": (self.manage_positions, 10),
-            ### MODIFICATION START ###
-            # DEADLOCK FIX: New task to safely update PnL for the planner
-            "pnl_updater": (self._update_pnl_metrics, 2), # Frequent, lightweight PnL update
-            ### MODIFICATION END ###
+            "pnl_updater": (self._update_pnl_metrics, 2),
             "reconciliation": (self.reconcile, 300),
             "health_check": (self.health_check, 60),
             "eod_report": (self._send_eod_report, 300),
@@ -1665,6 +1715,8 @@ class Engine:
             self.last_trade_timestamp = None
             self.active_token = None
             self.active_strategy = None
+            with self.portfolio_greeks_lock:
+                self.portfolio_greeks = {"net_delta": 0.0, "net_vega": 0.0}
         
         self.eod_flatten_triggered = False; self.eod_report_sent = False
         self.last_trading_day = now.date()
@@ -1682,10 +1734,8 @@ class Engine:
         for token in tokens_to_prime:
             if token is None: 
                 continue
-            
             symbol = self.book.get_symbol(token) or f"Token {token}"
             L.info(f"Priming historical data for: {symbol}")
-            
             hist = self.k.historical_data(token, from_date, to_date, "minute")
             if hist: 
                 self.bars.prime(token, pd.DataFrame(hist))
@@ -1701,13 +1751,10 @@ class Engine:
         
     def process_ticks(self, ticks: List[Dict]):
         for tick in ticks:
-            # This check is now redundant since the planner runs on a timer, but harmless
-            if self.bars.add_tick(tick):
-                pass
+            self.bars.add_tick(tick)
                 
     def _run_strategic_planner(self):
-        """The 'thinking' part of the bot. Finds signals and puts them on the queue."""
-        with self.engine_lock: # Acquires engine_lock (A) and nothing else.
+        with self.engine_lock:
             now = now_ist()
             
             if now.date() > self.last_trading_day:
@@ -1749,8 +1796,7 @@ class Engine:
             if best_signal_tuple:
                 best_token, best_signal = best_signal_tuple
                 
-                # risk_ok is now safe to call from within this lock
-                if not self.risk_ok():
+                if not self.risk_ok(hypothetical_signal=best_signal):
                     L.warning(f"--- Trade blocked by master risk controls for {best_signal.strategy_name.value}. ---")
                     return
                 
@@ -1772,17 +1818,14 @@ class Engine:
                     self.trade_signal_queue.put((best_token, best_signal, trade_params))
 
     def _trade_executor_worker(self):
-        """Waits for a validated trade signal and executes it."""
         L.info("Trade executor worker started.")
         while self.running.is_set():
             try:
-                # This call blocks until a signal is available
                 token, signal, trade_params = self.trade_signal_queue.get(timeout=1)
                 
                 L.info(f"Executor received signal for {signal.strategy_name.value}. Executing trade.")
-                # This worker acquires trader.lock (B) and nothing else, preventing deadlock.
                 if self.trader.open_position(trade_params):
-                    with self.engine_lock: # Briefly lock engine state ONLY to update timestamp
+                    with self.engine_lock:
                         self.last_trade_timestamp = now_ist()
 
             except Empty:
@@ -1803,7 +1846,6 @@ class Engine:
         return final_signals
 
     def handle_order_update(self, order: Dict):
-        """Callback for WebSocket order updates (Live Trading Only)."""
         oid, status = order.get('order_id'), order.get('status')
         pos_id = f"LIVE_{oid}"
         with self.trader.lock:
@@ -1812,7 +1854,6 @@ class Engine:
                 pos = next((p for p in self.trader.positions.values() if oid in [p.slm_order_id, p.tp_order_id, p.exit_order_id]), None)
                 if not pos: return 
 
-            # Entry Order Logic
             if oid == pos.entry_order_id and pos.status in [PositionStatus.PENDING_ENTRY.value, PositionStatus.PARTIALLY_FILLED_NO_BRACKETS.value]:
                 filled_qty = order.get('filled_quantity', 0)
                 if filled_qty > 0 and pos.status == PositionStatus.PENDING_ENTRY.value:
@@ -1824,7 +1865,13 @@ class Engine:
                     
                     pos.entry_price = avg_price; pos.qty = filled_qty; pos.high_price_since_entry = avg_price; pos.opened_at = now_ist(); 
                     pos.initial_sl_price = avg_price - pos.option_sl_points; pos.sl_price = pos.initial_sl_price; pos.tp_price = avg_price + pos.option_tp_points; 
-                    pos.status = PositionStatus.PARTIALLY_FILLED_NO_BRACKETS.value; self.store.upsert_position(pos)
+                    pos.status = PositionStatus.PARTIALLY_FILLED_NO_BRACKETS.value
+                    
+                    ### MODIFICATION START (IMPROVEMENT #4) ###
+                    # Initialize greeks on first fill
+                    self._initialize_position_greeks(pos)
+                    self.store.upsert_position(pos)
+                    ### MODIFICATION END ###
                     
                     if not self.trader.place_bracket_orders(pos): 
                         self.trader.close_position(pos, "BRACKET_PLACEMENT_FAILURE_ON_FILL")
@@ -1838,7 +1885,6 @@ class Engine:
                     if pos.qty == 0: L.warning(f"Entry order {oid} for {pos.tradingsymbol} {status} with no fills. Removing."); self.trader.positions.pop(pos.id, None)
                     else: L.info(f"Entry order for {pos.tradingsymbol} is final. Total filled: {pos.qty}/{pos.initial_qty}."); pos.status = PositionStatus.ACTIVE.value; self.store.upsert_position(pos)
             
-            # Exit Order Logic
             elif (oid in [pos.slm_order_id, pos.tp_order_id, pos.exit_order_id]) and (status == 'COMPLETE') and (pos.status != PositionStatus.CLOSED.value):
                 reason = pos.exit_reason or ("SL_HIT_WS" if oid == pos.slm_order_id else "TP_HIT_WS"); 
                 L.info(f"Exit order {oid} ({reason}) complete. Cancelling all other open orders for {pos.id}.")
@@ -1848,6 +1894,15 @@ class Engine:
                 self.trader.daily_realized_pnl += pnl; 
                 pos.status = PositionStatus.CLOSED.value
                 pos.exit_price = exit_price
+
+                ### MODIFICATION START (IMPROVEMENT #4) ###
+                # Remove greeks from portfolio on close
+                with self.portfolio_greeks_lock:
+                    self.portfolio_greeks["net_delta"] -= pos.greeks.get("delta", 0.0) * pos.initial_qty
+                    self.portfolio_greeks["net_vega"] -= pos.greeks.get("vega", 0.0) * pos.initial_qty
+                pos.greeks = {}
+                ### MODIFICATION END ###
+
                 self.store.upsert_position(pos); 
                 self.store.log_closed_trade(pos, exit_price, reason); 
                 self._update_performance_metrics(pnl) 
@@ -1901,12 +1956,9 @@ class Engine:
             strategy_params = CONFIG['strategies'].get(strategy_config_key, {})
             max_iv_for_strategy = strategy_params.get('max_iv_entry') 
 
-        ### MODIFICATION START ###
-        # Using precise time-to-expiry calculation
         now = now_ist()
         market_close_time = self.config["timings"]["market_close"]
         T = _calculate_time_to_expiry(expiry.date() if isinstance(expiry, pd.Timestamp) else expiry, now, market_close_time)
-        ### MODIFICATION END ###
         
         options_with_metrics = []
         for _, row in chain.iterrows():
@@ -1926,7 +1978,8 @@ class Engine:
                 continue
 
             delta = bs_delta(spot, row['strike'], T, 0.05, iv, option_type == OptionType.CE)
-            options_with_metrics.append({'delta_diff': abs(abs(delta) - target_delta), 'opt': row.to_dict(), 'ltp': ltp, 'delta': delta})
+            vega = bs_vega(spot, row['strike'], T, 0.05, iv)
+            options_with_metrics.append({'delta_diff': abs(abs(delta) - target_delta), 'opt': row.to_dict(), 'ltp': ltp, 'delta': delta, 'vega': vega})
         
         if not options_with_metrics: return None
         return min(options_with_metrics, key=lambda x: x['delta_diff'])
@@ -1962,6 +2015,7 @@ class Engine:
         option_contract = best_option_data['opt']
         option_ltp = best_option_data['ltp']
         estimated_delta = best_option_data['delta']
+        estimated_vega = best_option_data['vega']
 
         if expiry == date.today() and CONFIG["trading"].get("expiry_day_protocol_active", True):
              expiry_day_delta_assumption = CONFIG["trading"].get("expiry_day_delta_assumption", 0.85)
@@ -1976,7 +2030,13 @@ class Engine:
             return None
         
         risk_per_lot = final_sl_points_on_option * lot_size
-        number_of_lots = self.calculate_position_size(token, risk_per_lot)
+        
+        ### MODIFICATION START (IMPROVEMENT #5) ###
+        # Pass vega to the position sizer for an additional risk check
+        number_of_lots = self.calculate_position_size(
+            underlying_token, risk_per_lot, vega_per_lot=estimated_vega * lot_size
+        )
+        ### MODIFICATION END ###
 
         if number_of_lots <= 0: return None
             
@@ -1994,7 +2054,7 @@ class Engine:
             "underlying_sl": underlying_sl_level
         }
 
-    def calculate_position_size(self, underlying_token: int, risk_per_lot: float) -> int:
+    def calculate_position_size(self, underlying_token: int, risk_per_lot: float, vega_per_lot: float) -> int:
         if risk_per_lot <= 0: return 0
         risk_tiers = CONFIG["trading"]["risk_tiers"]
         
@@ -2024,7 +2084,20 @@ class Engine:
             
         final_risk_factor = self.risk_factor * vol_adjustment * vix_risk_factor * expiry_day_risk_factor
         allowed_risk = self.dynamic_account_equity * (active_risk_pct / 100.0) * final_risk_factor
-        calculated_lots = int(math.floor(allowed_risk / risk_per_lot)) if risk_per_lot > 0 else 0
+        
+        lots_by_delta_risk = int(math.floor(allowed_risk / risk_per_lot)) if risk_per_lot > 0 else 0
+        
+        ### MODIFICATION START (IMPROVEMENT #5) ###
+        # Add a second constraint based on Vega risk
+        max_vega_risk = self.config["trading"].get("max_trade_vega_risk")
+        if max_vega_risk and vega_per_lot > 0:
+            lots_by_vega_risk = int(math.floor(max_vega_risk / vega_per_lot))
+            calculated_lots = min(lots_by_delta_risk, lots_by_vega_risk)
+            if lots_by_vega_risk < lots_by_delta_risk:
+                L.info(f"Position size constrained by Vega risk. Delta lots: {lots_by_delta_risk}, Vega lots: {lots_by_vega_risk}.")
+        else:
+            calculated_lots = lots_by_delta_risk
+        ### MODIFICATION END ###
         
         L.info(f"Position Size Calc: PerfScore={self.performance_score}, RiskTier={active_risk_pct}%, AllowedRisk={allowed_risk:.2f}, Lots={calculated_lots}")
         return max(0, min(calculated_lots, CONFIG['trading']['max_lots_per_trade']))
@@ -2049,7 +2122,6 @@ class Engine:
         
     def manage_positions(self):
         with self.trader.lock:
-            # Create a copy to iterate over, preventing modification issues.
             active_positions = list(self.trader.positions.values())
         
         if not active_positions: 
@@ -2065,14 +2137,10 @@ class Engine:
                             closed_successfully = True; break
                         time.sleep(2)
                     
-                    ### MODIFICATION START ###
-                    # DEADLOCK FIX: Use a thread-safe event to signal fatal error
-                    # instead of acquiring the engine lock directly.
                     if not closed_successfully:
                         send_alert(f"🔥 FATAL: UNABLE TO CLOSE {p.tradingsymbol}. HALTING ALL TRADING.", "critical")
                         self.fatal_error_event.set()
-                    ### MODIFICATION END ###
-                continue # Move to the next position
+                continue
 
             if p.status not in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value]: 
                 continue
@@ -2154,7 +2222,6 @@ class Engine:
             self.store.upsert_position(p)
 
     def _calculate_trailing_stop(self, p: Position) -> float:
-        """Centralized logic for calculating the new theoretical trailing stop price."""
         underlying_name = _get_underlying(p.tradingsymbol)
         underlying_token = self.bn_token if "BANKNIFTY" in underlying_name else self.nifty_token
         df_underlying_full = self.bars.get_ohlc(underlying_token, 1)
@@ -2196,44 +2263,62 @@ class Engine:
 
         return new_sl_target
             
-    def risk_ok(self) -> bool:
-        """Master risk check. NOTE: This is called from within engine_lock context."""
-        if self.halt_trading:
-            return False
-        
-        ### MODIFICATION START ###
-        # DEADLOCK FIX: Use the cached unrealized PnL value instead of calculating it here.
-        current_equity = self.dynamic_account_equity + self.trader.daily_realized_pnl + self.last_unrealized_pnl
-        ### MODIFICATION END ###
+    def risk_ok(self, hypothetical_signal: Optional[TradeSignal] = None) -> bool:
+        with self.engine_lock:
+            if self.halt_trading:
+                return False
 
-        weekly_drawdown_limit = self.weekly_high_water_mark * (CONFIG["trading"].get("weekly_drawdown_pct_limit", 8.0) / 100.0)
-        if not self.in_weekly_drawdown_lock and current_equity < (self.weekly_high_water_mark - weekly_drawdown_limit):
-            self.in_weekly_drawdown_lock = True
-            send_alert(f"🔒 WEEKLY DD LOCK ENGAGED. Peak: {self.weekly_high_water_mark:.2f}, Current: {current_equity:.2f}. Switching to DEFENSIVE mode.", "warning")
-        
-        daily_drawdown_limit = self.daily_high_water_mark * (MAX_DAILY_DRAWDOWN_PCT / 100.0)
-        daily_dd_pct = 0.0
-        if self.daily_high_water_mark > 0:
-             daily_dd_pct = (self.daily_high_water_mark - current_equity) / self.daily_high_water_mark * 100
-        
-        if G_DAILY_DRAWDOWN_PCT: 
-            G_DAILY_DRAWDOWN_PCT.set(daily_dd_pct)
+            ### MODIFICATION START (IMPROVEMENT #4) ###
+            # Check portfolio greek limits before approving a new trade
+            if hypothetical_signal:
+                with self.portfolio_greeks_lock:
+                    hypothetical_delta = hypothetical_signal.delta * hypothetical_signal.qty
+                    hypothetical_vega = hypothetical_signal.vega * hypothetical_signal.qty
 
-        if current_equity < (self.daily_high_water_mark - daily_drawdown_limit):
-            send_alert(f"⛔ DD LIMIT HIT. HALTING. Peak Equity: {self.daily_high_water_mark:.2f}, Current: {current_equity:.2f} (DD: {daily_dd_pct:.2f}%)", "critical")
-            self.halt_trading = True
-            if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
+                    post_trade_delta = self.portfolio_greeks["net_delta"] + hypothetical_delta
+                    post_trade_vega = self.portfolio_greeks["net_vega"] + hypothetical_vega
+                    
+                    max_delta = self.config["trading"].get("max_portfolio_net_delta")
+                    max_vega = self.config["trading"].get("max_portfolio_net_vega")
+
+                    if max_delta and abs(post_trade_delta) > max_delta:
+                        L.warning(f"Trade REJECTED: Would breach max portfolio delta. Current: {self.portfolio_greeks['net_delta']:.0f}, Post-trade: {post_trade_delta:.0f}, Limit: {max_delta}")
+                        return False
+                    if max_vega and abs(post_trade_vega) > max_vega:
+                        L.warning(f"Trade REJECTED: Would breach max portfolio vega. Current: {self.portfolio_greeks['net_vega']:.0f}, Post-trade: {post_trade_vega:.0f}, Limit: {max_vega}")
+                        return False
+            ### MODIFICATION END ###
+
+            current_equity = self.dynamic_account_equity + self.trader.daily_realized_pnl + self.last_unrealized_pnl
+
+            weekly_drawdown_limit = self.weekly_high_water_mark * (CONFIG["trading"].get("weekly_drawdown_pct_limit", 8.0) / 100.0)
+            if not self.in_weekly_drawdown_lock and current_equity < (self.weekly_high_water_mark - weekly_drawdown_limit):
+                self.in_weekly_drawdown_lock = True
+                send_alert(f"🔒 WEEKLY DD LOCK ENGAGED. Peak: {self.weekly_high_water_mark:.2f}, Current: {current_equity:.2f}. Switching to DEFENSIVE mode.", "warning")
             
-            with self.trader.lock:
-                positions_to_close = [
-                    p for p in list(self.trader.positions.values())
-                    if p.status not in [PositionStatus.CLOSED.value, PositionStatus.PENDING_CLOSURE.value]
-                ]
-            for p in positions_to_close:
-                self.trader.close_position(p, "DD_LIMIT_HIT")
+            daily_drawdown_limit = self.daily_high_water_mark * (MAX_DAILY_DRAWDOWN_PCT / 100.0)
+            daily_dd_pct = 0.0
+            if self.daily_high_water_mark > 0:
+                 daily_dd_pct = (self.daily_high_water_mark - current_equity) / self.daily_high_water_mark * 100
             
-            return False
-        return True
+            if G_DAILY_DRAWDOWN_PCT: 
+                G_DAILY_DRAWDOWN_PCT.set(daily_dd_pct)
+
+            if current_equity < (self.daily_high_water_mark - daily_drawdown_limit):
+                send_alert(f"⛔ DD LIMIT HIT. HALTING. Peak Equity: {self.daily_high_water_mark:.2f}, Current: {current_equity:.2f} (DD: {daily_dd_pct:.2f}%)", "critical")
+                self.halt_trading = True
+                if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
+                
+                with self.trader.lock:
+                    positions_to_close = [
+                        p for p in list(self.trader.positions.values())
+                        if p.status not in [PositionStatus.CLOSED.value, PositionStatus.PENDING_CLOSURE.value]
+                    ]
+                for p in positions_to_close:
+                    self.trader.close_position(p, "DD_LIMIT_HIT")
+                
+                return False
+            return True
         
     def reconcile(self):
         if PAPER_TRADING: return
@@ -2269,7 +2354,6 @@ class Engine:
         except Exception as e: L.error(f"Reconciliation failed: {e}", exc_info=True)
         
     def health_check(self):
-        """Checks for both WS connection AND stale data feed."""
         if not self.prices.connected.is_set(): 
             send_alert("🔥 CRITICAL: PriceBus WebSocket is disconnected!", "critical")
             if G_WS_CONNECTED: G_WS_CONNECTED.set(0)
@@ -2297,30 +2381,23 @@ class Engine:
         except Exception as e:
             L.warning(f"Could not update dynamic account equity: {e}")
 
-    ### MODIFICATION START ###
-    # DEADLOCK FIX: New method to safely calculate and cache unrealized PnL.
     def _update_pnl_metrics(self):
-        """
-        Safely calculates unrealized PnL and caches it for the engine.
-        This is the only task that should call trader.unrealized_pnl() directly.
-        """
         self.last_unrealized_pnl = self.trader.unrealized_pnl()
-    ### MODIFICATION END ###
 
     def _update_prometheus_metrics(self):
-        """Task to update all Prometheus gauges periodically."""
         if not G_PNL_REALIZED: return 
         try:
             G_PNL_REALIZED.set(self.trader.daily_realized_pnl)
-            # Use the cached value for consistency
             G_PNL_UNREALIZED.set(self.last_unrealized_pnl)
             with self.engine_lock:
                 G_HALTED_STATUS.set(1 if self.halt_trading else 0)
+            with self.portfolio_greeks_lock:
+                if G_PORTFOLIO_DELTA: G_PORTFOLIO_DELTA.set(self.portfolio_greeks["net_delta"])
+                if G_PORTFOLIO_VEGA: G_PORTFOLIO_VEGA.set(self.portfolio_greeks["net_vega"])
         except Exception as e:
             L.warning(f"Failed to update Prometheus metrics: {e}")
 
     def _persist_bar_data(self):
-        """Periodically saves the in-memory 1-min bars to daily log files."""
         try:
             L.info("Persisting in-memory 1-minute bars to disk...")
             os.makedirs(DATA_LOG_DIR, exist_ok=True)
@@ -2333,19 +2410,61 @@ class Engine:
             }
 
             for token, filename in tokens_to_log.items():
-                if token is None:
-                    continue
-                
+                if token is None: continue
                 bar_df = self.bars.get_ohlc(token, 1) 
-                
                 if not bar_df.empty:
                     filepath = os.path.join(DATA_LOG_DIR, filename)
                     bar_df.to_csv(filepath) 
             
             L.info("Bar data persistence complete.")
-
         except Exception as e:
             L.error(f"Failed to persist bar data: {e}", exc_info=True)
+
+    ### MODIFICATION START (IMPROVEMENT #4) ###
+    def _initialize_position_greeks(self, p: Position):
+        """Calculates initial greeks for a position once it's filled."""
+        underlying_name = _get_underlying(p.tradingsymbol)
+        underlying_token = self.bn_token if "BANKNIFTY" in underlying_name else self.nifty_token
+        spot = self.prices.ltp(underlying_token)
+        tick = self.prices.get_full_tick(p.token)
+        
+        if not spot or not tick:
+            L.warning(f"Could not calculate initial greeks for {p.tradingsymbol} due to missing data.")
+            return
+
+        opt_details = self.book.df_by_token.loc[p.token]
+        T = _calculate_time_to_expiry(opt_details['expiry'].date(), now_ist(), self.config["timings"]["market_close"])
+        
+        p.greeks = calculate_greeks(spot, opt_details['strike'], T, 0.05, tick.get('iv', 0.2), p.option_type == 'CE')
+        
+        with self.portfolio_greeks_lock:
+            self.portfolio_greeks["net_delta"] += p.greeks.get("delta", 0.0) * p.initial_qty
+            self.portfolio_greeks["net_vega"] += p.greeks.get("vega", 0.0) * p.initial_qty
+        L.info(f"Initialized greeks for {p.tradingsymbol}: {p.greeks}. Portfolio totals: {self.portfolio_greeks}")
+
+    def _update_position_greeks(self, p: Position, tick: Dict):
+        """Continuously updates greeks for a position with each new tick."""
+        with self.trader.lock, self.portfolio_greeks_lock:
+            old_delta = p.greeks.get("delta", 0.0)
+            old_vega = p.greeks.get("vega", 0.0)
+
+            underlying_name = _get_underlying(p.tradingsymbol)
+            underlying_token = self.bn_token if "BANKNIFTY" in underlying_name else self.nifty_token
+            spot = self.prices.ltp(underlying_token)
+            
+            if not spot: return
+            
+            opt_details = self.book.df_by_token.loc[p.token]
+            T = _calculate_time_to_expiry(opt_details['expiry'].date(), now_ist(), self.config["timings"]["market_close"])
+
+            p.greeks = calculate_greeks(spot, opt_details['strike'], T, 0.05, tick.get('iv', 0.2), p.option_type == 'CE')
+            
+            delta_change = p.greeks.get("delta", 0.0) - old_delta
+            vega_change = p.greeks.get("vega", 0.0) - old_vega
+
+            self.portfolio_greeks["net_delta"] += delta_change * p.qty
+            self.portfolio_greeks["net_vega"] += vega_change * p.qty
+    ### MODIFICATION END ###
             
     def stop(self):
         if self.running.is_set():
@@ -2362,7 +2481,7 @@ class Engine:
             L.info("Shutdown complete.")
 
 # ==================================================================================================
-# APPLICATION ENTRY POINT
+# APPLICATION ENTRY POINT (No changes in this section)
 # ==================================================================================================
 def login_or_reuse(token_path: str) -> Tuple[KiteConnect, str]:
     api_key = os.environ.get("KITE_API_KEY"); api_secret = os.environ.get("KITE_API_SECRET")
@@ -2401,7 +2520,6 @@ def login_or_reuse(token_path: str) -> Tuple[KiteConnect, str]:
             raise SystemExit(f"FATAL: Login failed. Could not generate session. Reason: {e}")
 
 def main():
-    """Main composition root. Creates and injects all dependencies."""
     load_dotenv() 
     send_alert(f"Booting Sentinel PRIME Protocol... (Mode: {APP_ENV})")
     
