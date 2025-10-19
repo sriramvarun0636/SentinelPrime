@@ -17,6 +17,8 @@ from queue import Queue, Empty
 from typing import List, Dict, Optional, Tuple, Callable, Type
 from datetime import datetime, timedelta, time as dtime, date
 from abc import ABC, abstractmethod
+from collections import deque
+
 
 from dotenv import load_dotenv
 import numpy as np
@@ -247,6 +249,10 @@ class Position:
     oi_profit_target: Optional[float] = None
     intended_risk_rupees: float = 0.0
     is_entry_order_open: bool = False
+    # ### PILLAR 2 IMPLEMENTATION ### State for adaptive entry
+    entry_stage: int = 0
+    last_entry_modification: Optional[datetime] = None
+
 
     def __post_init__(self):
         """Sanitizes numeric types to prevent silent crashes from NumPy types."""
@@ -503,7 +509,7 @@ class Store:
             db_version = cursor.fetchone()[0]
             L.info(f"Database schema version: {db_version}")
             # ### IMPROVEMENT ### All migrations are now consolidated for brevity
-            if db_version < 5:
+            if db_version < 6:
                 L.info("Running database migrations...")
                 if db_version < 1:
                     cursor.execute("""
@@ -539,22 +545,29 @@ class Store:
                     cursor.execute("ALTER TABLE positions ADD COLUMN is_entry_order_open INTEGER DEFAULT 0")
                     cursor.execute("ALTER TABLE positions ADD COLUMN scale_out_rules TEXT DEFAULT '[]'")
                     cursor.execute("ALTER TABLE positions ADD COLUMN triggered_scale_out_targets TEXT DEFAULT '[]'")
+                
+                if db_version < 6: # ### PILLAR 2 ### DB migration for new fields
+                    cursor.execute("ALTER TABLE positions ADD COLUMN entry_stage INTEGER DEFAULT 0")
+                    cursor.execute("ALTER TABLE positions ADD COLUMN last_entry_modification TEXT")
 
-                cursor.execute("PRAGMA user_version = 5")
-                L.info("Database migrations complete. Now at version 5.")
+
+                cursor.execute("PRAGMA user_version = 6")
+                L.info("Database migrations complete. Now at version 6.")
     
     def upsert_position(self, p: Position):
         # This function is long due to the number of fields. It's a candidate for an ORM in the future.
         sql = """
-            INSERT INTO positions (id, tradingsymbol, token, option_type, qty, initial_qty, entry_price, initial_sl_price, sl_price, tp_price, opened_at, strategy, market_regime_at_entry, underlying_sl_level, status, entry_order_id, slm_order_id, tp_order_id, scaled_out_qty, breakeven_armed, trailing_sl_armed, initial_risk_points, option_sl_points, option_tp_points, high_price_since_entry, scale_out_rules, exit_order_id, exit_reason, exit_price, greeks, max_trade_duration_minutes, oi_profit_target, intended_risk_rupees, is_entry_order_open, triggered_scale_out_targets)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO positions (id, tradingsymbol, token, option_type, qty, initial_qty, entry_price, initial_sl_price, sl_price, tp_price, opened_at, strategy, market_regime_at_entry, underlying_sl_level, status, entry_order_id, slm_order_id, tp_order_id, scaled_out_qty, breakeven_armed, trailing_sl_armed, initial_risk_points, option_sl_points, option_tp_points, high_price_since_entry, scale_out_rules, exit_order_id, exit_reason, exit_price, greeks, max_trade_duration_minutes, oi_profit_target, intended_risk_rupees, is_entry_order_open, triggered_scale_out_targets, entry_stage, last_entry_modification)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                qty=excluded.qty, sl_price=excluded.sl_price, tp_price=excluded.tp_price, status=excluded.status, slm_order_id=excluded.slm_order_id, tp_order_id=excluded.tp_order_id, scaled_out_qty=excluded.scaled_out_qty, breakeven_armed=excluded.breakeven_armed, trailing_sl_armed=excluded.trailing_sl_armed, high_price_since_entry=excluded.high_price_since_entry, entry_price=excluded.entry_price, opened_at=excluded.opened_at, entry_order_id=excluded.entry_order_id, exit_order_id=excluded.exit_order_id, exit_reason=excluded.exit_reason, exit_price=excluded.exit_price, greeks=excluded.greeks, max_trade_duration_minutes=excluded.max_trade_duration_minutes, oi_profit_target=excluded.oi_profit_target, intended_risk_rupees=excluded.intended_risk_rupees, is_entry_order_open=excluded.is_entry_order_open, triggered_scale_out_targets=excluded.triggered_scale_out_targets
+                qty=excluded.qty, sl_price=excluded.sl_price, tp_price=excluded.tp_price, status=excluded.status, slm_order_id=excluded.slm_order_id, tp_order_id=excluded.tp_order_id, scaled_out_qty=excluded.scaled_out_qty, breakeven_armed=excluded.breakeven_armed, trailing_sl_armed=excluded.trailing_sl_armed, high_price_since_entry=excluded.high_price_since_entry, entry_price=excluded.entry_price, opened_at=excluded.opened_at, entry_order_id=excluded.entry_order_id, exit_order_id=excluded.exit_order_id, exit_reason=excluded.exit_reason, exit_price=excluded.exit_price, greeks=excluded.greeks, max_trade_duration_minutes=excluded.max_trade_duration_minutes, oi_profit_target=excluded.oi_profit_target, intended_risk_rupees=excluded.intended_risk_rupees, is_entry_order_open=excluded.is_entry_order_open, triggered_scale_out_targets=excluded.triggered_scale_out_targets, entry_stage=excluded.entry_stage, last_entry_modification=excluded.last_entry_modification
         """
         rules_json = json.dumps(p.scale_out_rules)
         greeks_json = json.dumps(p.greeks)
         triggered_json = json.dumps(p.triggered_scale_out_targets)
-        params = (p.id, p.tradingsymbol, p.token, p.option_type, p.qty, p.initial_qty, p.entry_price, p.initial_sl_price, p.sl_price, p.tp_price, p.opened_at.isoformat(), p.strategy, p.market_regime_at_entry, p.underlying_sl_level, p.status, p.entry_order_id, p.slm_order_id, p.tp_order_id, p.scaled_out_qty, int(p.breakeven_armed), int(p.trailing_sl_armed), p.initial_risk_points, p.option_sl_points, p.option_tp_points, p.high_price_since_entry, rules_json, p.exit_order_id, p.exit_reason, p.exit_price, greeks_json, p.max_trade_duration_minutes, p.oi_profit_target, p.intended_risk_rupees, int(p.is_entry_order_open), triggered_json)
+        last_mod_iso = p.last_entry_modification.isoformat() if p.last_entry_modification else None
+
+        params = (p.id, p.tradingsymbol, p.token, p.option_type, p.qty, p.initial_qty, p.entry_price, p.initial_sl_price, p.sl_price, p.tp_price, p.opened_at.isoformat(), p.strategy, p.market_regime_at_entry, p.underlying_sl_level, p.status, p.entry_order_id, p.slm_order_id, p.tp_order_id, p.scaled_out_qty, int(p.breakeven_armed), int(p.trailing_sl_armed), p.initial_risk_points, p.option_sl_points, p.option_tp_points, p.high_price_since_entry, rules_json, p.exit_order_id, p.exit_reason, p.exit_price, greeks_json, p.max_trade_duration_minutes, p.oi_profit_target, p.intended_risk_rupees, int(p.is_entry_order_open), triggered_json, p.entry_stage, last_mod_iso)
         with self.lock, self._get_connection() as conn:
             conn.execute(sql, params)
             conn.commit()
@@ -584,9 +597,11 @@ class Store:
             r_dict['trailing_sl_armed'] = bool(r_dict.get("trailing_sl_armed"))
             r_dict['is_entry_order_open'] = bool(r_dict.get("is_entry_order_open"))
             r_dict['opened_at'] = datetime.fromisoformat(r_dict["opened_at"])
+            if r_dict.get("last_entry_modification"):
+                r_dict['last_entry_modification'] = datetime.fromisoformat(r_dict["last_entry_modification"])
             
             # Remove keys that are not in the Position dataclass constructor
-            extra_keys = set(r_dict.keys()) - set(f.name for f in field(Position).default.fields)
+            extra_keys = set(r_dict.keys()) - set(f.name for f in Position.__dataclass_fields__)
             for key in extra_keys:
                 del r_dict[key]
 
@@ -1234,38 +1249,41 @@ class Trader(AbstractTrader):
                 scale_out_rules=CONFIG['trading']['scale_out_rules'],
                 max_trade_duration_minutes=trade_params.get('max_trade_duration_minutes', 90),
                 oi_profit_target=trade_params.get('oi_profit_target'),
-                intended_risk_rupees=trade_params.get('total_trade_risk', 0.0)
+                intended_risk_rupees=trade_params.get('total_trade_risk', 0.0),
+                last_entry_modification=now_ist() # ### PILLAR 2 ### Initialize mod time
             )
             self.store.upsert_position(pos)
             self.positions[pos.id] = pos
-
-            ltp = self.prices.ltp(int(opt['instrument_token']))
-            if not ltp:
-                L.warning(f"Cannot get LTP for {ts}, cannot place entry order.")
-                pos.status = PositionStatus.REJECTED.value; pos.exit_reason = "NO_LTP_FOR_ENTRY"
+            
+            # ### PILLAR 2 IMPLEMENTATION: ADAPTIVE ENTRY ###
+            # Instead of placing an SL order, we start with a passive LIMIT order.
+            # The management loop will make it more aggressive over time.
+            full_tick = self.prices.get_full_tick(int(opt['instrument_token']))
+            if not full_tick or not full_tick.get('depth'):
+                L.warning(f"Cannot get depth for {ts}, cannot place adaptive entry.")
+                pos.status = PositionStatus.REJECTED.value; pos.exit_reason = "NO_DEPTH_FOR_ENTRY"
                 self.store.upsert_position(pos); return None
 
-            tick_size = self.book.tick_size(ts)
-            trigger_price = round((ltp + 2 * tick_size) / tick_size) * tick_size
-            order_price = round((trigger_price + 5 * tick_size) / tick_size) * tick_size
-
+            bid_price = full_tick['depth']['buy'][0]['price']
+            
             oid = self.k.place_order(
                 variety=self.k.VARIETY_REGULAR, exchange="NFO", tradingsymbol=ts,
                 transaction_type=self.k.TRANSACTION_TYPE_BUY, quantity=qty, product=self.k.PRODUCT_MIS,
-                order_type=self.k.ORDER_TYPE_SL, price=order_price, trigger_price=trigger_price
+                order_type=self.k.ORDER_TYPE_LIMIT, price=bid_price
             )
 
             if oid is None:
-                L.error(f"Entry order placement failed for {ts} after multiple retries.")
+                L.error(f"Adaptive Entry Stage 1 order placement failed for {ts} after multiple retries.")
                 pos.status = PositionStatus.REJECTED.value; pos.exit_reason = "BROKER_API_FAILURE"
                 self.store.upsert_position(pos); return None
 
-            L.info(f"Placed entry STOPLOSS order {oid} for {ts} with trigger @ {trigger_price}")
+            L.info(f"Placed Adaptive Entry Stage 1 (Passive) order {oid} for {ts} @ {bid_price}")
 
             self.positions.pop(temp_id, None)
             pos.id = f"LIVE_{oid}"
             pos.entry_order_id = str(oid)
             pos.status = PositionStatus.PENDING_ENTRY.value
+            pos.entry_stage = 1
             self.store.upsert_position(pos)
             self.positions[pos.id] = pos
             return pos
@@ -1434,6 +1452,11 @@ class MomentumBreakoutStrategy(BaseStrategy):
     def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
         df = self.engine.get_ohlc(token, self.params["resample_minutes"])
         if len(df) < self.params["squeeze_period"]: return None
+        
+        # ### PILLAR 1.3 IMPLEMENTATION: Check for Volatility Contraction ###
+        # This check is now done in the `_find_best_option_contract` function which is called before this.
+        # We will assume that if this strategy is called, the vol contraction is already confirmed.
+        
         df.ta.bbands(length=self.params["bb_period"], append=True)
         df.ta.adx(length=14, append=True)
         df['bbw'] = (df[f'BBU_{self.params["bb_period"]}_2.0'] - df[f'BBL_{self.params["bb_period"]}_2.0']) / df[f'BBM_{self.params["bb_period"]}_2.0']
@@ -1615,6 +1638,11 @@ class Engine:
         self.vix_long_history_df = pd.DataFrame()
         self.scheduler = self._setup_scheduler()
 
+        # ### PILLAR 1 IMPLEMENTATION ### Data structures for microstructure analysis
+        self.tfi_scores: Dict[int, float] = {} # Trade Flow Imbalance score
+        self.recent_trades: Dict[int, deque] = {} # Stores recent trades for TFI calc
+        self.historical_avg_iv: Dict[int, pd.Series] = {} # For Volatility Contraction
+
     def set_dependencies(self, trader: AbstractTrader):
         self.trader = trader
         if not PAPER_TRADING:
@@ -1671,6 +1699,9 @@ class Engine:
                 for t in sane_ticks:
                     self.prices.last[t["instrument_token"]] = t.get("last_price")
                     self.prices.full_ticks[t["instrument_token"]] = t
+                    
+                    # ### PILLAR 1.2 IMPLEMENTATION: Trade Flow Imbalance (TFI) ###
+                    self._update_tfi_score(t)
 
                     if t["instrument_token"] in open_positions_by_token:
                         self._update_position_greeks(open_positions_by_token[t["instrument_token"]], t)
@@ -1803,7 +1834,7 @@ class Engine:
     def _setup_scheduler(self) -> Dict[str, Tuple[Callable, int]]:
         tasks = {
             "strategic_planner": (self._run_strategic_planner, 5),
-            "position_management": (self.manage_positions, 2),
+            "position_management": (self.manage_positions, 1), # Faster loop for adaptive entry
             "pnl_updater": (self._update_pnl_metrics, 2),
             "reconciliation": (self.reconcile, 300),
             "health_check": (self.health_check, 60),
@@ -1971,11 +2002,11 @@ class Engine:
         risk_tolerance_factor = 1.4
         
         if actual_risk_rupees > (p.intended_risk_rupees * risk_tolerance_factor):
-             L.critical(f"RISK BREACH POST-FILL on {p.tradingsymbol}! "
-                        f"Intended Risk: ₹{p.intended_risk_rupees:.2f}, "
-                        f"Actual Risk: ₹{actual_risk_rupees:.2f}. EXITING POSITION.")
-             send_alert(f"🔥 RISK BREACH POST-FILL: {p.tradingsymbol}. Exiting immediately.", "critical")
-             self.trader.close_position(p, "POST_FILL_RISK_BREACH")
+                 L.critical(f"RISK BREACH POST-FILL on {p.tradingsymbol}! "
+                            f"Intended Risk: ₹{p.intended_risk_rupees:.2f}, "
+                            f"Actual Risk: ₹{actual_risk_rupees:.2f}. EXITING POSITION.")
+                 send_alert(f"🔥 RISK BREACH POST-FILL: {p.tradingsymbol}. Exiting immediately.", "critical")
+                 self.trader.close_position(p, "POST_FILL_RISK_BREACH")
 
     def _run_strategic_planner(self):
         with self.engine_lock:
@@ -2027,7 +2058,7 @@ class Engine:
                         L.info(f"Planner approved signal for {signal.strategy_name.value}. Placing on execution queue.")
                         self.trade_signal_queue.put(trade_params)
                         return # Only take the first valid signal
-            
+        
     def _trade_executor_worker(self):
         L.info("Trade executor worker started.")
         while self.running.is_set():
@@ -2177,22 +2208,69 @@ class Engine:
         else: target_delta = strike_cfg.get('compression_delta', 0.50)
 
         underlying_symbol = self.book.get_symbol(underlying_token); underlying_name = _get_underlying(underlying_symbol)
-        chain = self.book.get_option_chain(underlying_name, expiry); chain = chain[chain['instrument_type'] == option_type.value].copy()
-        step = self.book.step_size(underlying_name); atm_strike = round(spot / step) * step
-        search_range = 15 * step; chain = chain[(chain['strike'] >= atm_strike - search_range) & (chain['strike'] <= atm_strike + search_range)]
-        if chain.empty: return None
+        
+        # ### PILLAR 1.3 IMPLEMENTATION: Volatility Contraction Breakout Logic ###
+        step = self.book.step_size(underlying_name)
+        num_strikes = 5 # Monitor 5 nearest OTM strikes
+        
+        # Get the chain of options to analyze for IV
+        otm_strikes_chain = self.book.get_option_chain(underlying_name, expiry)
+        otm_calls = otm_strikes_chain[(otm_strikes_chain['instrument_type'] == 'CE') & (otm_strikes_chain['strike'] > spot)].sort_values('strike').head(num_strikes)
+        otm_puts = otm_strikes_chain[(otm_strikes_chain['instrument_type'] == 'PE') & (otm_strikes_chain['strike'] < spot)].sort_values('strike', ascending=False).head(num_strikes)
+        
+        iv_analysis_chain = pd.concat([otm_calls, otm_puts])
+        if iv_analysis_chain.empty: return None
 
-        max_iv_for_strategy = strategy_obj.params.get('max_iv_entry')
         now = now_ist(); market_close_time = self.config["timings"]["market_close"]
         T = _calculate_time_to_expiry(expiry.date() if isinstance(expiry, pd.Timestamp) else expiry, now, market_close_time)
-        min_volume = self.config['trading']['min_option_volume']; min_oi = self.config['trading']['min_option_oi']
-        
-        # ### IMPROVEMENT ### Calculate HV once to use as a fallback for all options in the chain.
         underlying_bars = self.bars.get_ohlc(underlying_token, 1)
         hv = calculate_historical_volatility(underlying_bars['close'], timeframe_minutes=1) if not underlying_bars.empty else 0.3
+        
+        ivs = []
+        for _, row in iv_analysis_chain.iterrows():
+            tick = self.prices.get_full_tick(int(row['instrument_token']))
+            if tick and tick.get('last_price'):
+                iv = calculate_iv(tick['last_price'], spot, row['strike'], T, 0.05, row['instrument_type'] == 'CE', hv_fallback=hv)
+                ivs.append(iv)
+        
+        if not ivs: return None
+        avg_iv = sum(ivs) / len(ivs)
+        
+        # Store and check for contraction
+        if underlying_token not in self.historical_avg_iv:
+            self.historical_avg_iv[underlying_token] = pd.Series(dtype=float)
+        
+        s = self.historical_avg_iv[underlying_token]
+        # Using concat instead of append for modern pandas
+        self.historical_avg_iv[underlying_token] = pd.concat([s, pd.Series([avg_iv], index=[now])])
 
+        # Trim the series to keep it manageable (e.g., last 4 hours of data)
+        self.historical_avg_iv[underlying_token] = self.historical_avg_iv[underlying_token].last('4H')
+
+        lookback = CONFIG["technical"].get("iv_contraction_lookback", 120) # 120 5-sec checks = 10 mins
+        iv_series = self.historical_avg_iv[underlying_token]
+        
+        is_in_contraction = False
+        if len(iv_series) > lookback:
+            iv_percentile = iv_series.rolling(lookback).rank(pct=True).iloc[-1]
+            if iv_percentile < CONFIG["technical"].get("iv_contraction_threshold_pct", 10) / 100.0:
+                is_in_contraction = True
+                L.info(f"VOLATILITY CONTRACTION DETECTED for {underlying_name}. Avg IV Pct Rank: {iv_percentile*100:.2f}%")
+
+        if strategy == StrategyName.MOMENTUM_BREAKOUT.value and not is_in_contraction:
+             L.info(f"MomentumBreakout signal for {underlying_name} skipped. Not in IV contraction phase.")
+             return None
+
+        # Now, find the single best contract to trade based on delta
+        full_chain = self.book.get_option_chain(underlying_name, expiry); 
+        trade_chain = full_chain[full_chain['instrument_type'] == option_type.value].copy()
+        atm_strike = round(spot / step) * step
+        search_range = 15 * step; trade_chain = trade_chain[(trade_chain['strike'] >= atm_strike - search_range) & (trade_chain['strike'] <= atm_strike + search_range)]
+        if trade_chain.empty: return None
+
+        min_volume = self.config['trading']['min_option_volume']; min_oi = self.config['trading']['min_option_oi']
         options_with_metrics = []
-        for _, row in chain.iterrows():
+        for _, row in trade_chain.iterrows():
             token = int(row['instrument_token']); tick = self.prices.get_full_tick(token)
             if not tick: continue
             if tick.get('volume', 0) < min_volume or tick.get('open_interest', 0) < min_oi: continue
@@ -2204,12 +2282,12 @@ class Engine:
             if spread > CONFIG['trading']['max_bid_ask_spread_pct'] / 100.0: continue
             
             iv = calculate_iv(ltp, spot, row['strike'], T, 0.05, option_type == OptionType.CE, hv_fallback=hv)
-            if max_iv_for_strategy is not None and (iv * 100) > max_iv_for_strategy: continue
             greeks = calculate_greeks(spot, row['strike'], T, 0.05, iv, option_type == OptionType.CE)
             options_with_metrics.append({'delta_diff': abs(abs(greeks['delta']) - target_delta), 'opt': row.to_dict(), 'ltp': ltp, 'greeks': greeks})
 
         if not options_with_metrics: return None
         return min(options_with_metrics, key=lambda x: x['delta_diff'])
+
 
     def get_trade_params(
         self,
@@ -2233,6 +2311,15 @@ class Engine:
         if not best_option_data: return None
 
         option_contract, option_ltp, greeks = best_option_data['opt'], best_option_data['ltp'], best_option_data['greeks']
+        
+        # ### PILLAR 1.1 & 1.2 IMPLEMENTATION: Microstructure Filters ###
+        if not self._check_order_book_imbalance(option_contract['instrument_token'], side):
+            L.warning(f"Trade for {option_contract['tradingsymbol']} REJECTED by OBI filter.")
+            return None
+        if not self._check_tfi(option_contract['instrument_token'], side):
+            L.warning(f"Trade for {option_contract['tradingsymbol']} REJECTED by TFI filter.")
+            return None
+        
         estimated_delta = greeks['delta']
         spot_price = self.prices.ltp(token)
         if not spot_price: return None
@@ -2298,7 +2385,10 @@ class Engine:
             if vix_ltp > vix_params["high_threshold"]: vix_risk_factor = vix_params["high_factor"]
             elif vix_ltp < vix_params["low_threshold"]: vix_risk_factor = vix_params["low_factor"]
 
-        final_risk_factor = self.risk_factor * vol_adjustment * vix_risk_factor * expiry_day_risk_factor
+        # ### PILLAR 3.2 IMPLEMENTATION: Time-of-Day Risk Scaling ###
+        time_of_day_multiplier = self._get_time_of_day_risk_multiplier()
+
+        final_risk_factor = self.risk_factor * vol_adjustment * vix_risk_factor * expiry_day_risk_factor * time_of_day_multiplier
         allowed_risk = self.dynamic_account_equity * (active_risk_pct / 100.0) * final_risk_factor
 
         calculated_lots = int(math.floor(allowed_risk / risk_per_lot)) if risk_per_lot > 0 else 0
@@ -2329,12 +2419,9 @@ class Engine:
 
         now = now_ist()
         for p in active_positions:
-            # ### IMPROVEMENT ### Handle pending entry timeouts
+            # ### PILLAR 2 IMPLEMENTATION: Adaptive Entry Management ###
             if p.status == PositionStatus.PENDING_ENTRY.value:
-                timeout = self.config['trading'].get('entry_order_timeout_seconds', 60)
-                if (now - p.opened_at).total_seconds() > timeout:
-                    L.warning(f"Entry order for {p.tradingsymbol} has timed out. Cancelling.")
-                    self.trader.cancel_pending_entry(p)
+                self._manage_adaptive_entry(p, now)
                 continue
             
             # ### IMPROVEMENT ### Ensure brackets are always placed if a position is open
@@ -2449,17 +2536,26 @@ class Engine:
                     return False
 
             current_equity = self.dynamic_account_equity + self.trader.daily_realized_pnl + self.last_unrealized_pnl
-            weekly_drawdown_limit = self.weekly_high_water_mark * (CONFIG["trading"].get("weekly_drawdown_pct_limit", 8.0) / 100.0)
-            if not self.in_weekly_drawdown_lock and current_equity < (self.weekly_high_water_mark - weekly_drawdown_limit):
-                self.in_weekly_drawdown_lock = True
-                send_alert(f"🔒 WEEKLY DD LOCK ENGAGED. Peak: {self.weekly_high_water_mark:.2f}, Current: {current_equity:.2f}. Switching to DEFENSIVE mode.", "warning")
+            
+            # ### PILLAR 3.1 IMPLEMENTATION: Profit Lock-in Drawdown ###
+            realized_pnl = self.trader.daily_realized_pnl
+            profit_lock_floor = -float('inf')
+            
+            if realized_pnl > 0:
+                profit_at_risk_pct = self.config["trading"].get("profit_lockin_pct_at_risk", 40.0) / 100.0
+                profit_at_risk = realized_pnl * profit_at_risk_pct
+                profit_lock_floor = self.daily_high_water_mark - profit_at_risk
 
-            daily_drawdown_limit = self.daily_high_water_mark * (MAX_DAILY_DRAWDOWN_PCT / 100.0)
+            static_dd_limit = self.daily_high_water_mark * (MAX_DAILY_DRAWDOWN_PCT / 100.0)
+            static_floor = self.daily_high_water_mark - static_dd_limit
+            
+            final_floor = max(static_floor, profit_lock_floor)
+            
             daily_dd_pct = (self.daily_high_water_mark - current_equity) / self.daily_high_water_mark * 100 if self.daily_high_water_mark > 0 else 0
             if G_DAILY_DRAWDOWN_PCT: G_DAILY_DRAWDOWN_PCT.set(daily_dd_pct)
 
-            if current_equity < (self.daily_high_water_mark - daily_drawdown_limit):
-                send_alert(f"⛔ DD LIMIT HIT. HALTING. Peak Equity: {self.daily_high_water_mark:.2f}, Current: {current_equity:.2f} (DD: {daily_dd_pct:.2f}%)", "critical")
+            if current_equity < final_floor:
+                send_alert(f"⛔ DD LIMIT HIT. HALTING. Peak Equity: {self.daily_high_water_mark:.2f}, Current: {current_equity:.2f} (Floor: {final_floor:.2f})", "critical")
                 self.halt_trading = True
                 if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
 
@@ -2493,8 +2589,8 @@ class Engine:
                 send_alert(f"🔥 RECONCILE: Rogue position for {symbol} (Qty: {qty}) found at broker! Auto-flattening.", "critical");
                 transaction_type = self.k.TRANSACTION_TYPE_SELL if qty > 0 else self.k.TRANSACTION_TYPE_BUY
                 oid = self.k.place_order( variety=self.k.VARIETY_REGULAR, exchange="NFO", tradingsymbol=symbol,
-                                          transaction_type=transaction_type, quantity=abs(qty),
-                                          product=self.k.PRODUCT_MIS, order_type=self.k.ORDER_TYPE_MARKET )
+                                         transaction_type=transaction_type, quantity=abs(qty),
+                                         product=self.k.PRODUCT_MIS, order_type=self.k.ORDER_TYPE_MARKET )
                 if oid is None: send_alert(f"🔥🔥 FATAL: FAILED to auto-flatten rogue position {symbol}. MANUAL INTERVENTION REQUIRED!", "critical")
                 else: L.info(f"Placed market order {oid} to flatten rogue position {symbol}.")
 
@@ -2515,7 +2611,7 @@ class Engine:
             if age > 120 and self.config["timings"]["market_open"] < now_ist().time() < self.config["timings"]["market_close"]:
                 send_alert(f"🔥 CRITICAL: Stale Feed! No ticks received for {age:.0f} seconds.", "critical")
         elif self.config["timings"]["market_open"] < now_ist().time() < self.config["timings"]["market_close"]:
-             if G_LAST_TICK_AGE_SECONDS: G_LAST_TICK_AGE_SECONDS.set(999)
+                 if G_LAST_TICK_AGE_SECONDS: G_LAST_TICK_AGE_SECONDS.set(999)
 
     def _update_dynamic_equity(self):
         if PAPER_TRADING:
@@ -2630,6 +2726,146 @@ class Engine:
             for key in ["delta", "vega", "gamma", "theta"]:
                 change = p.greeks.get(key, 0.0) - old_greeks.get(key, 0.0)
                 self.portfolio_greeks[f"net_{key}"] += change * p.qty
+
+    # ### PILLAR 1 & 2 & 3 - NEW HELPER FUNCTIONS ###
+    def _get_time_of_day_risk_multiplier(self) -> float:
+        """### PILLAR 3.2 IMPLEMENTATION ###
+        Returns a risk multiplier based on the time of day.
+        """
+        now_time = now_ist().time()
+        time_config = self.config["trading"].get("time_of_day_risk", {})
+        
+        open_start, open_end = dtime.fromisoformat(time_config.get("opening_range", "09:15:00")), dtime.fromisoformat(time_config.get("opening_end", "10:30:00"))
+        midday_start, midday_end = dtime.fromisoformat(time_config.get("midday_range", "11:30:00")), dtime.fromisoformat(time_config.get("midday_end", "13:30:00"))
+        
+        if open_start <= now_time < open_end:
+            return time_config.get("opening_multiplier", 1.25)
+        elif midday_start <= now_time < midday_end:
+            return time_config.get("midday_multiplier", 0.5)
+        else:
+            return time_config.get("default_multiplier", 1.0)
+            
+    def _update_tfi_score(self, tick: dict):
+        """### PILLAR 1.2 IMPLEMENTATION ###
+        Analyzes a single tick to update the Trade Flow Imbalance score.
+        """
+        token = tick.get('instrument_token')
+        price = tick.get('last_price')
+        qty = tick.get('last_traded_quantity')
+        depth = tick.get('depth')
+
+        if not all([token, price, qty, depth]): return
+        if not depth.get('buy') or not depth.get('sell'): return
+
+        if token not in self.recent_trades:
+            window = self.config["technical"].get("tfi_window", 50)
+            self.recent_trades[token] = deque(maxlen=window)
+            self.tfi_scores[token] = 0.0
+
+        bid_price = depth['buy'][0]['price']
+        ask_price = depth['sell'][0]['price']
+        trade_value = 0
+
+        if price >= ask_price: # Aggressive Buy
+            trade_value = qty
+        elif price <= bid_price: # Aggressive Sell
+            trade_value = -qty
+        
+        if trade_value != 0:
+            self.recent_trades[token].append(trade_value)
+            self.tfi_scores[token] = sum(self.recent_trades[token])
+            
+    def _check_tfi(self, token: int, side: OrderSide) -> bool:
+        """### PILLAR 1.2 IMPLEMENTATION ###
+        Checks if the TFI score confirms a trade signal.
+        """
+        score = self.tfi_scores.get(token, 0.0)
+        threshold = self.config["technical"].get("tfi_confirmation_threshold", 500)
+        
+        if side == OrderSide.BUY and score > threshold:
+            L.info(f"TFI confirmed BUY for {token}. Score: {score}")
+            return True
+        if side == OrderSide.SELL and score < -threshold:
+            L.info(f"TFI confirmed SELL for {token}. Score: {score}")
+            return True
+        
+        return False
+
+    def _check_order_book_imbalance(self, token: int, side: OrderSide) -> bool:
+        """### PILLAR 1.1 IMPLEMENTATION ###
+        Analyzes the order book for imbalances to confirm a signal.
+        """
+        full_tick = self.prices.get_full_tick(token)
+        if not full_tick or not full_tick.get('depth'):
+            return False
+
+        depth = full_tick['depth']
+        bids = depth.get('buy', [])
+        asks = depth.get('sell', [])
+        
+        if not bids or not asks: return False
+        
+        # Analyze top 20 levels as requested
+        total_bid_qty = sum(item['quantity'] for item in bids[:20])
+        total_ask_qty = sum(item['quantity'] for item in asks[:20])
+        
+        if (total_bid_qty + total_ask_qty) == 0: return False
+        
+        obi_ratio = total_bid_qty / (total_bid_qty + total_ask_qty)
+        
+        threshold = self.config["technical"].get("obi_confirmation_threshold_pct", 75.0) / 100.0
+        
+        if side == OrderSide.BUY and obi_ratio > threshold:
+            L.info(f"OBI confirmed BUY for {token}. Ratio: {obi_ratio:.2f}")
+            return True
+        if side == OrderSide.SELL and (1 - obi_ratio) > threshold:
+            L.info(f"OBI confirmed SELL for {token}. Ratio: {obi_ratio:.2f} (Ask dominance: {1-obi_ratio:.2f})")
+            return True
+            
+        return False
+        
+    def _manage_adaptive_entry(self, p: Position, now: datetime):
+        """### PILLAR 2 IMPLEMENTATION ###
+        Handles the logic for the multi-stage adaptive entry.
+        """
+        if not p.last_entry_modification: return
+        
+        time_since_mod = (now - p.last_entry_modification).total_seconds()
+        
+        full_tick = self.prices.get_full_tick(p.token)
+        if not full_tick or not full_tick.get('depth'): return
+
+        depth = full_tick['depth']
+        if not depth.get('buy') or not depth.get('sell'): return
+
+        bid_price = depth['buy'][0]['price']
+        ask_price = depth['sell'][0]['price']
+        mid_price = (bid_price + ask_price) / 2.0
+        tick_size = self.book.tick_size(p.tradingsymbol)
+        mid_price = round(mid_price / tick_size) * tick_size # Round to nearest tick
+
+        new_price = -1.0
+
+        if p.entry_stage == 1 and time_since_mod > self.config['trading']['adaptive_entry_stage2_ms']/1000.0:
+            L.info(f"Adaptive Entry Stage 2 (Neutral) for {p.tradingsymbol}")
+            new_price = mid_price
+            p.entry_stage = 2
+        elif p.entry_stage == 2 and time_since_mod > self.config['trading']['adaptive_entry_stage3_ms']/1000.0:
+            L.info(f"Adaptive Entry Stage 3 (Aggressive) for {p.tradingsymbol}")
+            new_price = ask_price
+            p.entry_stage = 3
+        
+        if new_price > 0:
+            if self.trader.k.modify_order(
+                variety=self.trader.k.VARIETY_REGULAR,
+                order_id=p.entry_order_id,
+                price=new_price
+            ):
+                p.last_entry_modification = now
+                self.store.upsert_position(p)
+                L.info(f"Modified entry order {p.entry_order_id} to price {new_price}")
+            else:
+                L.error(f"Failed to modify entry order {p.entry_order_id} for adaptive entry.")
 
     def stop(self):
         if self.running.is_set():

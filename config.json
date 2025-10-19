@@ -1,104 +1,139 @@
 {
-  "trading": {
-    "paper_trading": true,
-    "account_equity": 100000.0,
-    "max_daily_drawdown_pct": 5.0,
-    "weekly_drawdown_pct_limit": 10.0,
-    "max_concurrent_trades": 1,
-    "trade_cooldown_minutes": 5,
-    "metrics_port": 9095,
-    "paper_trade_slippage_ticks": 1,
-    "correlated_risk_reduction_factor": 0.6,
-    "min_option_price": 20.0,
-    "max_bid_ask_spread_pct": 0.75,
-    "max_sl_pct_of_premium": 50.0,
-    "max_lots_per_trade": 20,
-    "insane_tick_pct": 5.0,
-    "max_trade_duration_minutes": 150,
-    "risk_tiers": {
-      "defensive": 1.0,
-      "standard": 2.0,
-      "aggressive": 3.0
+    "trading": {
+        "paper_trading": true,
+        "account_equity": 100000.0,
+        "max_daily_drawdown_pct": 2.5,
+        "weekly_drawdown_pct_limit": 5.0,
+        "max_concurrent_trades": 1,
+        "max_lots_per_trade": 20,
+        "trade_cooldown_minutes": 15,
+        "min_option_price": 25.0,
+        "max_bid_ask_spread_pct": 0.75,
+        "paper_trade_slippage_ticks": 2,
+
+        "risk_tiers": {
+            "aggressive": 1.25,
+            "standard": 1.0,
+            "defensive": 0.5
+        },
+        "consecutive_loss_adjustment": {
+            "reduction_per_loss": 0.15,
+            "min_factor": 0.4
+        },
+        "vix_adjustment": {
+            "low_threshold": 12,
+            "low_factor": 1.2,
+            "high_threshold": 20,
+            "high_factor": 0.6
+        },
+
+        "max_sl_pct_of_premium": 40.0,
+        "breakeven_trigger_rr": 1.2,
+        "trailing_sl_activation_rr": 2.0,
+        "trailing_sl": {
+            "timeframe": 5,
+            "chandelier_period": 14,
+            "chandelier_multiplier": 2.5,
+            "timeframe_scaled_out": 3,
+            "chandelier_multiplier_scaled_out": 2.0
+        },
+        "scale_out_rules": [
+            {"rr_target": 1.8, "pct_to_close": 50},
+            {"rr_target": 3.0, "pct_to_close": 50}
+        ],
+        
+        "portfolio_limits": {
+            "max_portfolio_net_delta": 4000,
+            "max_portfolio_net_vega": 8000
+        },
+
+        "option_selection_filters": {
+            "max_iv_rank_entry": 65.0,
+            "min_dist_from_oi_wall_pct": 0.3,
+            "min_option_volume": 100000,
+            "min_option_oi": 1000000
+        },
+        "strike_selection": {
+            "trend_delta": 0.45,
+            "chop_delta": 0.65,
+            "compression_delta": 0.50
+        },
+
+        "# --- PILLAR 2: EXECUTION ALPHA ---": {},
+        "adaptive_entry_stage2_ms": 150,
+        "adaptive_entry_stage3_ms": 250,
+        "entry_order_timeout_seconds": 20,
+
+        "# --- PILLAR 3: RISK ALPHA ---": {},
+        "profit_lock_in": {
+            "min_profit_trigger": 10000.0,
+            "pct_to_risk": 40.0
+        },
+        "time_of_day_risk": {
+            "opening_range": "09:15:00", "opening_end": "10:30:00", "opening_multiplier": 1.25,
+            "midday_range": "11:30:00", "midday_end": "13:30:00", "midday_multiplier": 0.50,
+            "default_multiplier": 1.0
+        }
     },
-    "consecutive_loss_adjustment": {
-      "min_factor": 0.5,
-      "reduction_per_loss": 0.25
+
+    "timings": {
+        "market_open": "09:15:00", 
+        "market_settling_time": "09:35:00",
+        "final_entry_time": "14:30:00",
+        "final_expiry_entry_time": "13:30:00",
+        "eod_flatten_time": "15:10:00",
+        "market_close": "15:30:00"
     },
-    "vix_adjustment": {
-      "high_threshold": 22.0,
-      "high_factor": 0.75,
-      "low_threshold": 12.0,
-      "low_factor": 1.1
+
+    "technical": {
+        "warmup_days": 15,
+        "insane_tick_pct": 5.0,
+
+        "# --- PILLAR 1: STRATEGY ALPHA ---": {},
+        "tfi_window": 50,
+        "tfi_confirmation_threshold": 500,
+        "obi_confirmation_threshold_pct": 70.0,
+        "iv_contraction_lookback": 120,
+        "iv_contraction_threshold_pct": 10.0
     },
-    "scale_out_rules": [
-      {
-        "rr_target": 2.5,
-        "pct_to_close": 40
-      }
-    ],
-    "breakeven_trigger_rr": 1.5,
-    "trailing_sl_activation_rr": 2.0,
-    "trailing_sl_timeframe": 5,
-    "trailing_sl_chandelier_period": 14,
-    "trailing_sl_chandelier_multiplier": 2.5,
-    "trailing_sl_timeframe_scaled_out": 3,
-    "trailing_sl_chandelier_multiplier_scaled_out": 2.0,
-    "expiry_day_protocol_active": true,
-    "expiry_day_delta_assumption": 0.85,
-    "expiry_day_risk_reduction_factor": 0.5
-  },
-  "timings": {
-    "market_open": "09:15:00",
-    "market_settling_time": "09:20:00",
-    "final_entry_time": "14:45:00",
-    "final_expiry_entry_time": "14:15:00",
-    "eod_flatten_time": "15:10:00",
-    "market_close": "15:30:00"
-  },
-  "technical": {
-    "warmup_days": 15
-  },
-  "strategies": {
-    "regime_classifier": {
-      "resample_minutes": 5,
-      "hysteresis_confirmation_count": 3,
-      "adx_period": 14,
-      "adx_trend_entry_threshold": 23.0,
-      "adx_trend_exit_threshold": 20.0,
-      "bb_period": 20,
-      "bbw_rank_period": 100,
-      "compression_rank_threshold": 10.0,
-      "correlation_period": 50,
-      "correlation_threshold": 0.4,
-      "vix_chaos_threshold": 24.0
-    },
-    "momentum_breakout": {
-      "resample_minutes": 5,
-      "target_delta": 0.55,
-      "max_iv_entry": 30.0,
-      "bb_period": 20,
-      "squeeze_period": 50,
-      "squeeze_factor": 0.8,
-      "volume_factor": 1.5,
-      "atr_sl_multiplier": 1.8,
-      "atr_tp_multiplier": 3.0
-    },
-    "trend_pullback": {
-      "primary_tf": 5,
-      "confirm_tf": 15,
-      "target_delta": 0.6,
-      "max_iv_entry": 28.0,
-      "ema_period": 21,
-      "atr_sl_multiplier": 2.0,
-      "atr_tp_multiplier": 3.5
-    },
-    "mean_reversion": {
-      "resample_minutes": 5,
-      "target_delta": 0.5,
-      "max_iv_entry": 35.0,
-      "bb_period": 20,
-      "atr_sl_multiplier": 1.5,
-      "atr_tp_multiplier": 1.5
+
+    "strategies": {
+        "regime_classifier": {
+            "resample_minutes": 5,
+            "adx_period": 14,
+            "bb_period": 20,
+            "dynamic_regime_lookback": 200,
+            "hysteresis_confirmation_count": 2,
+            "vix_chaos_threshold": 22.0,
+            "correlation_period": 50,
+            "correlation_threshold": 0.4
+        },
+        "MomentumBreakout": {
+            "resample_minutes": 5,
+            "squeeze_period": 50,
+            "squeeze_factor": 0.8,
+            "bb_period": 20,
+            "volume_factor": 1.8,
+            "atr_sl_multiplier": 2.2,
+            "atr_tp_multiplier": 4.0,
+            "max_duration_minutes": 75,
+            "max_iv_entry": 35.0
+        },
+        "TrendPullback": {
+            "primary_tf": 5,
+            "confirm_tf": 15,
+            "ema_period": 21,
+            "atr_sl_multiplier": 1.8,
+            "atr_tp_multiplier": 3.5,
+            "max_duration_minutes": 120,
+            "max_iv_entry": 45.0
+        },
+        "MeanReversion": {
+            "resample_minutes": 5,
+            "bb_period": 20,
+            "atr_sl_multiplier": 1.5,
+            "max_duration_minutes": 60,
+            "max_iv_entry": 50.0
+        }
     }
-  }
 }
