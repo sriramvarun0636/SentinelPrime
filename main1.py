@@ -2138,12 +2138,19 @@ class RiskManager:
 
         slippage_factor = self.trading_config.get("sl_slippage_factor_pct", 20.0) / 100.0
         
-        # --- NEW: Confluence Score Sizing ---
-        # Normalize the score. Assumes a "standard" score is 2.0.
-        # A score of 2.0 = 100% size. 1.0 = 50% size. 4.0 = 150% size (capped).
+        # --- NEW: Confluence Score Sizing (from config) ---
         standard_score = self.trading_config.get("standard_trade_score", 2.0)
-        bet_sizing_multiplier = max(0.25, min(1.5, confidence_score / standard_score))
-        L.info(f"Confluence Sizing: Score={confidence_score:.2f}, Standard={standard_score}, Multiplier={bet_sizing_multiplier:.2f}")
+        sizing_floor = self.trading_config.get("regime_confidence_sizing_floor", 0.5)
+        sizing_cap = self.trading_config.get("regime_confidence_sizing_cap", 1.5)
+        
+        # Calculate raw multiplier based on signal's confluence score
+        raw_multiplier = confidence_score / standard_score
+        
+        # Clamp the multiplier using the floor and cap from config.json
+        bet_sizing_multiplier = max(sizing_floor, min(sizing_cap, raw_multiplier))
+        
+        L.info(f"Confluence Sizing: Score={confidence_score:.2f}, Raw Multi={raw_multiplier:.2f}, "
+               f"Clamped Multi={bet_sizing_multiplier:.2f} (Floor: {sizing_floor}, Cap: {sizing_cap})")
 
         # --- NEW: Dynamic Strategy Weighting ---
         # (This implements Change #3)
@@ -3870,6 +3877,30 @@ class Engine:
 
             # --- 2. Update Regime Classification (Needed for scoring even if halted) ---
             self.run_regime_classification(now)
+            # --- NEW: 2a. Regime Stability/Confidence Check ---
+            low_conf_thresh = self.trading_config.get("low_regime_confidence_threshold", 0.0)
+            flip_rate_thresh = self.trading_config.get("high_regime_flip_rate_threshold", 99)
+            
+            # Calculate flip rate (flips in last 1 hour)
+            flips_last_hour = 0
+            if self.regime_change_history:
+                one_hour_ago = now - timedelta(hours=1)
+                flips_last_hour = sum(1 for ts in self.regime_change_history if ts > one_hour_ago)
+            
+            is_unstable = False
+            if self.regime_confidence < low_conf_thresh:
+                L.warning(f"REGIME STABILITY HALT: Confidence ({self.regime_confidence:.2f}) is below threshold ({low_conf_thresh}). Halting.")
+                is_unstable = True
+                
+            if flips_last_hour > flip_rate_thresh:
+                L.warning(f"REGIME STABILITY HALT: Flip rate ({flips_last_hour}/hr) is above threshold ({flip_rate_thresh}). Halting.")
+                is_unstable = True
+
+            if is_unstable:
+                if not self.halt_trading: # Only log/alert on the transition
+                     send_alert(f"⚠️ REGIME UNSTABLE: Confidence {self.regime_confidence:.2f}, Flip Rate {flips_last_hour}/hr. Halting new entries.", "warning")
+                self.halt_trading = True
+                if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
 
             # --- 3. Master Halt Check (Check *after* potential Theta Halt engagement/disengagement) ---
             if self.halt_trading:
