@@ -6,6 +6,7 @@ import sys
 import time
 import math
 import json
+import queue
 import signal
 import logging
 import threading
@@ -59,6 +60,143 @@ try:
     from scipy.stats import norm
 except ImportError:
     raise RuntimeError("scipy library not found. Please install it: pip install scipy")
+
+# ==================================================================================================
+# ACTOR MODEL - FOR CONCURRENCY SAFETY
+# ==================================================================================================
+L_ACTORS = logging.getLogger("SENTINEL-PRIME.ACTORS")
+
+class OrderActor(threading.Thread):
+    """A single-threaded actor for all broker API I/O."""
+    def __init__(self, kite_client: GovernedKite):
+        super().__init__(daemon=True, name="OrderActor")
+        self.q = queue.Queue()
+        self.kite = kite_client
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                msg = self.q.get(timeout=1.0)
+                if msg is None:
+                    continue
+
+                L_ACTORS.debug(f"OrderActor processing: {msg.get('type')}")
+                msg_type = msg['type']
+                reply_q = msg.get('reply_q') # Reply queue is optional
+
+                try:
+                    res = None
+                    # --- Write/Trade Methods ---
+                    if msg_type == "place_order":
+                        res = self.kite.place_order(**msg['params'])
+                    elif msg_type == "modify_order":
+                        res = self.kite.modify_order(**msg['params'])
+                    elif msg_type == "cancel_order":
+                        res = self.kite.cancel_order(**msg['params'])
+                    
+                    # --- Read/Data Methods ---
+                    elif msg_type == "order_history":
+                        res = self.kite.order_history(**msg['params'])
+                    
+                    # --- NEWLY ADDED METHODS ---
+                    elif msg_type == "orders":
+                        res = self.kite.orders()
+                    elif msg_type == "positions":
+                        res = self.kite.positions()
+                    elif msg_type == "margins":
+                        res = self.kite.margins()
+                    elif msg_type == "instruments":
+                        res = self.kite.instruments(**msg['params'])
+                    elif msg_type == "historical_data":
+                        res = self.kite.historical_data(**msg['params'])
+                    elif msg_type == "quote":
+                        res = self.kite.quote(**msg['params'])
+                    # --- END NEW METHODS ---
+
+                    else:
+                        L_ACTORS.error(f"OrderActor unknown message type: {msg_type}")
+
+                    if reply_q:
+                        reply_q.put({"ok": True, "res": res})
+
+                except Exception as e:
+                    L_ACTORS.error(f"OrderActor error on {msg_type}: {e}", exc_info=False)
+                    if reply_q:
+                        reply_q.put({"ok": False, "error": e})
+                
+                self.q.task_done()
+
+            except queue.Empty:
+                continue
+
+    def stop(self):
+        self.running = False
+        self.q.put(None) # Unblock .get()
+
+class StoreActor(threading.Thread):
+    """A single-threaded actor for all database I/O."""
+    def __init__(self, store: Store):
+        super().__init__(daemon=True, name="StoreActor")
+        self.q = queue.Queue()
+        self.store = store # The *only* thread that can use this object
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                msg = self.q.get(timeout=1.0)
+                if msg is None:
+                    continue
+
+                L_ACTORS.debug(f"StoreActor processing: {msg.get('type')}")
+                msg_type = msg['type']
+                reply_q = msg.get('reply_q') # Reply is optional
+
+                try:
+                    res = None
+                    # --- Write Methods ---
+                    if msg_type == "upsert_position":
+                        self.store.upsert_position(msg['pos'])
+                    elif msg_type == "log_closed_trade":
+                        self.store.log_closed_trade(msg['pos'], msg['price'], msg['reason'])
+                    elif msg_type == "log_strategy_performance":
+                        self.store.log_strategy_performance(msg['name'], msg['pnl'])
+                    elif msg_type == "set_kv":
+                        self.store.set_kv(msg['key'], msg['value'])
+                    
+                    # --- Read Methods ---
+                    elif msg_type == "get_kv":
+                        res = self.store.get_kv(msg['key'], msg.get('default'))
+                    elif msg_type == "load_open_positions":
+                        res = self.store.load_open_positions()
+                    
+                    # --- NEWLY ADDED METHODS ---
+                    elif msg_type == "get_strategy_performance":
+                        res = self.store.get_strategy_performance(msg['lookback_days'])
+                    elif msg_type == "get_todays_trades_stats":
+                        res = self.store.get_todays_trades_stats()
+                    # --- END NEW METHODS ---
+                    
+                    else:
+                        L_ACTORS.error(f"StoreActor unknown message type: {msg_type}")
+
+                    if reply_q:
+                        reply_q.put({"ok": True, "res": res})
+
+                except Exception as e:
+                    L_ACTORS.error(f"StoreActor error on {msg_type}: {e}", exc_info=True)
+                    if reply_q:
+                        reply_q.put({"ok": False, "error": e})
+
+                self.q.task_done()
+
+            except queue.Empty:
+                continue
+    
+    def stop(self):
+        self.running = False
+        self.q.put(None) # Unblock .get()
 
 
 # ==================================================================================================
@@ -733,9 +871,9 @@ class Store:
 # DATA MANAGEMENT
 # ==================================================================================================
 class InstrumentBook:
-    def __init__(self, kite: GovernedKite, store: Store):
-        self.kite = kite
-        self.store = store
+    def __init__(self, store_actor: StoreActor, order_actor: OrderActor):
+        self.store_actor = store_actor
+        self.order_actor = order_actor
         self.df = None
         self.path = os.path.join(PERSIST_DIR, "instruments_nfo.csv")
         self.df_by_token = None
@@ -746,8 +884,29 @@ class InstrumentBook:
 
     def load(self):
         try:
-            if not os.path.exists(self.path) or self.store.get_kv("instruments_refreshed") != str(date.today()):
-                self.refresh()
+            # --- FIXED: Use StoreActor for DB read ---
+            # This is a blocking call, safe to do on startup
+            L.debug("InstrumentBook checking refresh status with StoreActor...")
+            reply_q = queue.Queue()
+            self.store_actor.q.put({
+                "type": "get_kv",
+                "key": "instruments_refreshed",
+                "default": None,
+                "reply_q": reply_q
+            })
+            
+            instruments_refreshed = None
+            try:
+                resp = reply_q.get(timeout=10.0) # Wait for actor's reply
+                if resp['ok']:
+                    instruments_refreshed = resp['res']
+                else:
+                    L.warning(f"StoreActor failed to get 'instruments_refreshed' key: {resp.get('error')}")
+            except queue.Empty:
+                L.error("Timeout waiting for StoreActor reply in InstrumentBook.load()")
+
+            if not os.path.exists(self.path) or instruments_refreshed != str(date.today()):
+                self.refresh() # This will also use actors
             else:
                 L.info("Loading NFO instruments from local cache.")
                 self.df = pd.read_csv(self.path, parse_dates=["expiry"])
@@ -765,17 +924,45 @@ class InstrumentBook:
         return self
 
     def refresh(self):
-        L.info("Refreshing NFO instrument list from broker...")
+        L.info("Refreshing NFO instrument list via OrderActor...")
         try:
-            instruments = self.kite.instruments("NFO")
+            # --- FIXED: Use OrderActor for API call ---
+            reply_q = queue.Queue()
+            self.order_actor.q.put({
+                "type": "instruments",
+                "params": {"exchange": "NFO"},
+                "reply_q": reply_q
+            })
+
+            instruments = None
+            try:
+                resp = reply_q.get(timeout=10.0) # Wait for actor's reply
+                if resp['ok']:
+                    instruments = resp['res']
+                else:
+                    L.error(f"OrderActor failed to get instruments: {resp.get('error')}")
+                    raise KiteException(f"OrderActor failed: {resp.get('error')}")
+            except queue.Empty:
+                L.error("Timeout waiting for OrderActor reply in InstrumentBook.refresh()")
+                raise KiteException("Timeout waiting for OrderActor reply")
+
             if instruments is None:
-                raise KiteException("Failed to fetch NFO instruments from API after multiple retries.")
+                raise KiteException("Failed to fetch NFO instruments from OrderActor after multiple retries.")
+            
             df = pd.DataFrame(instruments)
             if "expiry" in df.columns:
                 df["expiry"] = pd.to_datetime(df["expiry"], errors="coerce")
             df.to_csv(self.path, index=False)
             self.df = df
-            self.store.set_kv("instruments_refreshed", str(date.today()))
+            
+            # --- FIXED: Use StoreActor for DB write ---
+            # This is a non-blocking "fire-and-forget" message
+            self.store_actor.q.put({
+                "type": "set_kv",
+                "key": "instruments_refreshed",
+                "value": str(date.today())
+            })
+            
             L.info(f"NFO Instrument list refreshed and saved. Rows: {len(df)}")
         except Exception as e:
             L.error(f"API fetch for NFO instruments failed: {e}")
@@ -788,6 +975,7 @@ class InstrumentBook:
 
     def _load_special_tokens(self):
         L.info("Loading special instrument tokens...")
+        # These methods are safe, they only read from self.df
         nifty_fut = self.find_current_futures_contract("NIFTY")
         bn_fut = self.find_current_futures_contract("BANKNIFTY")
         if nifty_fut:
@@ -804,6 +992,10 @@ class InstrumentBook:
             self.special_tokens["INDIA VIX"] = 257281
 
         L.info(f"Special tokens loaded: {self.special_tokens}")
+
+    # --- NO CHANGES NEEDED BELOW ---
+    # All other methods only read from self.df and do not
+    # make any network or database calls. They are already safe.
 
     def get_token(self, trading_symbol: str) -> Optional[int]:
         try:
@@ -1144,6 +1336,34 @@ def get_raw_classification(self, current_regime_enum: Regime) -> Tuple[Regime, O
         # --- Calculate Indicators ---
         df_n = self._add_indicators(df_n)
         df_bn = self._add_indicators(df_bn)
+        
+        try:
+            df_n_close = df_n['close']
+            df_bn_close = df_bn['close']
+            
+            # Calculate the ratio
+            ratio_series = df_n_close / df_bn_close
+            
+            # Get the lookback period from your config
+            lookback = self.params.get("dynamic_regime_lookback", 200)
+            
+            # Calculate rolling mean and std dev
+            ratio_mean = ratio_series.rolling(window=lookback).mean().iloc[-1]
+            ratio_std = ratio_series.rolling(window=lookback).std().iloc[-1]
+            current_ratio = ratio_series.iloc[-1]
+
+            if ratio_std > 0:
+                # Calculate the z-score (how many std devs from the mean)
+                zscore = (current_ratio - ratio_mean) / ratio_std
+                # Store this on the main engine object
+                self.engine.nifty_bn_zscore = zscore 
+                L.debug(f"StatArb Z-Score: {zscore:.2f} (Ratio: {current_ratio:.4f})")
+            else:
+                self.engine.nifty_bn_zscore = 0.0 # Not enough data or no volatility
+                
+        except Exception as e:
+            L.warning(f"StatArb ratio calculation failed: {e}")
+            self.engine.nifty_bn_zscore = None # Set to None on failure
 
         # --- Calculate Scores ---
         score_n = self._get_scores(df_n, current_regime_enum)
@@ -1288,16 +1508,37 @@ class AbstractTrader(ABC):
     def execute_simulated_sl(self, p: Position) -> bool:
         pass
 
-    def unrealized_pnl(self) -> float:
-        pnl = 0.0
-        with self.lock:
-            for p in self.positions.values():
-                if p.status not in [PositionStatus.CLOSED.value, PositionStatus.PENDING_ENTRY.value, PositionStatus.PENDING_SUBMISSION.value, PositionStatus.REJECTED.value]:
-                    ltp = self.prices.ltp(p.token)
-                    if ltp is None:
-                        ltp = p.entry_price
-                    pnl += (ltp - p.entry_price) * p.qty
-        return pnl
+    # In AbstractTrader class
+def unrealized_pnl(self) -> float:
+    """Calculates total unrealized PnL for all active positions."""
+    pnl = 0.0
+    with self.lock:
+        # Loop through all positions the trader is currently managing
+        for p in self.positions.values():
+            
+            # --- THE FIX ---
+            # Calculate PnL for *any* position that is not fully closed 
+            # or in a pre-submission state.
+            # This NOW INCLUDES PENDING_CLOSURE and PENDING_SL_EXIT.
+            if p.status not in [
+                PositionStatus.CLOSED.value,
+                PositionStatus.PENDING_SUBMISSION.value,
+                PositionStatus.REJECTED.value
+            ]:
+                # PENDING_ENTRY positions have p.qty = 0, so they 
+                # will correctly contribute 0.0 to the PnL.
+                if p.qty <= 0:
+                    continue
+
+                ltp = self.prices.ltp(p.token)
+                if ltp is None:
+                    # If no ltp, use entry price to calculate zero PnL
+                    # for this position, but don't crash.
+                    ltp = p.entry_price 
+                
+                # Use p.qty, which is the *current* open quantity
+                pnl += (ltp - p.entry_price) * p.qty 
+    return pnl
 
 
 class PaperTrader(AbstractTrader):
@@ -1386,7 +1627,7 @@ class PaperTrader(AbstractTrader):
                 )
 
                 self.positions[pos.id] = pos
-                self.store.upsert_position(pos)
+                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
                 self.prices.subscribe([pos.token])
                 
                 send_alert(f"⏳ [PAPER] {pos.strategy} PENDING ENTRY {pos.tradingsymbol} Qty={qty} @ Target {bid_price:.2f}")
@@ -1418,10 +1659,15 @@ class PaperTrader(AbstractTrader):
             p.status = PositionStatus.CLOSED.value
             p.exit_reason = reason
             p.exit_price = exit_price
-            self.store.upsert_position(p)
-            self.store.log_closed_trade(p, exit_price, reason)
-            
-            self.store.log_strategy_performance(p.strategy, pnl)
+            self.store_actor.q.put({"type": "upsert_position", "pos": p})
+            self.store_actor.q.put({
+                "type": "log_closed_trade", 
+                "pos": p, "price": exit_price, "reason": reason
+            })
+            self.store_actor.q.put({
+                "type": "log_strategy_performance", 
+                "name": p.strategy, "pnl": pnl
+            })
 
             self._update_performance(pnl)
 
@@ -1435,7 +1681,7 @@ class PaperTrader(AbstractTrader):
                 return False
             p.status = PositionStatus.CLOSED.value
             p.exit_reason = "ENTRY_CANCELLED_PAPER"
-            self.store.upsert_position(p)
+            self.store_actor.q.put({"type": "upsert_position", "pos": p})
             self.positions.pop(p.id, None)
             L.info(f"[PAPER] Cancelled pending entry for {p.tradingsymbol}")
             return True
@@ -1445,10 +1691,11 @@ class PaperTrader(AbstractTrader):
             if new_trigger > p.sl_price:
                 L.info(f"[PAPER] Trailing SL for {p.tradingsymbol} from {p.sl_price:.2f} to {new_trigger:.2f}")
                 p.sl_price = new_trigger
-                self.store.upsert_position(p)
+                self.store_actor.q.put({"type": "upsert_position", "pos": p})
     
     # In PaperTrader class, add new method
     # Inside PaperTrader class
+    # In PaperTrader class
     def _manage_pending_entries(self, now: datetime):
         with self.lock:
             # Get a copy of IDs to iterate over, allowing removal from original dict
@@ -1497,8 +1744,8 @@ class PaperTrader(AbstractTrader):
                          p.last_entry_modification = now
                          p.greeks["target_mid"] = mid_price # Store new MID target
                          L.info(f"[PAPER] Entry {p.id} -> Stage 2 (Target Mid @ {mid_price:.2f})")
-                         self.store.upsert_position(p) # Save stage change
-                         # Continue to next iteration, don't check fill yet for this stage
+                         self.store_actor.q.put({"type": "upsert_position", "pos": p}) # Save stage change
+                         target_price = mid_price # Update target price for this cycle's fill check
 
                  elif current_stage == 2:
                      target_price = p.greeks.get("target_mid", mid_price) # Target is MID
@@ -1508,8 +1755,8 @@ class PaperTrader(AbstractTrader):
                          p.last_entry_modification = now
                          p.greeks["target_ask"] = ask_price # Store new ASK target
                          L.info(f"[PAPER] Entry {p.id} -> Stage 3 (Target Ask @ {ask_price:.2f})")
-                         self.store.upsert_position(p) # Save stage change
-                         # Continue to next iteration
+                         self.store_actor.q.put({"type": "upsert_position", "pos": p}) # Save stage change
+                         target_price = ask_price # Update target price for this cycle's fill check
 
                  elif current_stage == 3:
                      target_price = p.greeks.get("target_ask", ask_price) # Target is ASK
@@ -1524,26 +1771,24 @@ class PaperTrader(AbstractTrader):
                          L.warning(f"[PAPER] Entry {p.id} ({p.tradingsymbol}) TIMED OUT after {time_since_open:.1f}s. Cancelling.")
                          self.cancel_pending_entry(p) # This removes from self.positions
                          continue # Move to next ID
-
-                 # --- Check for Fill Simulation ---
+                 
+                 # --- REFACTORED FILL SIMULATION (NO RANDOMNESS) ---
                  fill_price = None
-                 if target_price > 0 and ltp <= target_price: # Basic condition: market touched or crossed our target
-                    if current_stage == 1: # Target was BID
-                        fill_chance = self.config['trading'].get('paper_fill_bid_chance', 0.20)
-                        if random.random() < fill_chance:
-                            fill_price = min(target_price, ltp) # Fill at bid or better
-                            L.info(f"✅ [PAPER] Stage 1 (BID) FILL @ {fill_price:.2f} (Target: {target_price:.2f}, LTP: {ltp:.2f}) - Chance: {fill_chance*100:.0f}%")
 
-                    elif current_stage == 2: # Target was MID
-                        fill_chance = self.config['trading'].get('paper_fill_mid_chance', 0.60)
-                        if random.random() < fill_chance:
-                            fill_price = min(target_price, ltp) # Fill at mid or better
-                            L.info(f"✅ [PAPER] Stage 2 (MID) FILL @ {fill_price:.2f} (Target: {target_price:.2f}, LTP: {ltp:.2f}) - Chance: {fill_chance*100:.0f}%")
+                 if current_stage == 3:
+                     # Stage 3: Aggressive (target is ASK).
+                     # We are crossing the spread. This should fill *immediately* at the ask price.
+                     fill_price = target_price # target_price *is* the ask_price we set
+                     L.info(f"✅ [PAPER] Stage 3 (ASK) FILL @ {fill_price:.2f} (Simulated crossing spread to target ASK {target_price:.2f}, LTP: {ltp:.2f})")
 
-                    elif current_stage == 3: # Target was ASK
-                        # Simulate crossing spread - fill at the target ASK price
-                        fill_price = target_price
-                        L.info(f"✅ [PAPER] Stage 3 (ASK) FILL @ {fill_price:.2f} (Simulated crossing spread to target ASK, LTP: {ltp:.2f})")
+                 elif target_price > 0 and ltp <= target_price:
+                     # Stage 1 (BID) or Stage 2 (MID): Passive
+                     # The market price (LTP) has traded *at or below* our resting order's price.
+                     # This simulates a real LIMIT order fill.
+                     fill_price = target_price # We get filled at our limit price
+                     L.info(f"✅ [PAPER] Stage {current_stage} ({'BID' if current_stage == 1 else 'MID'}) FILL @ {fill_price:.2f} (LTP {ltp:.2f} touched/crossed target {target_price:.2f})")
+                 
+                 # --- END REFACTORED FILL SIMULATION ---
 
                  # --- If Filled ---
                  if fill_price is not None:
@@ -1561,46 +1806,80 @@ class PaperTrader(AbstractTrader):
                     p.last_entry_modification = now # Update modification time on fill
 
                     send_alert(f"✅ [PAPER] {p.strategy} OPENED {p.tradingsymbol} Qty={p.qty} @ {p.entry_price:.2f}, SL={p.sl_price:.2f}, TP={p.tp_price:.2f}")
-                    self.store.upsert_position(p) # Update DB immediately after fill
-                    # No need to remove from self.positions here, status change handles it
+                    self.store_actor.q.put({"type": "upsert_position", "pos": p}) # Update DB immediately after fill
                     continue # Move to the next pending ID
 
-                 # --- If stage changed but not filled, DB already updated above ---
-                 # If no stage change and no fill, do nothing until next cycle or timeout
+def scale_out(self, p: Position, qty_to_close: int) -> bool:
+    with self.lock:
+        if p.status not in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value] or qty_to_close <= 0 or qty_to_close > p.qty:
+            # Added check for qty_to_close > p.qty
+            if qty_to_close > p.qty:
+                 L.warning(f"[PAPER] Scale out failed: Cannot close {qty_to_close} Qty, only {p.qty} remaining.")
+            return False
 
-    def scale_out(self, p: Position, qty_to_close: int) -> bool:
-        with self.lock:
-            if p.status not in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value] or qty_to_close <= 0:
-                return False
+        current_ltp = self.prices.ltp(p.token) or p.entry_price
+        tick_size = self.book.tick_size(p.tradingsymbol)
+        slippage = tick_size * self.config['trading'].get('paper_trade_slippage_ticks', 1)
+        exit_price = round((current_ltp - slippage) / tick_size) * tick_size # Ensure exit price respects tick size
 
-            current_ltp = self.prices.ltp(p.token) or p.entry_price
-            tick_size = self.book.tick_size(p.tradingsymbol)
-            slippage = tick_size * self.config['trading'].get('paper_trade_slippage_ticks', 1)
-            exit_price = current_ltp - slippage
+        pnl = (exit_price - p.entry_price) * qty_to_close
+        self.daily_realized_pnl += pnl
 
-            pnl = (exit_price - p.entry_price) * qty_to_close
-            self.daily_realized_pnl += pnl
-            self._log_partial_trade(p, exit_price, qty_to_close, "PARTIAL_SCALE_OUT_PAPER")
-            
-            self.store.log_strategy_performance(p.strategy, pnl)
-            
-            self._update_performance(pnl)
-            send_alert(f"💰 [PAPER] SCALED OUT {qty_to_close} of {p.tradingsymbol} @ {exit_price:.2f}. PnL: {pnl:.2f}. Daily PnL: {self.trader.daily_realized_pnl:.2f}")
+        # --- REFACTOR START ---
+        
+        # 1. Log the partial trade directly using StoreActor
+        #    (Replaces the call to _log_partial_trade which doesn't exist in PaperTrader)
+        partial_trade_id = f"{p.id}_PARTIAL_SCALE_OUT_PAPER_{uuid.uuid4()}" 
+        # Create a temporary 'partial position' object for logging, reflecting the closed quantity
+        partial_pos_log_data = dataclasses.replace(p, id=partial_trade_id, initial_qty=qty_to_close, qty=qty_to_close)
+        
+        self.store_actor.q.put({
+            "type": "log_closed_trade", 
+            "pos": partial_pos_log_data, # Use the temporary object for logging
+            "price": exit_price, 
+            "reason": "PARTIAL_SCALE_OUT_PAPER"
+        })
 
-            L.info(f"[PAPER] Scaling out {qty_to_close} of {p.tradingsymbol}")
-            p.qty -= qty_to_close
-            p.scaled_out_qty += qty_to_close
-            p.status = PositionStatus.PARTIALLY_CLOSED.value if p.qty > 0 else PositionStatus.CLOSED.value
-            self.store.upsert_position(p)
+        # 2. Log strategy performance using StoreActor
+        self.store_actor.q.put({
+            "type": "log_strategy_performance", 
+            "name": p.strategy, 
+            "pnl": pnl
+        })
+        
+        # --- REFACTOR END ---
 
-            if p.status == PositionStatus.CLOSED.value:
-                L.info(f"[PAPER] Position fully closed via scale out.")
-                self.positions.pop(p.id, None)
-            return True
+        self._update_performance(pnl) # This callback is fine
+        
+        # Construct alert message before modifying position state
+        alert_msg = f"💰 [PAPER] SCALED OUT {qty_to_close} of {p.tradingsymbol} @ {exit_price:.2f}. PnL: {pnl:.2f}. Daily PnL: {self.daily_realized_pnl:.2f}" # Corrected self.trader access
+
+        L.info(f"[PAPER] Scaling out {qty_to_close} of {p.tradingsymbol}")
+        
+        # Update position state *after* logging and constructing messages
+        p.qty -= qty_to_close
+        p.scaled_out_qty += qty_to_close
+        new_status = PositionStatus.PARTIALLY_CLOSED.value if p.qty > 0 else PositionStatus.CLOSED.value
+        
+        if p.status != new_status:
+            L.info(f"[PAPER] {p.tradingsymbol} status changed: {p.status} -> {new_status}")
+            p.status = new_status
+
+        # 3. Upsert the final position state using StoreActor (already correct)
+        self.store_actor.q.put({"type": "upsert_position", "pos": p})
+        
+        # Send alert now
+        send_alert(alert_msg)
+
+        if p.status == PositionStatus.CLOSED.value:
+            L.info(f"[PAPER] Position {p.id} fully closed via scale out.")
+            self.positions.pop(p.id, None) # Remove from active dict
+
+        return True
 
     def place_bracket_orders(self, p: Position) -> bool:
         p.status = PositionStatus.ACTIVE.value
-        self.store.upsert_position(p)
+        self.store_actor.q.put({"type": "upsert_position", "pos": p})
         return True
 
     def execute_simulated_sl(self, p: Position) -> bool:
@@ -1611,65 +1890,195 @@ class PaperTrader(AbstractTrader):
 class Trader(AbstractTrader):
     def __init__(self,
                  engine: 'Engine',
-                 kite: GovernedKite,
-                 store: Store,
+                 store: Store,               # Pass original store for startup read ONLY
+                 store_actor: StoreActor,    # Pass actor for runtime writes
+                 order_actor: OrderActor,    # Pass actor for runtime I/O
                  book: InstrumentBook,
                  prices: PriceBus,
                  config: Dict,
                  perf_callback: Optional[Callable[[float], None]] = None):
-        super().__init__(engine, book, prices, store, config, perf_callback)
-        self.k = kite
-        self.positions = store.load_open_positions()
+        
+        # Pass None for store to super(), as runtime writes use store_actor
+        super().__init__(engine, book, prices, None, config, perf_callback) 
+        
+        self.order_actor = order_actor
+        self.store_actor = store_actor
+        
+        # This is the *only* place we use the original store object directly.
+        # This is safe because it's a blocking read *before* the engine starts.
+        # It MUST use the passed `store` object, not the actor.
+        try:
+            L.info("Trader loading initial open positions from store...")
+            self.positions = store.load_open_positions() 
+            L.info(f"Loaded {len(self.positions)} open positions.")
+        except Exception as e:
+            L.critical(f"FATAL: Failed to load open positions on startup: {e}", exc_info=True)
+            # Depending on severity, you might want to raise SystemExit here
+            self.positions = {} # Start with empty positions if load fails
 
+        # --- Startup Order Reconciliation (Needs direct API access via OrderActor) ---
         if self.positions:
             L.info("Reconciling open orders for existing positions on startup...")
+            reply_q = queue.Queue()
+            self.order_actor.q.put({"type": "orders", "reply_q": reply_q}) # Assuming OrderActor handles 'orders' type
+            
+            open_orders = None
             try:
-                open_orders = self.k.orders()
-                if open_orders is not None:
-                    open_order_ids = {str(o['order_id']) for o in open_orders if o['status'] == 'OPEN'}
-                    for p in list(self.positions.values()):
-                        if p.tp_order_id and str(p.tp_order_id) not in open_order_ids:
-                            L.warning(f"TP order {p.tp_order_id} for {p.tradingsymbol} not found open. Clearing.")
-                            p.tp_order_id = None
-                        if p.slm_order_id and str(p.slm_order_id) not in open_order_ids:
-                            L.warning(f"SLM order {p.slm_order_id} for {p.tradingsymbol} not found open. Clearing.")
-                            p.slm_order_id = None
-                        self.store.upsert_position(p)
+                resp = reply_q.get(timeout=15.0) # Longer timeout for potentially large order book
+                if resp['ok']:
+                    open_orders = resp['res']
+                else:
+                    L.error(f"Failed to fetch open orders during startup reconciliation: {resp.get('error')}")
+            except queue.Empty:
+                L.error("Timeout fetching open orders during startup reconciliation.")
             except Exception as e:
-                L.error(f"Failed to reconcile open orders on startup: {e}")
+                L.error(f"Exception fetching open orders during startup reconciliation: {e}", exc_info=True)
 
+            if open_orders is not None:
+                open_order_ids = {str(o['order_id']) for o in open_orders if o.get('status') == 'OPEN'}
+                L.info(f"Found {len(open_order_ids)} open orders at broker.")
+                
+                needs_db_update = False
+                for p in list(self.positions.values()):
+                    if p.tp_order_id and str(p.tp_order_id) not in open_order_ids:
+                        L.warning(f"Startup Reconcile: TP order {p.tp_order_id} for {p.tradingsymbol} not found open. Clearing.")
+                        p.tp_order_id = None
+                        needs_db_update = True
+                    if p.slm_order_id and str(p.slm_order_id) not in open_order_ids:
+                        L.warning(f"Startup Reconcile: SLM order {p.slm_order_id} for {p.tradingsymbol} not found open. Clearing.")
+                        p.slm_order_id = None
+                        needs_db_update = True
+                    # Check pending entry orders too
+                    if p.entry_order_id and p.status == PositionStatus.PENDING_ENTRY.value and str(p.entry_order_id) not in open_order_ids:
+                         L.warning(f"Startup Reconcile: Pending Entry order {p.entry_order_id} for {p.tradingsymbol} not found open. Marking as REJECTED.")
+                         p.status = PositionStatus.REJECTED.value
+                         p.exit_reason = "STARTUP_RECONCILE_ENTRY_MISSING"
+                         p.entry_order_id = None
+                         p.is_entry_order_open = False
+                         needs_db_update = True
+
+                    if needs_db_update:
+                        # Send non-blocking update to StoreActor
+                        self.store_actor.q.put({"type": "upsert_position", "pos": p})
+                        needs_db_update = False # Reset for next position
+            else:
+                 L.error("Could not retrieve open orders from broker. Reconciliation incomplete.")
+
+
+        # Subscribe to ticks for loaded positions
         for p in self.positions.values():
-            self.prices.subscribe([p.token])
+            if p.token: # Ensure token exists
+                self.prices.subscribe([p.token])
 
+    # --- Order History Fetch (Refactored) ---
     def _get_order_avg_price(self, oid: str) -> Optional[float]:
-        history = self.k.order_history(oid)
+        """Fetches order history via OrderActor and calculates the average fill price."""
+        
+        L.debug(f"Requesting order history for {oid} via OrderActor.")
+        reply_q = queue.Queue()
+        self.order_actor.q.put({
+            "type": "order_history",
+            "params": {"order_id": oid},
+            "reply_q": reply_q
+        })
+
+        history = None
+        try:
+            # Block waiting for the actor's response (holds no locks)
+            resp = reply_q.get(timeout=10.0) # Increased timeout for potentially slow API
+            if resp['ok'] and resp['res'] is not None:
+                history = resp['res']
+                L.debug(f"Received history for {oid}: {len(history)} entries.")
+            else:
+                L.error(f"Failed to get order history for {oid} from OrderActor: {resp.get('error')}")
+                return None
+        except queue.Empty:
+            L.error(f"Timeout waiting for order history response for {oid} from OrderActor.")
+            return None
+        except Exception as e:
+            L.error(f"Unexpected error getting order history for {oid}: {e}", exc_info=True)
+            return None
+
         if not history:
+            L.warning(f"Order history for {oid} was empty after fetch.")
             return None
-        trades = [t for t in history if t.get('status') == 'COMPLETE']
+            
+        trades = [t for t in history if t.get('status') == 'COMPLETE' and t.get('filled_quantity', 0) > 0]
         if not trades:
+            L.warning(f"No 'COMPLETE' trades with filled quantity found in history for order {oid}.")
             return None
-        qty = sum(t['filled_quantity'] for t in trades)
-        return (sum(t['price'] * t['filled_quantity'] for t in trades) / qty) if qty > 0 else None
+            
+        total_qty = sum(t['filled_quantity'] for t in trades)
+        # Use average_price if available (more accurate), fallback to price
+        weighted_sum = sum(t.get('average_price', t.get('price', 0)) * t['filled_quantity'] for t in trades) 
 
+        if total_qty > 0:
+            avg_price = weighted_sum / total_qty
+            L.info(f"Calculated avg price for order {oid}: {avg_price:.2f} (Qty: {total_qty})")
+            return avg_price
+        else:
+            L.warning(f"Total filled quantity for order {oid} is zero after filtering trades.")
+            return None
+
+    # --- Order Cancellation (Refactored) ---
     def _cancel_all_open_orders_for_pos(self, p: Position, cancel_entry: bool = False):
-        """Cancels all associated open orders for a position."""
-        orders_to_cancel = [p.tp_order_id, p.slm_order_id]
+        """
+        Cancels all associated open orders for a position using the OrderActor (non-blocking).
+        """
+        # Define constants locally or globally if self.k is removed
+        VARIETY_REGULAR = "regular" 
+        
+        orders_to_cancel = []
+        if p.tp_order_id: orders_to_cancel.append(p.tp_order_id)
+        if p.slm_order_id: orders_to_cancel.append(p.slm_order_id)
 
-        if cancel_entry:
+        if cancel_entry and p.entry_order_id:
             orders_to_cancel.append(p.entry_order_id)
 
+        if not orders_to_cancel:
+            L.debug(f"No orders to cancel for {p.tradingsymbol}.")
+            return
+
+        L.debug(f"Requesting cancellation for orders associated with {p.tradingsymbol}: {orders_to_cancel}")
+        
+        orders_sent_for_cancel = [] 
         for oid in orders_to_cancel:
-            if oid:
-                if self.k.cancel_order(self.k.VARIETY_REGULAR, str(oid)) is None:
-                    L.warning(f"Could not cancel order {oid} after multiple retries.")
-
-        p.tp_order_id = None
-        p.slm_order_id = None
-        if cancel_entry:
+            if oid: # Ensure oid is not None
+                oid_str = str(oid)
+                # Send a non-blocking ("fire-and-forget") message
+                self.order_actor.q.put({
+                    "type": "cancel_order",
+                    "params": {"variety": VARIETY_REGULAR, "order_id": oid_str}, 
+                    "reply_q": None # No need to wait
+                })
+                L.info(f"Sent cancel request for order {oid_str} via OrderActor.")
+                orders_sent_for_cancel.append(oid_str) 
+                
+        # Immediately clear the local state
+        if p.tp_order_id and str(p.tp_order_id) in orders_sent_for_cancel:
+            p.tp_order_id = None
+        if p.slm_order_id and str(p.slm_order_id) in orders_sent_for_cancel:
+            p.slm_order_id = None
+        if cancel_entry and p.entry_order_id and str(p.entry_order_id) in orders_sent_for_cancel:
             p.entry_order_id = None
+            p.is_entry_order_open = False 
+            
+        L.debug(f"Cleared local order IDs for {p.tradingsymbol} after sending cancel requests.")
+        # Caller function is responsible for upserting the position state if needed.
 
+    # --- Open Position (Refactored) ---
     def open_position(self, trade_params: Dict) -> Optional[Position]:
+        """
+        Submits an adaptive entry order via the OrderActor and saves state via StoreActor.
+        """
+        # Define constants locally or globally
+        VARIETY_REGULAR = "regular"
+        TRANSACTION_TYPE_BUY = "BUY"
+        PRODUCT_MIS = "MIS"
+        ORDER_TYPE_LIMIT = "LIMIT"
+        
         with self.lock:
+            # --- 1. Pre-Trade Checks ---
             open_pos_count = sum(1 for p in self.positions.values() if p.status not in [PositionStatus.CLOSED.value, PositionStatus.REJECTED.value])
             opt, ts = trade_params['opt'], trade_params['opt']['tradingsymbol']
             lot_size = self.book.lot_size(_get_underlying(ts))
@@ -1681,12 +2090,14 @@ class Trader(AbstractTrader):
             lots = int(trade_params['lots'])
             qty = int(lots * lot_size)
             if qty <= 0:
+                L.warning(f"Trade rejected: Calculated quantity is {qty}.")
                 return None
 
+            # --- 2. Create Initial Position Object ---
             temp_id = f"TEMP_{uuid.uuid4()}"
             pos = Position(
                 id=temp_id,
-                status=PositionStatus.PENDING_SUBMISSION.value,
+                status=PositionStatus.PENDING_SUBMISSION.value, 
                 tradingsymbol=ts, token=int(opt['instrument_token']), option_type=opt['instrument_type'],
                 qty=0, initial_qty=qty, entry_price=0, initial_sl_price=0, sl_price=0, tp_price=0,
                 opened_at=now_ist(), strategy=trade_params['strategy'], market_regime_at_entry=trade_params['regime'],
@@ -1700,276 +2111,516 @@ class Trader(AbstractTrader):
                 intended_risk_rupees=trade_params.get('total_trade_risk', 0.0),
                 last_entry_modification=now_ist()
             )
-            self.store.upsert_position(pos)
-            self.positions[pos.id] = pos
 
+            # --- 3. Save Initial State via StoreActor ---
+            self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+            self.positions[pos.id] = pos # Add to local dict immediately
+
+            # --- 4. Get Depth for Entry Price ---
             full_tick = self.prices.get_full_tick(int(opt['instrument_token']))
-            if not full_tick or not full_tick.get('depth'):
+            if not full_tick or not full_tick.get('depth') or not full_tick['depth'].get('buy'):
                 L.warning(f"Cannot get depth for {ts}, cannot place adaptive entry.")
                 pos.status = PositionStatus.REJECTED.value
                 pos.exit_reason = "NO_DEPTH_FOR_ENTRY"
-                self.store.upsert_position(pos)
+                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                self.positions.pop(pos.id, None) 
                 return None
 
             bid_price = full_tick['depth']['buy'][0]['price']
 
-            oid = self.k.place_order(
-                variety=self.k.VARIETY_REGULAR, exchange="NFO", tradingsymbol=ts,
-                transaction_type=self.k.TRANSACTION_TYPE_BUY, quantity=qty, product=self.k.PRODUCT_MIS,
-                order_type=self.k.ORDER_TYPE_LIMIT, price=bid_price
-            )
+            # --- 5. Place Order via OrderActor ---
+            place_params = {
+                "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": ts,
+                "transaction_type": TRANSACTION_TYPE_BUY, "quantity": qty,
+                "product": PRODUCT_MIS,
+                "order_type": ORDER_TYPE_LIMIT, "price": bid_price
+            }
 
+            L.info(f"Sending place order request for {ts} @ {bid_price} (Qty: {qty}) via OrderActor.")
+            reply_q = queue.Queue()
+            self.order_actor.q.put({
+                "type": "place_order",
+                "params": place_params,
+                "reply_q": reply_q
+            })
+
+            oid = None
+            try:
+                resp = reply_q.get(timeout=10.0) 
+                if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
+                    oid = resp['res']['order_id']
+                    L.info(f"OrderActor successfully placed order {oid} for {ts}.")
+                else:
+                    raise Exception(resp.get('error', 'Unknown error from OrderActor'))
+            except queue.Empty:
+                L.error(f"Timeout waiting for place order response for {ts} from OrderActor.")
+            except Exception as e:
+                L.error(f"Adaptive Entry Stage 1 order placement failed for {ts}. Error: {e}")
+
+            # --- 6. Handle Order Placement Result ---
             if oid is None:
-                L.error(f"Adaptive Entry Stage 1 order placement failed for {ts} after multiple retries.")
                 pos.status = PositionStatus.REJECTED.value
                 pos.exit_reason = "BROKER_API_FAILURE"
-                self.store.upsert_position(pos)
+                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                self.positions.pop(pos.id, None) 
                 return None
+            else:
+                L.info(f"Placed Adaptive Entry Stage 1 (Passive) order {oid} for {ts} @ {bid_price}")
+                self.positions.pop(temp_id, None) # Remove temp ID
 
-            L.info(f"Placed Adaptive Entry Stage 1 (Passive) order {oid} for {ts} @ {bid_price}")
+                pos.id = f"LIVE_{oid}"
+                pos.entry_order_id = str(oid)
+                pos.status = PositionStatus.PENDING_ENTRY.value
+                pos.entry_stage = 1
+                pos.is_entry_order_open = True 
 
-            self.positions.pop(temp_id, None)
-            pos.id = f"LIVE_{oid}"
-            pos.entry_order_id = str(oid)
-            pos.status = PositionStatus.PENDING_ENTRY.value
-            pos.entry_stage = 1
-            self.store.upsert_position(pos)
-            self.positions[pos.id] = pos
-            return pos
+                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                self.positions[pos.id] = pos # Add back with correct ID
+                self.prices.subscribe([pos.token]) 
+                return pos
 
+    # --- Place Brackets (Refactored) ---
     def place_bracket_orders(self, p: Position) -> bool:
+        """Places or modifies TP and SL orders via OrderActor after entry fill."""
+        # Define constants locally or globally
+        VARIETY_REGULAR = "regular"
+        TRANSACTION_TYPE_SELL = "SELL"
+        PRODUCT_MIS = "MIS"
+        ORDER_TYPE_LIMIT = "LIMIT"
+        ORDER_TYPE_SLM = "SL-M"
+        
         if p.status != PositionStatus.OPEN_AWAITING_BRACKETS.value:
+            L.warning(f"place_bracket_orders called for {p.tradingsymbol} but status is {p.status}. Skipping.")
             return False
+            
+        if p.qty <= 0:
+            L.error(f"Cannot place brackets for {p.tradingsymbol} with zero quantity ({p.qty}).")
+            p.status = PositionStatus.CLOSED.value 
+            p.exit_reason = "ZERO_QTY_ON_BRACKET"
+            self.store_actor.q.put({"type": "upsert_position", "pos": p})
+            self.positions.pop(p.id, None) # Remove if closed due to zero qty
+            return False
+
         tick_size = self.book.tick_size(p.tradingsymbol)
-        tp_id, slm_id = None, None
-        try:
-            # 1. Place/Modify TP Order
-            if p.tp_price > 0 and not p.tp_order_id:
-                tp_limit = round(p.tp_price / tick_size) * tick_size
-                tp_id = self.k.place_order(self.k.VARIETY_REGULAR, "NFO", p.tradingsymbol, self.k.TRANSACTION_TYPE_SELL, p.qty, self.k.PRODUCT_MIS, self.k.ORDER_TYPE_LIMIT, price=tp_limit)
-                if tp_id is None:
-                    raise ValueError("TP order placement failed")
-                p.tp_order_id = str(tp_id)
-                L.info(f"Placed TP order {tp_id} @ {tp_limit} for {p.qty} of {p.tradingsymbol}")
-            elif p.tp_order_id:
-                if self.k.modify_order(self.k.VARIETY_REGULAR, p.tp_order_id, quantity=p.qty) is None:
-                    raise ValueError(f"Failed to modify TP order {p.tp_order_id} quantity to {p.qty}")
-                L.info(f"Modified TP order {p.tp_order_id} quantity to {p.qty} for {p.tradingsymbol}")
+        
+        tp_success = False
+        slm_success = False
+        tp_oid_attempted = None
+        slm_oid_attempted = None
+        
+        # --- 1. Place/Modify TP Order ---
+        if p.tp_price > 0:
+            tp_limit = round(p.tp_price / tick_size) * tick_size
+            if not p.tp_order_id: # Place new TP
+                place_params = {
+                    "variety": VARIETY_REGULAR, "exchange": "NFO", 
+                    "tradingsymbol": p.tradingsymbol, "transaction_type": TRANSACTION_TYPE_SELL, 
+                    "quantity": p.qty, "product": PRODUCT_MIS, 
+                    "order_type": ORDER_TYPE_LIMIT, "price": tp_limit
+                }
+                L.info(f"Sending request to place TP order @ {tp_limit} for {p.qty} of {p.tradingsymbol}...")
+                reply_q = queue.Queue()
+                self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
+                try:
+                    resp = reply_q.get(timeout=10.0)
+                    if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
+                        tp_oid_attempted = str(resp['res']['order_id'])
+                        p.tp_order_id = tp_oid_attempted # Store ID
+                        tp_success = True
+                        L.info(f"Successfully placed TP order {p.tp_order_id}.")
+                    else: raise Exception(resp.get('error', 'Unknown TP placement error'))
+                except Exception as e: L.error(f"Failed to place TP order for {p.tradingsymbol}: {e}")
+            
+            else: # Modify existing TP quantity
+                modify_params = {"variety": VARIETY_REGULAR, "order_id": p.tp_order_id, "quantity": p.qty}
+                L.info(f"Sending request to modify TP order {p.tp_order_id} qty to {p.qty}...")
+                reply_q = queue.Queue()
+                self.order_actor.q.put({"type": "modify_order", "params": modify_params, "reply_q": reply_q})
+                try:
+                    resp = reply_q.get(timeout=10.0)
+                    if resp['ok']:
+                        tp_oid_attempted = p.tp_order_id 
+                        tp_success = True
+                        L.info(f"Successfully modified TP order {p.tp_order_id} quantity.")
+                    else: raise Exception(resp.get('error', 'Unknown TP modification error'))
+                except Exception as e: L.error(f"Failed to modify TP order {p.tp_order_id}: {e}")
+        else: tp_success = True # No TP needed
 
-            # 2. Place/Modify SL-M Order
-            if p.sl_price > 0 and not p.slm_order_id:
-                sl_trigger = round(p.sl_price / tick_size) * tick_size
-                slm_id = self.k.place_order(
-                    variety=self.k.VARIETY_REGULAR, exchange="NFO", tradingsymbol=p.tradingsymbol,
-                    transaction_type=self.k.TRANSACTION_TYPE_SELL, quantity=p.qty, product=self.k.PRODUCT_MIS,
-                    order_type=self.k.ORDER_TYPE_SLM, trigger_price=sl_trigger
-                )
-                if slm_id is None:
-                    raise ValueError("SL-M order placement failed")
-                p.slm_order_id = str(slm_id)
-                L.info(f"Placed SL-M order {slm_id} @ trigger {sl_trigger} for {p.qty} of {p.tradingsymbol}")
-            elif p.slm_order_id:
-                if self.k.modify_order(self.k.VARIETY_REGULAR, p.slm_order_id, quantity=p.qty) is None:
-                    raise ValueError(f"Failed to modify SL-M order {p.slm_order_id} quantity to {p.qty}")
-                L.info(f"Modified SL-M order {p.slm_order_id} quantity to {p.qty} for {p.tradingsymbol}")
+        # --- 2. Place/Modify SL-M Order ---
+        if p.sl_price > 0:
+            sl_trigger = round(p.sl_price / tick_size) * tick_size
+            if not p.slm_order_id: # Place new SLM
+                place_params = {
+                    "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": p.tradingsymbol,
+                    "transaction_type": TRANSACTION_TYPE_SELL, "quantity": p.qty, 
+                    "product": PRODUCT_MIS, "order_type": ORDER_TYPE_SLM, 
+                    "trigger_price": sl_trigger
+                }
+                L.info(f"Sending request to place SL-M order @ trigger {sl_trigger} for {p.qty} of {p.tradingsymbol}...")
+                reply_q = queue.Queue()
+                self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
+                try:
+                    resp = reply_q.get(timeout=10.0)
+                    if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
+                        slm_oid_attempted = str(resp['res']['order_id'])
+                        p.slm_order_id = slm_oid_attempted # Store ID
+                        slm_success = True
+                        L.info(f"Successfully placed SL-M order {p.slm_order_id}.")
+                    else: raise Exception(resp.get('error', 'Unknown SLM placement error'))
+                except Exception as e: L.error(f"Failed to place SL-M order for {p.tradingsymbol}: {e}")
 
+            else: # Modify existing SLM quantity
+                modify_params = {"variety": VARIETY_REGULAR, "order_id": p.slm_order_id, "quantity": p.qty}
+                L.info(f"Sending request to modify SL-M order {p.slm_order_id} qty to {p.qty}...")
+                reply_q = queue.Queue()
+                self.order_actor.q.put({"type": "modify_order", "params": modify_params, "reply_q": reply_q})
+                try:
+                    resp = reply_q.get(timeout=10.0)
+                    if resp['ok']:
+                        slm_oid_attempted = p.slm_order_id 
+                        slm_success = True
+                        L.info(f"Successfully modified SL-M order {p.slm_order_id} quantity.")
+                    else: raise Exception(resp.get('error', 'Unknown SLM modification error'))
+                except Exception as e: L.error(f"Failed to modify SL-M order {p.slm_order_id}: {e}")
+        else: slm_success = True # No SL needed (unlikely)
+
+        # --- 3. Finalize State Based on Success ---
+        if tp_success and slm_success:
             p.status = PositionStatus.ACTIVE.value
-            self.store.upsert_position(p)
-            L.info(f"Position {p.tradingsymbol} is now ACTIVE with broker SL @ {p.sl_price:.2f} and TP @ {p.tp_price:.2f}.")
+            self.store_actor.q.put({"type": "upsert_position", "pos": p}) 
+            L.info(f"Position {p.tradingsymbol} ACTIVE. SL: {p.slm_order_id} @ {p.sl_price:.2f}, TP: {p.tp_order_id} @ {p.tp_price:.2f}.")
             return True
-        except Exception as e:
-            L.error(f"Failed to place/modify bracket orders for {p.tradingsymbol}: {e}")
-            if tp_id:
-                self.k.cancel_order(self.k.VARIETY_REGULAR, str(tp_id))
-            if slm_id:
-                self.k.cancel_order(self.k.VARIETY_REGULAR, str(slm_id))
+        else:
+            # Cleanup logic: If one succeeded, cancel it
+            L.error(f"Bracket placement failed for {p.tradingsymbol}. TP Success: {tp_success}, SLM Success: {slm_success}. Cleaning up.")
+            orders_to_clean = []
+            if tp_success and tp_oid_attempted: orders_to_clean.append(tp_oid_attempted); p.tp_order_id = None
+            if slm_success and slm_oid_attempted: orders_to_clean.append(slm_oid_attempted); p.slm_order_id = None
+                 
+            for oid_clean in orders_to_clean:
+                 L.warning(f"Cleaning up orphaned order: {oid_clean}")
+                 self.order_actor.q.put({ # Fire-and-forget cancel
+                     "type": "cancel_order", "params": {"variety": VARIETY_REGULAR, "order_id": oid_clean},
+                     "reply_q": None })
+                 
+            # Trigger immediate close as placing brackets failed
+            send_alert(f"CRITICAL: Failed bracket placement for {p.tradingsymbol}. Closing position!", "critical")
+            self.close_position(p, "BRACKET_PLACEMENT_FAILURE") 
             return False
 
+    # --- Close Position (Refactored) ---
     def close_position(self, p: Position, reason: str) -> bool:
+        """Closes a position by cancelling brackets and placing a market order via Actors."""
+        # Define constants locally or globally
+        VARIETY_REGULAR = "regular"
+        TRANSACTION_TYPE_SELL = "SELL"
+        PRODUCT_MIS = "MIS"
+        ORDER_TYPE_MARKET = "MARKET"
+        
         with self.lock:
             if p.status in [PositionStatus.PENDING_CLOSURE.value, PositionStatus.CLOSED.value, PositionStatus.PENDING_SL_EXIT.value]:
-                return True
+                L.debug(f"close_position called for {p.tradingsymbol} ({p.id}) but already closing/closed ({p.status}). Skipping.")
+                return True 
 
+            original_status = p.status
             p.status = PositionStatus.PENDING_CLOSURE.value
             p.exit_reason = reason
-            self.store.upsert_position(p)
+            
+            self.store_actor.q.put({"type": "upsert_position", "pos": p})
+            L.info(f"Marked {p.tradingsymbol} ({p.id}) as PENDING_CLOSURE. Reason: {reason}.")
 
-            self._cancel_all_open_orders_for_pos(p, cancel_entry=p.is_entry_order_open)
+            self._cancel_all_open_orders_for_pos(p, cancel_entry=(original_status == PositionStatus.PENDING_ENTRY.value))
 
             if p.qty <= 0:
-                L.warning(f"Attempted to close position {p.tradingsymbol} with zero quantity. Marking as closed.")
+                L.warning(f"Attempted to close {p.tradingsymbol} ({p.id}) with zero/negative quantity ({p.qty}). Marking closed.")
                 p.status = PositionStatus.CLOSED.value
-                self.store.upsert_position(p)
+                p.exit_reason = reason + "_ZERO_QTY"
+                self.store_actor.q.put({"type": "upsert_position", "pos": p})
+                self.positions.pop(p.id, None) 
                 return True
 
-            oid = self.k.place_order(self.k.VARIETY_REGULAR, "NFO", p.tradingsymbol, self.k.TRANSACTION_TYPE_SELL, p.qty, self.k.PRODUCT_MIS, self.k.ORDER_TYPE_MARKET)
+            # --- Place Market Exit Order via OrderActor ---
+            place_params = {
+                "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": p.tradingsymbol, 
+                "transaction_type": TRANSACTION_TYPE_SELL, "quantity": p.qty, 
+                "product": PRODUCT_MIS, "order_type": ORDER_TYPE_MARKET
+            }
+            
+            L.info(f"Sending MARKET exit order request for {p.qty} of {p.tradingsymbol} ({p.id}) via OrderActor. Reason: {reason}.")
+            reply_q = queue.Queue()
+            self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
+
+            oid = None
+            try:
+                resp = reply_q.get(timeout=10.0) 
+                if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
+                    oid = resp['res']['order_id']
+                    L.info(f"Market exit order {oid} placed successfully via OrderActor for {p.tradingsymbol}.")
+                else: raise Exception(resp.get('error', 'Unknown error placing market exit'))
+            except queue.Empty: L.critical(f"Timeout waiting for MARKET exit order response for {p.tradingsymbol}!")
+            except Exception as e: L.critical(f"MARKET EXIT ORDER FAILED for {p.tradingsymbol}. Error: {e}")
+
             if oid is None:
-                L.critical(f"MARKET EXIT ORDER FAILED for {p.tradingsymbol}. Manual intervention required!")
-                send_alert(f"🔥 CRITICAL: FAILED TO PLACE MARKET EXIT for {p.tradingsymbol}. POSITION IS STILL OPEN.", "critical")
-                p.status = PositionStatus.ACTIVE.value
-                self.store.upsert_position(p)
-                return False
+                send_alert(f"🔥 CRITICAL: FAILED TO PLACE MARKET EXIT for {p.tradingsymbol} ({p.id}). POSITION IS STILL OPEN. Manual intervention required!", "critical")
+                p.exit_reason = reason + "_EXIT_API_FAIL" # Keep PENDING_CLOSURE
+                self.store_actor.q.put({"type": "upsert_position", "pos": p})
+                return False 
+            else:
+                p.exit_order_id = str(oid)
+                # Status remains PENDING_CLOSURE until fill confirmation
+                self.store_actor.q.put({"type": "upsert_position", "pos": p})
+                return True 
 
-            L.info(f"Market exit order {oid} placed for {p.tradingsymbol}. Reason: {reason}.")
-            p.exit_order_id = str(oid)
-            self.store.upsert_position(p)
-            return True
-
+    # --- Cancel Pending Entry (Refactored) ---
     def cancel_pending_entry(self, p: Position) -> bool:
+        """Cancels a pending entry order via OrderActor."""
         with self.lock:
             if p.status != PositionStatus.PENDING_ENTRY.value or not p.entry_order_id:
+                L.debug(f"cancel_pending_entry called for {p.tradingsymbol} but not PENDING_ENTRY or no entry_order_id.")
                 return False
 
             L.warning(f"Cancelling pending entry order {p.entry_order_id} for {p.tradingsymbol}.")
-            self._cancel_all_open_orders_for_pos(p, cancel_entry=True)
+            self._cancel_all_open_orders_for_pos(p, cancel_entry=True) # Uses actor
+            
             p.status = PositionStatus.CLOSED.value
-            p.exit_reason = "ENTRY_TIMEOUT_CANCELLED"
-            self.store.upsert_position(p)
-            self.positions.pop(p.id, None)
+            p.exit_reason = "ENTRY_TIMEOUT_CANCELLED" 
+            self.store_actor.q.put({"type": "upsert_position", "pos": p}) # Uses actor
+            self.positions.pop(p.id, None) 
             return True
 
+    # --- Scale Out (Refactored) ---
     def scale_out(self, p: Position, qty_to_close: int) -> bool:
+        """Scales out by cancelling brackets and placing market order via Actors."""
+        # Define constants locally or globally
+        VARIETY_REGULAR = "regular"
+        TRANSACTION_TYPE_SELL = "SELL"
+        PRODUCT_MIS = "MIS"
+        ORDER_TYPE_MARKET = "MARKET"
+        
         with self.lock:
             if p.status not in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value] or qty_to_close <= 0 or qty_to_close > p.qty:
-                return False
+                 if qty_to_close > p.qty: L.warning(f"Scale out failed for {p.tradingsymbol}: Cannot close {qty_to_close}, only {p.qty} left.")
+                 return False
 
-            L.info(f"Scaling out {qty_to_close} of {p.tradingsymbol}. Temporarily cancelling brackets.")
-            self._cancel_all_open_orders_for_pos(p, cancel_entry=False)
+            L.info(f"Scaling out {qty_to_close} of {p.tradingsymbol}. Cancelling brackets.")
+            self._cancel_all_open_orders_for_pos(p, cancel_entry=False) # Uses actor
 
-            p.status = PositionStatus.OPEN_AWAITING_BRACKETS
-            self.store.upsert_position(p)
+            # Update status immediately
+            p.status = PositionStatus.OPEN_AWAITING_BRACKETS 
+            self.store_actor.q.put({"type": "upsert_position", "pos": p}) # Uses actor
 
-            oid = self.k.place_order(
-                self.k.VARIETY_REGULAR, "NFO", p.tradingsymbol, self.k.TRANSACTION_TYPE_SELL,
-                qty_to_close, self.k.PRODUCT_MIS, self.k.ORDER_TYPE_MARKET
-            )
+            # --- Place Scale-Out Market Order via OrderActor ---
+            place_params = {
+                "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": p.tradingsymbol, 
+                "transaction_type": TRANSACTION_TYPE_SELL, "quantity": qty_to_close, 
+                "product": PRODUCT_MIS, "order_type": ORDER_TYPE_MARKET
+            }
+            
+            L.info(f"Sending scale-out MARKET order for {qty_to_close} of {p.tradingsymbol} via OrderActor.")
+            reply_q = queue.Queue()
+            self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
+
+            oid = None
+            try:
+                resp = reply_q.get(timeout=10.0) 
+                if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
+                    oid = resp['res']['order_id']
+                    L.info(f"Scale-out market order {oid} placed successfully.")
+                else: raise Exception(resp.get('error', 'Unknown error placing scale-out order'))
+            except queue.Empty: L.critical(f"Timeout waiting for scale-out MARKET order response for {p.tradingsymbol}!")
+            except Exception as e: L.critical(f"SCALE OUT MARKET ORDER FAILED for {p.tradingsymbol}. Error: {e}")
 
             if oid is None:
                 send_alert(f"CRITICAL: SCALE OUT MARKET ORDER FAILED for {p.tradingsymbol}. Closing full position!", "critical")
-                self.close_position(p, "SCALE_OUT_FAILURE")
-                return False
+                self.close_position(p, "SCALE_OUT_FAILURE_FULL_EXIT") # Uses actor
+                return False 
+            else:
+                p.partial_exit_order_ids.append(str(oid))
+                # Status remains OPEN_AWAITING_BRACKETS
+                self.store_actor.q.put({"type": "upsert_position", "pos": p}) # Uses actor
+                return True 
 
-            p.partial_exit_order_ids.append(str(oid))
-            self.store.upsert_position(p)
-
-            return True
-
+    # --- Modify SL (Refactored - Copied from previous correct version) ---
     def modify_sl(self, p: Position, new_trigger: float):
-        """
-        Modifies the stop-loss for a position by placing a new SL-M order
-        and then cancelling the old one (Cancel-Modify-Replace).
-        Includes "Double SL" protection.
-        """
+        """Modifies SL using OrderActor (Cancel-Modify-Replace logic)."""
+        # Define constants locally or globally
+        VARIETY_REGULAR = "regular"
+        TRANSACTION_TYPE_SELL = "SELL"
+        PRODUCT_MIS = "MIS"
+        ORDER_TYPE_SLM = "SL-M"
+        
         tick_size = self.book.tick_size(p.tradingsymbol)
         new_trigger_rounded = round(new_trigger / tick_size) * tick_size
 
-        # Check if the new SL is meaningfully higher than the current one
-        if new_trigger_rounded > p.sl_price and abs(new_trigger_rounded - p.sl_price) >= tick_size:
-            old_sl = p.sl_price
-            old_slm_id = p.slm_order_id
+        if new_trigger_rounded <= p.sl_price or abs(new_trigger_rounded - p.sl_price) < tick_size:
+             return # No change or change too small
+        
+        old_sl = p.sl_price
+        old_slm_id = p.slm_order_id
 
-            # --- Place new SL-M order first for safety ---
-            L.info(f"Attempting to trail SL for {p.tradingsymbol} to {new_trigger_rounded:.2f}. Placing new order...")
-            new_slm_id = self.k.place_order(
-                variety=self.k.VARIETY_REGULAR, exchange="NFO", tradingsymbol=p.tradingsymbol,
-                transaction_type=self.k.TRANSACTION_TYPE_SELL, quantity=p.qty, product=self.k.PRODUCT_MIS,
-                order_type=self.k.ORDER_TYPE_SLM, trigger_price=new_trigger_rounded
-            )
+        # --- 1. Place new SL-M order first ---
+        L.info(f"Attempting to trail SL for {p.tradingsymbol} to {new_trigger_rounded:.2f}. Placing new order...")
+        place_params = {
+            "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": p.tradingsymbol,
+            "transaction_type": TRANSACTION_TYPE_SELL, "quantity": p.qty, 
+            "product": PRODUCT_MIS, "order_type": ORDER_TYPE_SLM, 
+            "trigger_price": new_trigger_rounded
+        }
+        
+        reply_q = queue.Queue()
+        self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
+        
+        new_slm_id = None
+        try:
+            resp = reply_q.get(timeout=10.0) 
+            if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
+                new_slm_id = str(resp['res']['order_id'])
+            else: raise Exception(resp.get('error', 'Unknown error'))
+        except Exception as e:
+            L.error(f"Failed to place NEW SL-M order for {p.tradingsymbol} trail. Aborting trail. Old SL {old_slm_id} active. Error: {e}")
+            return # Old SL remains active
 
-            # --- Case 1: New order placement fails ---
-            if new_slm_id is None:
-                L.error(f"Failed to place NEW SL-M order for {p.tradingsymbol} trail. Aborting trail. Old SL {old_slm_id} is still active.")
-                # We simply return. The old, valid SL is still in place.
-                return
+        L.info(f"Successfully placed new SL order {new_slm_id} for {p.tradingsymbol}. Cancelling old order {old_slm_id}.")
 
-            L.info(f"Successfully placed new SL order {new_slm_id} for {p.tradingsymbol}. Now cancelling old order {old_slm_id}.")
-
-            # --- Case 2: New order placed, now cancel the old one ---
-            if old_slm_id:
-                if self.k.cancel_order(self.k.VARIETY_REGULAR, old_slm_id) is None:
-                    # --- !! CRITICAL FAILURE !! ---
-                    # We failed to cancel the old order. Both might be active.
-                    L.critical(f"!! DOUBLE SL DANGER for {p.tradingsymbol} !! Failed to cancel old SL {old_slm_id} after placing new SL {new_slm_id}.")
-                    send_alert(f"🔥 CRITICAL: DOUBLE SL {p.tradingsymbol}. Old SL {old_slm_id} FAILED TO CANCEL. "
-                               f"New SL {new_slm_id} is active. Position is in SAFE MODE. MANUAL INTERVENTION ADVISED.", "critical")
-
-                    # Put position into a "safe" state.
-                    # PENDING_CLOSURE will stop PositionManager from modifying it further.
-                    p.status = PositionStatus.PENDING_CLOSURE.value
-                    p.exit_reason = "SAFE_MODE_DOUBLE_SL"
-                    
-                    # Store the new, valid SL information
-                    p.sl_price = new_trigger_rounded
-                    p.slm_order_id = str(new_slm_id)
-                    self.store.upsert_position(p)
-                    
-                    # Stop execution here. Do not proceed to normal update.
-                    return
-                
+        # --- 2. Cancel the old SL order ---
+        cancel_success = True
+        if old_slm_id:
+            cancel_reply_q = queue.Queue()
+            self.order_actor.q.put({
+                "type": "cancel_order",
+                "params": {"variety": VARIETY_REGULAR, "order_id": old_slm_id},
+                "reply_q": cancel_reply_q
+            })
+            try:
+                cancel_resp = cancel_reply_q.get(timeout=10.0)
+                if not cancel_resp['ok']: raise Exception(cancel_resp.get('error', 'Unknown error'))
                 L.info(f"Successfully cancelled old SL order {old_slm_id}.")
+            except Exception as e:
+                # --- !! CRITICAL FAILURE !! ---
+                L.critical(f"!! DOUBLE SL DANGER for {p.tradingsymbol} !! Failed to cancel old SL {old_slm_id} after placing new SL {new_slm_id}. Error: {e}")
+                send_alert(f"🔥 CRITICAL: DOUBLE SL {p.tradingsymbol}. Old SL {old_slm_id} FAILED TO CANCEL. New SL {new_slm_id} active.", "critical")
+                cancel_success = False
 
-            # --- Case 3: Success! New order placed, old one cancelled (or didn't exist) ---
+                # Put position into SAFE MODE
+                p.status = PositionStatus.PENDING_CLOSURE.value 
+                p.exit_reason = "SAFE_MODE_DOUBLE_SL"
+                p.sl_price = new_trigger_rounded # Store the *new* SL info
+                p.slm_order_id = new_slm_id
+                self.store_actor.q.put({"type": "upsert_position", "pos": p}) 
+                return # Stop processing this position
+
+        # --- 3. Success (or old order cancel failed but we proceed with new SL) ---
+        if cancel_success: # Only update state if cancel succeeded or wasn't needed
             p.sl_price = new_trigger_rounded
-            p.slm_order_id = str(new_slm_id)
-            self.store.upsert_position(p)
-            L.info(f"Trailed broker SL for {p.tradingsymbol} from {old_sl:.2f} to {new_trigger_rounded:.2f} (New ID: {new_slm_id})")
+            p.slm_order_id = new_slm_id
+            self.store_actor.q.put({"type": "upsert_position", "pos": p})
+            L.info(f"Trailed SL for {p.tradingsymbol} from {old_sl:.2f} to {new_trigger_rounded:.2f} (New ID: {new_slm_id})")
 
+    # --- Execute Simulated SL (No Change - Only for PaperTrader) ---
     def execute_simulated_sl(self, p: Position) -> bool:
-        # This function is now ONLY for PaperTrader.
         L.critical("execute_simulated_sl called on LIVE trader. This should not happen.")
         return False
 
+    # --- Handle Partial Exit Fill (Refactored) ---
     def _handle_partial_exit_fill(self, pos: Position, order: Dict):
-        """Handles the logic for a partial scale-out order fill."""
+        """Handles the logic for a partial scale-out order fill (called by order update worker)."""
         filled_qty = order.get('filled_quantity', 0)
-        oid = order.get('order_id')
+        oid = str(order.get('order_id')) 
+
+        # Remove the OID immediately upon receiving the update, regardless of fill qty
+        removed_oid = False
+        if oid in pos.partial_exit_order_ids:
+            pos.partial_exit_order_ids.remove(oid)
+            L.debug(f"Removed partial exit OID {oid} from position {pos.id} list: {pos.partial_exit_order_ids}")
+            removed_oid = True
+        else:
+             L.warning(f"Partial exit OID {oid} (status: {order.get('status')}) not found in pos.partial_exit_order_ids for {pos.id}. Current list: {pos.partial_exit_order_ids}")
 
         if filled_qty == 0:
-            L.warning(f"Partial exit order {oid} completed with 0 fills. Ignoring.")
+            L.warning(f"Partial exit order {oid} completed with 0 fills for {pos.tradingsymbol}. Ignoring PnL.")
+            # If OID was removed and no more partials pending, try re-bracketing
+            if removed_oid and not pos.partial_exit_order_ids and pos.qty > 0:
+                 L.info(f"Zero-fill partial exit {oid} complete. Re-attempting bracket placement for remaining {pos.qty} qty.")
+                 if pos.status == PositionStatus.OPEN_AWAITING_BRACKETS: # Check status before placing
+                     if not self.place_bracket_orders(pos): 
+                         send_alert(f"CRITICAL: FAILED to re-place brackets after zero-fill scale out for {pos.tradingsymbol}. Closing position.", "critical")
+                         self.close_position(pos, "BRACKET_REPLACE_FAILURE_POST_SCALE")
+                 else:
+                      L.warning(f"Cannot re-place brackets after zero-fill scale out for {pos.id}, status is {pos.status}")
+            # Ensure DB is updated even if no fill, as OID list changed
+            elif removed_oid:
+                 self.store_actor.q.put({"type": "upsert_position", "pos": pos})
             return
 
-        L.info(f"💰 Partial exit (scale-out) fill received for {pos.tradingsymbol}. Qty: {filled_qty}.")
+        L.info(f"💰 Partial exit (scale-out) fill received for {pos.tradingsymbol}. Order: {oid}, Qty: {filled_qty}.")
 
-        avg_price = self._get_order_avg_price(oid)
+        avg_price = self._get_order_avg_price(oid) # Uses OrderActor
         if not avg_price:
-            L.error(f"Could not get avg price for partial exit {oid}. PnL will be inaccurate.")
-            avg_price = self.prices.ltp(pos.token) or pos.entry_price  # Best guess
+            L.error(f"Could not get avg price for partial exit {oid}. PnL inaccurate. Using LTP fallback.")
+            avg_price = self.prices.ltp(pos.token) or pos.entry_price 
 
         pnl = (avg_price - pos.entry_price) * filled_qty
         self.daily_realized_pnl += pnl
         
-        self.store.log_strategy_performance(pos.strategy, pnl)
+        self.store_actor.q.put({"type": "log_strategy_performance", "name": pos.strategy, "pnl": pnl})
 
+        # --- Update Position State ---
         pos.qty -= filled_qty
         pos.scaled_out_qty += filled_qty
 
-        if oid in pos.partial_exit_order_ids:
-            pos.partial_exit_order_ids.remove(oid)
-
+        # --- Determine Next Step ---
         if pos.qty <= 0:
-            L.warning(f"Scale-out fill for {filled_qty} resulted in 0 or negative qty ({pos.qty}). Closing position fully.")
-            pos.qty = 0
+            L.info(f"Scale-out {oid} ({filled_qty} qty) resulted in zero/negative qty ({pos.qty}) for {pos.tradingsymbol}. Closing fully.")
+            pos.qty = 0 
             pos.exit_reason = "SCALE_OUT_FULL"
-            self._handle_exit_fill(pos, order)
+            self._handle_exit_fill(pos, order) # Uses actors
         else:
-            pos.status = PositionStatus.OPEN_AWAITING_BRACKETS
-            self.store.upsert_position(pos)
+             if pos.partial_exit_order_ids: # More partials pending?
+                  L.info(f"Partial exit {oid} complete. Awaiting {pos.partial_exit_order_ids}. Status remains {pos.status}.")
+                  self.store_actor.q.put({"type": "upsert_position", "pos": pos}) # Update DB
+             else: # Last partial exit, re-place brackets
+                  L.info(f"Final partial exit {oid} complete. Re-placing brackets for remaining {pos.qty} qty.")
+                  pos.status = PositionStatus.OPEN_AWAITING_BRACKETS 
+                  self.store_actor.q.put({"type": "upsert_position", "pos": pos}) # Save before placing
+                  
+                  if not self.place_bracket_orders(pos): # Uses actors
+                      send_alert(f"CRITICAL: FAILED to re-place brackets after scale out for {pos.tradingsymbol}. Closing remaining position!", "critical")
+                      self.close_position(pos, "BRACKET_REPLACE_FAILURE_POST_SCALE")
+                  
+             self._log_partial_trade_actor(pos, avg_price, filled_qty, f"PARTIAL_SCALE_OUT_{oid}") 
+             
+             self._update_performance(pnl) 
+             send_alert(f"💰 SCALED OUT {filled_qty} of {pos.tradingsymbol} @ {avg_price:.2f}. PnL: {pnl:.2f}. Daily PnL: {self.daily_realized_pnl:.2f}")
 
-            self._log_partial_trade(pos, avg_price, filled_qty, "PARTIAL_SCALE_OUT")
-            self._update_performance(pnl)  # Update PnL
-            send_alert(f"💰 SCALED OUT {filled_qty} of {pos.tradingsymbol} @ {avg_price:.2f}. PnL: {pnl:.2f}. Daily PnL: {self.daily_realized_pnl:.2f}")
-
-    def _log_partial_trade(self, p: Position, exit_price: float, qty: int, reason: str):
-        """Logs a partial trade to the trade_log table."""
+    # --- Log Partial Trade via Actor (Refactored) ---
+    def _log_partial_trade_actor(self, p: Position, exit_price: float, qty: int, reason: str):
+        """Sends a message to the StoreActor to log a partial trade."""
         pnl = (exit_price - p.entry_price) * qty
-        trade_id = f"{p.id}_{reason}_{uuid.uuid4()}"
-        with self.store.lock, self.store._get_connection() as conn:
-            conn.execute(
-                """INSERT INTO trade_log (id, tradingsymbol, strategy, entry_time, exit_time, entry_price, exit_price, qty, pnl, exit_reason, market_regime_at_entry)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (trade_id, p.tradingsymbol, p.strategy, p.opened_at.isoformat(), now_ist().isoformat(), p.entry_price, exit_price, qty, pnl, reason, p.market_regime_at_entry)
-            )
-            conn.commit()
+        trade_id = f"{p.id}_{reason}_{uuid.uuid4()}" 
+        
+        # Create a temporary 'partial position' object for logging
+        try:
+             # Use dataclasses.replace if Position is a dataclass
+             partial_pos_log_data = dataclasses.replace(p, id=trade_id, initial_qty=qty, qty=qty) 
+        except TypeError:
+             # Manual creation if not a dataclass (adjust fields as needed)
+             L.warning("Position object might not be a dataclass. Creating log data manually.")
+             partial_pos_log_data = Position(
+                id=trade_id, tradingsymbol=p.tradingsymbol, token=p.token, 
+                option_type=p.option_type, qty=qty, initial_qty=qty, # Key change: use closed qty
+                entry_price=p.entry_price, opened_at=p.opened_at, strategy=p.strategy, 
+                market_regime_at_entry=p.market_regime_at_entry, 
+                # Include other necessary fields, default others
+                initial_sl_price=0, sl_price=0, tp_price=0, status="LOGGED_PARTIAL" 
+             )
+
+        self.store_actor.q.put({
+            "type": "log_closed_trade",
+            "pos": partial_pos_log_data, 
+            "price": exit_price,
+            "reason": reason 
+        })
+        L.debug(f"Sent partial trade log request to StoreActor for {trade_id} ({qty} qty).")
 
 # ==================================================================================================
 # MODULARIZED LOGIC (NEW CLASSES)
@@ -1982,14 +2633,14 @@ class RiskManager:
                  trader: AbstractTrader,
                  book: InstrumentBook,
                  prices: PriceBus,
-                 store: Store,
+                 store_actor: StoreActor,
                  config: Dict):
         self.strategy_weights: Dict[str, float] = {}
         self.engine = engine
         self.trader = trader
         self.book = book
         self.prices = prices
-        self.store = store
+        self.store_actor = store_actor
         self.trading_config = config["trading"]
         self.technical_config = config["technical"]
         self.timings_config = config["timings"]
@@ -2021,12 +2672,25 @@ class RiskManager:
             L.info("New week detected. Resetting weekly high water mark and drawdown lock.")
             self.weekly_high_water_mark = self.dynamic_account_equity
             self.in_weekly_drawdown_lock = False
-            self.store.set_kv("weekly_hwm", str(self.weekly_high_water_mark))
+            
+            # --- FIXED: Use StoreActor ---
+            self.store_actor.q.put({
+                "type": "set_kv",
+                "key": "weekly_hwm",
+                "value": str(self.weekly_high_water_mark)
+            })
+            # --- END FIX ---
 
         if last_trading_day:
-            self.store.set_kv(f"daily_pnl_{last_trading_day}", str(self.trader.daily_realized_pnl))
+            # --- FIXED: Use StoreActor ---
+            self.store_actor.q.put({
+                "type": "set_kv",
+                "key": f"daily_pnl_{last_trading_day}",
+                "value": str(self.trader.daily_realized_pnl)
+            })
+            # --- END FIX ---
 
-        self.update_dynamic_equity()
+        self.update_dynamic_equity() # This function is now fixed to use actors
         self.trader.daily_realized_pnl = 0.0
 
         with self.lock:
@@ -2040,16 +2704,70 @@ class RiskManager:
         L.info(f"RiskManager state reset. Equity: ₹{self.dynamic_account_equity:,.2f}, Daily HWM: {self.daily_high_water_mark:,.2f}")
 
     def load_persistent_state(self, trading_day: date):
-        self.weekly_high_water_mark = float(self.store.get_kv("weekly_hwm", str(self.dynamic_account_equity)))
-        pnl_str = self.store.get_kv(f"daily_pnl_{trading_day}", "0.0")
+        # --- FIXED: Use StoreActor (Blocking Read) ---
+        weekly_hwm_str = str(self.dynamic_account_equity)
+        pnl_str = "0.0"
+        
+        try:
+            reply_q_hwm = queue.Queue()
+            self.store_actor.q.put({
+                "type": "get_kv",
+                "key": "weekly_hwm",
+                "default": str(self.dynamic_account_equity),
+                "reply_q": reply_q_hwm
+            })
+            resp_hwm = reply_q_hwm.get(timeout=10.0)
+            if resp_hwm['ok']:
+                weekly_hwm_str = resp_hwm['res']
+
+            reply_q_pnl = queue.Queue()
+            self.store_actor.q.put({
+                "type": "get_kv",
+                "key": f"daily_pnl_{trading_day}",
+                "default": "0.0",
+                "reply_q": reply_q_pnl
+            })
+            resp_pnl = reply_q_pnl.get(timeout=10.0)
+            if resp_pnl['ok']:
+                pnl_str = resp_pnl['res']
+
+        except queue.Empty:
+            L.error("Timeout loading persistent state from StoreActor.")
+        except Exception as e:
+            L.error(f"Error loading persistent state from StoreActor: {e}")
+        
+        self.weekly_high_water_mark = float(weekly_hwm_str)
         self.trader.daily_realized_pnl = float(pnl_str)
+        # --- END FIX ---
+
         self.daily_high_water_mark = self.dynamic_account_equity + self.trader.daily_realized_pnl
         self.weekly_high_water_mark = max(self.weekly_high_water_mark, self.daily_high_water_mark)
         L.info(f"RiskManager state loaded. Daily PnL: {self.trader.daily_realized_pnl}. Daily HWM: {self.daily_high_water_mark}. Weekly HWM: {self.weekly_high_water_mark}")
         
+        
     def _update_strategy_weights(self):
         L.info("Updating dynamic strategy weights...")
-        df = self.store.get_strategy_performance(self.strategy_perf_lookback_days)
+        
+        # --- FIXED: Use StoreActor (Blocking Read) ---
+        df = pd.DataFrame() # Default to empty df
+        try:
+            reply_q = queue.Queue()
+            self.store_actor.q.put({
+                "type": "get_strategy_performance",
+                "lookback_days": self.strategy_perf_lookback_days,
+                "reply_q": reply_q
+            })
+            resp = reply_q.get(timeout=10.0)
+            if resp['ok']:
+                df = resp['res']
+            else:
+                L.error(f"Failed to get strategy performance from StoreActor: {resp.get('error')}")
+        except queue.Empty:
+            L.error("Timeout getting strategy performance from StoreActor.")
+        except Exception as e:
+            L.error(f"Error getting strategy performance from StoreActor: {e}")
+        # --- END FIX ---
+
         if df.empty:
             L.warning("No strategy performance data found. Using default weights.")
             # Reset all known strategies to 1.0
@@ -2267,28 +2985,69 @@ class RiskManager:
             self.risk_factor = max(loss_streak_config["min_factor"], 1.0 - loss_streak_config["reduction_per_loss"] * self.consecutive_losses)
 
             L.info(f"PnL: {pnl:.2f}, PerfScore: {self.performance_score}, ConsecLosses: {self.consecutive_losses}, RiskFactor: {self.risk_factor:.2f}")
-            self.store.set_kv(f"daily_pnl_{self.engine.last_trading_day}", str(self.trader.daily_realized_pnl))
-            self.store.set_kv("weekly_hwm", str(self.weekly_high_water_mark))
+            self.store_actor.q.put({
+                "type": "set_kv", 
+                "key": f"daily_pnl_{self.engine.last_trading_day}", 
+                "value": str(self.trader.daily_realized_pnl)
+            })
+            self.store_actor.q.put({
+                "type": "set_kv", 
+                "key": "weekly_hwm", 
+                "value": str(self.weekly_high_water_mark)
+            })
 
     def update_dynamic_equity(self):
         if PAPER_TRADING:
             self.dynamic_account_equity = self.account_equity_base + self.trader.daily_realized_pnl
             L.info(f"Paper equity updated to: {self.dynamic_account_equity:,.2f}")
             return
+        
+        # --- FIXED: Use OrderActor (Blocking Read) ---
         try:
-            margins = self.engine.k.margins()
+            reply_q = queue.Queue()
+            # We access the order_actor via engine.trader
+            self.engine.trader.order_actor.q.put({
+                "type": "margins",
+                "reply_q": reply_q
+            })
+            
+            margins = None
+            resp = reply_q.get(timeout=10.0)
+            if resp['ok']:
+                margins = resp['res']
+            else:
+                L.error(f"Failed to get margins from OrderActor: {resp.get('error')}")
+
             if margins and 'equity' in margins and margins['equity'].get('net'):
                 self.dynamic_account_equity = float(margins['equity']['net'])
                 L.info(f"Dynamic account equity updated to: {self.dynamic_account_equity:,.2f}")
+        
+        except queue.Empty:
+            L.warning("Timeout updating dynamic account equity.")
         except Exception as e:
             L.warning(f"Could not update dynamic account equity: {e}")
+        # --- END FIX ---
 
     def reconcile_broker_pnl(self):
         if PAPER_TRADING:
             return
         
+        # --- FIXED: Use OrderActor (Blocking Read) ---
         try:
-            broker_positions = self.engine.k.positions()
+            reply_q = queue.Queue()
+            self.engine.trader.order_actor.q.put({
+                "type": "positions",
+                "reply_q": reply_q
+            })
+
+            broker_positions = None
+            resp = reply_q.get(timeout=10.0)
+            if resp['ok']:
+                broker_positions = resp['res']
+            else:
+                L.error(f"Failed to get positions from OrderActor: {resp.get('error')}")
+                return
+
             if not broker_positions or 'net' not in broker_positions:
                 return
 
@@ -2311,7 +3070,8 @@ class RiskManager:
                     f"Difference: ₹{discrepancy:.2f}",
                     "warning"
                 )
-        
+        except queue.Empty:
+            L.warning("Timeout reconciling broker P&L.") 
         except Exception as e:
             L.warning(f"Could not reconcile broker P&L: {e}")
 
@@ -2531,6 +3291,10 @@ class MicrostructureMonitor:
         return 0  # Neutral
 
 
+import queue # <--- MAKE SURE THIS IMPORT IS AT THE TOP OF YOUR FILE
+
+# ... (other classes) ...
+
 class PositionManager:
     """Handles the high-frequency loop for managing all active positions."""
     def __init__(self,
@@ -2538,127 +3302,155 @@ class PositionManager:
                  trader: AbstractTrader,
                  book: InstrumentBook,
                  prices: PriceBus,
-                 store: Store,
+                 store_actor: StoreActor, # Now correctly injected
                  risk_manager: RiskManager,
                  config: Dict):
         self.engine = engine
         self.trader = trader
         self.book = book
         self.prices = prices
-        self.store = store
+        self.store_actor = store_actor # Store the actor
         self.risk_manager = risk_manager
         self.trading_config = config["trading"]
         self.timings_config = config["timings"]
         self.lock = None
         self.lock = threading.RLock()
 
-        self.position_price_history: Dict[str, deque] = {}  # Key: pos.id, Value: deque of (timestamp, price)
+        self.position_price_history: Dict[str, deque] = {}
         self.last_greeks_update_per_pos: Dict[str, datetime] = {}
         self.trailing_sl_config = self.trading_config.get("trailing_sl", {})
         self.trade_mgmt_config = self.trading_config.get("trade_management", {})
 
     def manage_positions(self):
         with self.trader.lock:
+            # Create a copy to avoid modification during iteration issues
             active_positions = list(self.trader.positions.values())
 
         now = now_ist()
         if PAPER_TRADING:
+            # PaperTrader._manage_pending_entries is safe, uses store_actor
             self.trader._manage_pending_entries(now)
-            
-        for p in active_positions:
-            if p.status == PositionStatus.PENDING_ENTRY.value:
-                self._manage_adaptive_entry(p, now)
-                continue
 
+        for p in active_positions:
+            # --- Check if position still exists locally (might be closed by another thread) ---
+            with self.trader.lock:
+                if p.id not in self.trader.positions:
+                    L.debug(f"Position {p.id} ({p.tradingsymbol}) no longer in active list, skipping management.")
+                    continue
+
+            # --- Handle Pending Entry ---
+            if p.status == PositionStatus.PENDING_ENTRY.value:
+                # Calls _manage_adaptive_entry which is now fixed
+                self._manage_adaptive_entry(p, now)
+                continue # Move to next position
+
+            # --- Handle Placing Brackets ---
             if p.status == PositionStatus.OPEN_AWAITING_BRACKETS.value:
+                # trader.place_bracket_orders is already refactored
                 if not self.trader.place_bracket_orders(p):
                     send_alert(f"CRITICAL: FAILED to place brackets for {p.tradingsymbol}. Closing position.", "critical")
+                    # trader.close_position is already refactored
                     if not self.trader.close_position(p, "BRACKET_PLACEMENT_FAILURE"):
                         send_alert(f"🔥 FATAL: UNABLE TO CLOSE {p.tradingsymbol}. HALTING ALL TRADING.", "critical")
                         self.engine.fatal_error_event.set()
-                continue
+                continue # Move to next position
 
+            # --- Handle Pending SL-L Fallback ---
             if p.status == PositionStatus.PENDING_SL_EXIT.value:
                 ltp = self.prices.ltp(p.token)
                 if ltp and ltp < (p.sl_price * 0.99):
                     L.warning(f"SL-L for {p.tradingsymbol} likely missed (LTP: {ltp}, SL:{p.sl_price}). Firing MARKET order.")
+                    # trader.close_position is already refactored
                     self.trader.close_position(p, "SL_L_MISSED_MK_FALLBACK")
-                continue
+                continue # Move to next position
 
+            # --- Skip non-active positions ---
             if p.status not in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value]:
                 continue
 
+            # --- Main Active Position Management ---
             ltp = self.prices.ltp(p.token)
             if not ltp:
-                continue
+                continue # Skip if no LTP available
 
-            # --- Throttled Greek Update ---
+            # Throttled Greek Update (safe, no I/O)
             GREEKS_UPDATE_INTERVAL_SECONDS = 10
             last_update = self.last_greeks_update_per_pos.get(p.id)
-            
-            # Update if never updated OR if 10 seconds have passed
             if not last_update or (now - last_update).total_seconds() > GREEKS_UPDATE_INTERVAL_SECONDS:
                 L.debug(f"Updating greeks for {p.tradingsymbol}")
+                # risk_manager.update_position_greeks is safe, uses prices/book/engine.get_ohlc
                 self.risk_manager.update_position_greeks(p, ltp)
                 self.last_greeks_update_per_pos[p.id] = now
-            # --- End Throttled Update ---
 
+            # Price History for Velocity (safe, no I/O)
             if p.id not in self.position_price_history:
-                self.position_price_history[p.id] = deque(maxlen=20)  # Store ~20s of 1s data
+                self.position_price_history[p.id] = deque(maxlen=20)
             self.position_price_history[p.id].append((now, ltp))
 
+            # Velocity Trigger Check (safe, no I/O)
             if self._check_velocity_trigger(p, now):
                 send_alert(f"⛔ VELOCITY TRIGGER on {p.tradingsymbol}! Pre-emptive exit.", "warning")
+                # trader.close_position is already refactored
                 self.trader.close_position(p, "VELOCITY_TRIGGER_EXIT")
-                continue
+                continue # Move to next position
 
+            # Time Stop Check (safe, no I/O)
             if (now - p.opened_at).total_seconds() / 60 > p.max_trade_duration_minutes:
                 L.info(f"Position {p.tradingsymbol} hit time-stop of {p.max_trade_duration_minutes} mins. Closing.")
+                # trader.close_position is already refactored
                 self.trader.close_position(p, "TIME_STOP_EXIT")
-                continue
+                continue # Move to next position
 
+            # Underlying SL Check (safe, uses prices)
             underlying_name = _get_underlying(p.tradingsymbol)
             underlying_token = self.engine.bn_token if "BANKNIFTY" in underlying_name else self.engine.nifty_token
             underlying_price = self.prices.ltp(underlying_token)
-
             if underlying_price and p.underlying_sl_level:
-                if p.option_type == 'CE' and underlying_price <= p.underlying_sl_level:
-                    L.warning(f"UNDERLYING SL HIT (Bullish) for {p.tradingsymbol}. Underlying: {underlying_price:.2f}, SL: {p.underlying_sl_level:.2f}. Closing position.")
+                if (p.option_type == 'CE' and underlying_price <= p.underlying_sl_level) or \
+                   (p.option_type == 'PE' and underlying_price >= p.underlying_sl_level):
+                    L.warning(f"UNDERLYING SL HIT for {p.tradingsymbol}. Underlying: {underlying_price:.2f}, SL: {p.underlying_sl_level:.2f}. Closing.")
+                    # trader.close_position is already refactored
                     self.trader.close_position(p, "UNDERLYING_SL_HIT")
-                    continue
-                elif p.option_type == 'PE' and underlying_price >= p.underlying_sl_level:
-                    L.warning(f"UNDERLYING SL HIT (Bearish) for {p.tradingsymbol}. Underlying: {underlying_price:.2f}, SL: {p.underlying_sl_level:.2f}. Closing position.")
-                    self.trader.close_position(p, "UNDERLYING_SL_HIT")
-                    continue
+                    continue # Move to next position
 
+            # Option Price SL Check (local backup)
             if ltp <= p.sl_price:
                 if PAPER_TRADING:
+                    # trader.execute_simulated_sl uses close_position which uses actors
                     self.trader.execute_simulated_sl(p)
                 else:
                     L.warning(f"OPTION PRICE SL HIT for {p.tradingsymbol} (LTP: {ltp}, SL: {p.sl_price}). "
-                              f"This is a backup stop. The broker SL-M order {p.slm_order_id} should execute imminently.")
-                continue
+                              f"Broker SL-M {p.slm_order_id} should execute.")
+                continue # Move to next position
 
+            # Update High Water Mark (safe, local state)
             with self.trader.lock:
-                p.high_price_since_entry = max(p.high_price_since_entry, ltp)
+                 # Need lock here if trader might modify pos outside this loop
+                 p.high_price_since_entry = max(p.high_price_since_entry, ltp)
 
+            # Scale Out Logic (safe, trader.scale_out is refactored)
             profit_points = ltp - p.entry_price
-
-            with self.trader.lock:
+            scaled_out_this_cycle = False
+            with self.trader.lock: # Lock needed if trader might modify pos outside this loop
                 for rule in p.scale_out_rules:
                     target = rule['rr_target']
                     if target not in p.triggered_scale_out_targets and profit_points >= p.initial_risk_points * target:
                         qty_to_close = int(p.initial_qty * (rule['pct_to_close'] / 100.0))
+                        # trader.scale_out uses actors internally
                         if self.trader.scale_out(p, qty_to_close):
                             p.triggered_scale_out_targets.append(target)
-                            break
-            if p.status != PositionStatus.ACTIVE.value:
-                continue
+                            scaled_out_this_cycle = True
+                            break # Only one scale-out per cycle
 
-            with self.trader.lock:
+            if scaled_out_this_cycle:
+                continue # Let next cycle handle TSL after scale-out state settles
+
+            # Trailing Stop Loss Logic (safe, trader.modify_sl is refactored)
+            with self.trader.lock: # Lock needed if trader might modify pos outside this loop
                 current_rr = profit_points / p.initial_risk_points if p.initial_risk_points > 0 else 0
-                highest_sl_floor = p.initial_sl_price
+                highest_sl_floor = p.initial_sl_price # Start with initial SL
 
+                # --- Static RR-based Trailing ---
                 trailing_stages = self.trade_mgmt_config.get("trailing_stop_stages", [])
                 for stage in trailing_stages:
                     if current_rr >= stage['rr_target']:
@@ -2667,36 +3459,44 @@ class PositionManager:
 
                 final_new_sl = highest_sl_floor
 
+                # --- Dynamic Chandelier Trailing ---
+                # Check if TSL is armed
                 if not p.trailing_sl_armed and profit_points >= p.initial_risk_points * self.trading_config['trailing_sl_activation_rr']:
                     p.trailing_sl_armed = True
                     L.info(f"Chandelier Trailing SL armed for {p.tradingsymbol} after reaching {self.trading_config['trailing_sl_activation_rr']}R.")
 
+                # Calculate Chandelier SL if armed
                 if p.trailing_sl_armed:
+                    # _calculate_trailing_stop is safe, uses engine.get_ohlc
                     if calculated_chandelier_sl := self._calculate_trailing_stop(p):
-                        final_new_sl = max(final_new_sl, calculated_chandelier_sl)
+                        final_new_sl = max(final_new_sl, calculated_chandelier_sl) # Take the higher of static or dynamic
 
+                # --- Apply the Trail ---
                 if final_new_sl > p.sl_price:
-                    # Check if the new SL is now profitable (or at breakeven)
                     is_now_risk_free = final_new_sl >= p.entry_price
 
-                    # If the trade is now risk-free AND we still have a static TP order, cancel it.
+                    # Cancel static TP if TSL becomes profitable (uses actor)
                     if is_now_risk_free and p.tp_order_id and not PAPER_TRADING:
-                        L.info(f"TSL for {p.tradingsymbol} is now profitable. Cancelling static TP order {p.tp_order_id} to let winner run.")
-                        try:
-                            # Use the trader's Kite instance
-                            if self.trader.k.cancel_order(self.trader.k.VARIETY_REGULAR, p.tp_order_id):
-                                p.tp_order_id = None # Clear the order ID
-                            else:
-                                L.warning(f"Failed to cancel static TP order {p.tp_order_id} via API.")
-                        except Exception as e:
-                            L.error(f"Error cancelling static TP order {p.tp_order_id}: {e}")
+                        L.info(f"TSL for {p.tradingsymbol} is now profitable. Cancelling static TP {p.tp_order_id}.")
+                        # --- FIXED: Use OrderActor (Non-blocking) ---
+                        # Use engine.trader to access the actor
+                        self.engine.trader.order_actor.q.put({
+                            "type": "cancel_order",
+                            "params": {"variety": "regular", "order_id": str(p.tp_order_id)},
+                            "reply_q": None # Fire-and-forget
+                        })
+                        p.tp_order_id = None # Clear local ID immediately
+                        # --- END FIX ---
 
-                    # Now, modify the SL as usual
+                    # trader.modify_sl uses actors internally
                     self.trader.modify_sl(p, final_new_sl)
 
-            self.store.upsert_position(p)
+            # --- Final DB Update ---
+            # Update position in DB via actor (non-blocking)
+            self.store_actor.q.put({"type": "upsert_position", "pos": p})
 
     def _calculate_trailing_stop(self, p: Position) -> Optional[float]:
+        # This function is safe. Uses engine.get_ohlc which reads from memory.
         try:
             trail_params = self.trailing_sl_config
             trail_tf = trail_params["timeframe_scaled_out"] if p.triggered_scale_out_targets else trail_params["timeframe"]
@@ -2721,6 +3521,7 @@ class PositionManager:
             return None
 
     def _manage_adaptive_entry(self, p: Position, now: datetime):
+        # This function needs fixing as it uses self.trader.k and self.store
         if not p.last_entry_modification:
             return
 
@@ -2741,30 +3542,72 @@ class PositionManager:
         mid_price = round(mid_price / tick_size) * tick_size
 
         new_price = -1.0
+        target_stage = p.entry_stage # Track target stage
 
+        # Determine if stage needs to change
         if p.entry_stage == 1 and time_since_mod > self.trading_config['adaptive_entry_stage2_ms'] / 1000.0:
             L.info(f"Adaptive Entry Stage 2 (Neutral) for {p.tradingsymbol}")
             new_price = mid_price
-            p.entry_stage = 2
+            target_stage = 2
         elif p.entry_stage == 2 and time_since_mod > self.trading_config['adaptive_entry_stage3_ms'] / 1000.0:
             L.info(f"Adaptive Entry Stage 3 (Aggressive) for {p.tradingsymbol}")
             new_price = ask_price
-            p.entry_stage = 3
+            target_stage = 3
 
+        # Check for timeout ONLY in the final stage
+        elif p.entry_stage == 3:
+             entry_timeout_config = (self.trading_config['adaptive_entry_stage2_ms'] +
+                                     self.trading_config['adaptive_entry_stage3_ms'] +
+                                     3000) # Total time + buffer in ms
+             entry_timeout_sec = entry_timeout_config / 1000.0
+             time_since_open = (now - p.opened_at).total_seconds() # Time since SUBMISSION
+
+             if time_since_open > entry_timeout_sec:
+                 L.warning(f"Adaptive Entry TIMEOUT for {p.entry_order_id} ({p.tradingsymbol}) after {time_since_open:.1f}s. Cancelling.")
+                 # trader.cancel_pending_entry uses actors
+                 self.trader.cancel_pending_entry(p)
+                 return # Stop processing this position
+
+        # If a stage change requires a modification
         if new_price > 0:
-            if self.trader.k.modify_order(
-                variety=self.trader.k.VARIETY_REGULAR,
-                order_id=p.entry_order_id,
-                price=new_price
-            ):
+            # --- FIXED: Use OrderActor (Blocking Modify) ---
+            modify_params = {
+                "variety": "regular", # Assuming regular variety
+                "order_id": str(p.entry_order_id),
+                "price": new_price
+            }
+            reply_q = queue.Queue()
+            # Use engine.trader to access actor
+            self.engine.trader.order_actor.q.put({
+                "type": "modify_order",
+                "params": modify_params,
+                "reply_q": reply_q
+            })
+
+            modify_success = False
+            try:
+                resp = reply_q.get(timeout=10.0)
+                if resp['ok']:
+                    modify_success = True
+                else:
+                    L.error(f"Failed to modify entry order {p.entry_order_id}: {resp.get('error')}")
+            except queue.Empty:
+                L.error(f"Timeout modifying entry order {p.entry_order_id}.")
+            # --- END FIX ---
+
+            if modify_success:
                 p.last_entry_modification = now
-                self.store.upsert_position(p)
-                L.info(f"Modified entry order {p.entry_order_id} to price {new_price}")
+                p.entry_stage = target_stage # Update stage only on success
+                # --- FIXED: Use StoreActor (Non-blocking Update) ---
+                self.store_actor.q.put({"type": "upsert_position", "pos": p})
+                # --- END FIX ---
+                L.info(f"Successfully modified entry order {p.entry_order_id} to price {new_price} (Stage {p.entry_stage})")
             else:
-                L.error(f"Failed to modify entry order {p.entry_order_id} for adaptive entry.")
+                L.error(f"Failed to modify entry order {p.entry_order_id} for adaptive entry. Order may be stuck.")
+                # Consider if you need error handling here, e.g., cancelling the order
 
     def _check_velocity_trigger(self, p: Position, now: datetime) -> bool:
-        """Checks if price is accelerating towards the SL, warranting a pre-emptive exit."""
+        # This function is safe. Reads from memory. No I/O.
         history = self.position_price_history.get(p.id)
         velo_cfg = self.trade_mgmt_config.get("velocity_trigger", {})
         lookback_seconds = velo_cfg.get("lookback_seconds", 5)
@@ -3107,13 +3950,12 @@ class VolatilityMeanReversionStrategy(BaseStrategy):
 # ==================================================================================================
 class Engine:
     def __init__(self,
-                 kite: GovernedKite,
-                 store: Store,
+                 store_actor: StoreActor,
                  book: InstrumentBook,
                  prices: PriceBus,
                  config: Dict):
-        self.k = kite
-        self.store = store
+        # self.k = kite  <--- DELETED
+        self.store_actor = store_actor
         self.book = book
         self.prices = prices
         self.config = config
@@ -3153,6 +3995,7 @@ class Engine:
         self.potential_regime: Optional[Regime] = None
         self.potential_regime_count: int = 0
         self.regime_confirmation_threshold: int = self.config["strategies"]["regime_classifier"].get("hysteresis_confirmation_count", 3)
+        self.nifty_bn_zscore: Optional[float] = None
 
         self.last_trading_day: Optional[date] = None
         self.eod_flatten_triggered = False
@@ -3194,8 +4037,27 @@ class Engine:
         if not self.nifty_50_tokens:
             return
         try:
-            # This is ONE API call for all 50 tokens
-            quotes = self.k.quote(self.nifty_50_tokens)
+            # --- FIXED: Use OrderActor ---
+            L.debug("Requesting Nifty 50 quotes via OrderActor...")
+            reply_q = queue.Queue()
+            self.trader.order_actor.q.put({
+                "type": "quote",
+                "params": {"instrument_tokens": self.nifty_50_tokens},
+                "reply_q": reply_q
+            })
+            
+            quotes = None
+            try:
+                resp = reply_q.get(timeout=10.0)
+                if resp['ok']:
+                    quotes = resp['res']
+                else:
+                    raise Exception(resp.get('error', 'Failed to get quotes from OrderActor'))
+            except queue.Empty:
+                L.error("Timeout waiting for OrderActor quote reply for market breadth.")
+                return
+            # --- END FIX ---
+
             if not quotes:
                 L.warning("Market breadth quote fetch returned no data.")
                 return
@@ -3288,6 +4150,8 @@ class Engine:
             if atm_iv:
                 L.debug(f"Updating ATM IV cache for {underlying_name}: {atm_iv:.4f}")
                 self.atm_iv_cache[underlying_name] = atm_iv
+                
+                
     def _tick_processor_worker(self):
         L.info("Tick processor worker started.")
         while self.running.is_set():
@@ -3308,9 +4172,7 @@ class Engine:
                 continue
             except Exception as e:
                 L.error(f"FATAL Error in tick processor worker: {e}", exc_info=True)
-    # --- ADD NEW METHOD to Engine class ---
-    # REFACTORED from _score_and_queue_trade
-    # Insert this method inside the Engine class in main1.py
+
 
     # Inside Engine class
     def _score_and_size_trade(self, signal: TradeSignal, token: int) -> Optional[Dict]:
@@ -3397,8 +4259,39 @@ class Engine:
         if tfi_score == 1: score += 0.5; score_log.append("TFI Confirm: +0.5")
         if obi_score == -1: score -= 1.0; score_log.append("OBI Conflict: -1.0") # Increased penalty
         if tfi_score == -1: score -= 1.0; score_log.append("TFI Conflict: -1.0") # Increased penalty
+        
+        # --- NEW: 5. StatArb Relative Value Score ---
+        if self.nifty_bn_zscore is not None:
+            zscore = self.nifty_bn_zscore
+            z_threshold = 1.5 # How many std devs to consider "expensive" or "cheap"
 
-        # --- 5. Market Breadth Score ---
+            if token == self.nifty_token: # We are trading NIFTY
+                if signal.side == OrderSide.BUY:
+                    if zscore < -z_threshold: # Nifty is "cheap"
+                        score += 1.0; score_log.append(f"StatArb Confirm (Nifty Cheap): +1.0")
+                    elif zscore > z_threshold: # Nifty is "expensive"
+                        score -= 1.0; score_log.append(f"StatArb Conflict (Nifty Expensive): -1.0")
+                
+                elif signal.side == OrderSide.SELL:
+                    if zscore > z_threshold: # Nifty is "expensive"
+                        score += 1.0; score_log.append(f"StatArb Confirm (Nifty Expensive): +1.0")
+                    elif zscore < -z_threshold: # Nifty is "cheap"
+                        score -= 1.0; score_log.append(f"StatArb Conflict (Nifty Cheap): -1.0")
+
+            elif token == self.bn_token: # We are trading BANKNIFTY (logic is inverted)
+                if signal.side == OrderSide.BUY:
+                    if zscore > z_threshold: # Nifty is "expensive" -> BN is "cheap"
+                        score += 1.0; score_log.append(f"StatArb Confirm (BN Cheap): +1.0")
+                    elif zscore < -z_threshold: # Nifty is "cheap" -> BN is "expensive"
+                        score -= 1.0; score_log.append(f"StatArb Conflict (BN Expensive): -1.0")
+                
+                elif signal.side == OrderSide.SELL:
+                    if zscore < -z_threshold: # Nifty is "cheap" -> BN is "expensive"
+                        score += 1.0; score_log.append(f"StatArb Confirm (BN Expensive): +1.0")
+                    elif zscore > z_threshold: # Nifty is "expensive" -> BN is "cheap"
+                        score -= 1.0; score_log.append(f"StatArb Conflict (BN Cheap): -1.0")
+
+        # --- 6. Market Breadth Score ---
         if self.market_breadth != 0:
             breadth_threshold = self.technical_config.get("breadth_score_threshold", 10)
             if (signal.side == OrderSide.BUY and self.market_breadth > breadth_threshold) or \
@@ -3408,7 +4301,7 @@ class Engine:
                  (signal.side == OrderSide.SELL and self.market_breadth > breadth_threshold):
                  score -= 1.0; score_log.append(f"Breadth Conflict (Net {self.market_breadth}): -1.0")
 
-        # --- 6. Volatility Structure Score (IV vs HV) ---
+        # --- 7. Volatility Structure Score (IV vs HV) ---
         vol_config = self.technical_config.get("volatility_filter", {})
         hv_period = vol_config.get("hv_period", 20)
         underlying_ohlc = self.get_ohlc(token, 1)
@@ -3429,7 +4322,7 @@ class Engine:
         # NOTE: Regime Confidence multiplier is NOT applied to the score itself.
         # It affects the final *sizing* in the planner via RiskManager.
 
-        # --- 7. Final Score Calculation & Minimum Threshold Check ---
+        # --- 8. Final Score Calculation & Minimum Threshold Check ---
         final_score = max(0, score) # Clamp score at 0 minimum
 
         # Log BEFORE threshold check for debugging visibility
@@ -3440,7 +4333,7 @@ class Engine:
             # L.debug(f"Signal score {final_score:.1f} < min threshold {min_score} for {option_symbol}. Dropped.") # Moved logging
             return None
 
-        # --- 8. Return Package with Score and Preliminary Params ---
+        # --- 9. Return Package with Score and Preliminary Params ---
         # The 'params' dict still holds the option details ('opt') and greeks,
         # but the 'lots' and 'total_trade_risk' are based on the dummy score=1.0 and will be recalculated.
         return {
@@ -3464,7 +4357,7 @@ class Engine:
         if not all([self.trader, self.risk_manager, self.micro_monitor, self.pos_manager]):
             raise SystemExit("FATAL: Dependencies not set. Call engine.set_dependencies() before start().")
 
-        self.warm_up()
+        self.warm_up() # This is now fixed to use actors
         self.prices.start()
         if not self.prices.connected.wait(10):
             raise SystemExit("FATAL: PriceBus WebSocket could not connect.")
@@ -3475,13 +4368,8 @@ class Engine:
 
         self.prices.subscribe(tokens_to_subscribe)
 
-        # Inside Engine.start
-
-# ... (code before thread starting) ...
-
         self.running.set()
 
-        # --- MODIFIED: Store thread objects ---
         L.info("Starting TickProcessor thread...")
         self.tick_thread = threading.Thread(target=self._tick_processor_worker, name="TickProcessor", daemon=True)
         self.tick_thread.start()
@@ -3498,9 +4386,8 @@ class Engine:
         for name, (func, interval) in self.scheduler.items():
             thread = threading.Thread(target=self._run_task_in_loop, args=(func, interval, name), name=name, daemon=True)
             thread.start()
-            self.scheduler_threads[name] = thread # Store scheduled threads by name
+            self.scheduler_threads[name] = thread 
             L.info(f"Started scheduler thread for '{name}' with {interval}s interval.")
-        # --- End Modified Section ---
 
         self.loop() # Start the main loop
 
@@ -3519,11 +4406,31 @@ class Engine:
                 L.error(f"Error in scheduled task '{name}': {e}", exc_info=True)
             time.sleep(interval)
 
+    
     def _send_eod_report(self):
         now_time = now_ist().time()
         if now_time > self.timings_config["market_close"] and not self.eod_report_sent:
             L.info("Sending End-of-Day report...")
-            wins, losses = self.store.get_todays_trades_stats()
+            
+            # --- FIXED: Use StoreActor ---
+            L.debug("Requesting EOD stats from StoreActor...")
+            reply_q = queue.Queue()
+            self.store_actor.q.put({
+                "type": "get_todays_trades_stats",
+                "reply_q": reply_q
+            })
+            
+            wins, losses = 0, 0
+            try:
+                resp = reply_q.get(timeout=10.0)
+                if resp['ok']:
+                    wins, losses = resp['res']
+                else:
+                    L.error(f"Could not get EOD stats from StoreActor: {resp.get('error')}")
+            except queue.Empty:
+                L.error("Timeout getting EOD stats from StoreActor")
+            # --- END FIX ---
+                
             total_trades = wins + losses
             win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
             report = (f"📊 **--- End of Day Report ---** 📊\n\n"
@@ -3592,8 +4499,17 @@ class Engine:
         L.info("Post-Market state. Running final tasks for the day.")
         if not self.eod_report_sent:
             self._send_eod_report()
+            
+        # --- FIXED: Use StoreActor ---
         if self.last_trading_day:
-            self.store.set_kv(f"daily_pnl_{self.last_trading_day}", str(self.trader.daily_realized_pnl))
+            L.debug("Sending final daily PnL to StoreActor...")
+            self.store_actor.q.put({
+                "type": "set_kv",
+                "key": f"daily_pnl_{self.last_trading_day}",
+                "value": str(self.trader.daily_realized_pnl)
+            })
+        # --- END FIX ---
+            
         send_alert(f"💤 Sentinel shutting down for the day. Final Realized PnL: ₹{self.trader.daily_realized_pnl:,.2f}")
         L.info("Daily tasks complete. Bot will now stop.")
         self.stop()
@@ -3673,7 +4589,8 @@ class Engine:
 
     def _reset_daily_state(self):
         L.info("Resetting daily state for new trading day.")
-        self.risk_manager.reset_daily_state(self.last_trading_day)
+        # This now uses store_actor internally
+        self.risk_manager.reset_daily_state(self.last_trading_day) 
 
         with self.master_lock:
             self.halt_trading = False
@@ -3696,7 +4613,8 @@ class Engine:
     def warm_up(self):
         L.info("Warming up... Priming historical data.")
         self.last_trading_day = now_ist().date()
-        self.risk_manager.load_persistent_state(self.last_trading_day)
+        # This now uses store_actor internally
+        self.risk_manager.load_persistent_state(self.last_trading_day) 
 
         to_date, from_date = self.last_trading_day, self.last_trading_day - timedelta(days=self.technical_config["warmup_days"])
 
@@ -3718,7 +4636,32 @@ class Engine:
                 continue
             symbol = self.book.get_symbol(token) or f"Token {token}"
             L.info(f"Priming historical data for: {symbol}")
-            hist = self.k.historical_data(token, from_date, to_date, "minute")
+            
+            # --- FIXED: Use OrderActor ---
+            hist = None
+            L.debug(f"Requesting hist data for {symbol} via OrderActor...")
+            reply_q = queue.Queue()
+            params = {
+                "instrument_token": token,
+                "from_date": from_date,
+                "to_date": to_date,
+                "interval": "minute"
+            }
+            self.trader.order_actor.q.put({
+                "type": "historical_data",
+                "params": params,
+                "reply_q": reply_q
+            })
+            try:
+                resp = reply_q.get(timeout=30.0) # Longer timeout for historical
+                if resp['ok']:
+                    hist = resp['res']
+                else:
+                    L.error(f"Failed to get hist data from OrderActor: {resp.get('error')}")
+            except queue.Empty:
+                L.error(f"Timeout getting hist data for {symbol} from OrderActor")
+            # --- END FIX ---
+
             if hist:
                 df_hist=pd.DataFrame(hist)
                 self.bars.prime(token, df_hist, append=False)
@@ -3731,8 +4674,30 @@ class Engine:
                     if gap_minutes > 2 and gap_minutes < 375: # Gap is > 2 mins but < 1 day
                         L.warning(f"Detected {gap_minutes:.0f} min data gap for {symbol}. Backfilling...")
                         
-                        # Fetch *only* the missing data
-                        gap_data = self.k.historical_data(token, last_bar_ts + timedelta(minutes=1), now, "minute")
+                        # --- FIXED: Use OrderActor ---
+                        gap_data = None
+                        gap_params = {
+                            "instrument_token": token,
+                            "from_date": last_bar_ts + timedelta(minutes=1),
+                            "to_date": now,
+                            "interval": "minute"
+                        }
+                        gap_reply_q = queue.Queue()
+                        self.trader.order_actor.q.put({
+                            "type": "historical_data",
+                            "params": gap_params,
+                            "reply_q": gap_reply_q
+                        })
+                        try:
+                            gap_resp = gap_reply_q.get(timeout=30.0)
+                            if gap_resp['ok']:
+                                gap_data = gap_resp['res']
+                            else:
+                                L.error(f"Gap-fill failed: {gap_resp.get('error')}")
+                        except queue.Empty:
+                            L.error("Timeout on gap-fill request")
+                        # --- END FIX ---
+                        
                         if gap_data:
                             self.bars.prime(token, pd.DataFrame(gap_data), append=True)
                             L.info(f"Successfully backfilled {len(gap_data)} bars for {symbol}.")
@@ -3744,7 +4709,31 @@ class Engine:
         if self.vix_token:
             L.info("Priming long-term VIX history for IV Rank calculation...")
             vix_from_date = self.last_trading_day - timedelta(days=365)
-            vix_hist = self.k.historical_data(self.vix_token, vix_from_date, to_date, "day")
+            
+            # --- FIXED: Use OrderActor ---
+            vix_hist = None
+            vix_params = {
+                "instrument_token": self.vix_token,
+                "from_date": vix_from_date,
+                "to_date": to_date,
+                "interval": "day"
+            }
+            vix_reply_q = queue.Queue()
+            self.trader.order_actor.q.put({
+                "type": "historical_data",
+                "params": vix_params,
+                "reply_q": vix_reply_q
+            })
+            try:
+                vix_resp = vix_reply_q.get(timeout=30.0)
+                if vix_resp['ok']:
+                    vix_hist = vix_resp['res']
+                else:
+                    L.error(f"VIX hist failed: {vix_resp.get('error')}")
+            except queue.Empty:
+                L.error("Timeout on VIX hist request")
+            # --- END FIX ---
+            
             if vix_hist:
                 self.vix_long_history_df = pd.DataFrame(vix_hist)
                 L.info(f"Successfully primed {len(self.vix_long_history_df)} days of VIX data.")
@@ -3766,13 +4755,35 @@ class Engine:
                     for token in [self.nifty_token, self.bn_token]:
                         if not token:
                             continue
-                        hist_data = self.k.historical_data(token, now - timedelta(minutes=5), now, "minute")
+                        
+                        # --- FIXED: Use OrderActor ---
+                        hist_data = None
+                        params = {
+                            "instrument_token": token,
+                            "from_date": now - timedelta(minutes=5),
+                            "to_date": now,
+                            "interval": "minute"
+                        }
+                        reply_q = queue.Queue()
+                        self.trader.order_actor.q.put({
+                            "type": "historical_data",
+                            "params": params,
+                            "reply_q": reply_q
+                        })
+                        try:
+                            resp = reply_q.get(timeout=10.0)
+                            if resp['ok']:
+                                hist_data = resp['res']
+                        except queue.Empty:
+                            L.warning("Timeout reconciling bars")
+                        # --- END FIX ---
+                        
                         if not hist_data:
                             continue
 
                         hist_df = pd.DataFrame(hist_data)
                         bar_df = self.bars.data.get(token, {}).get(1)
-                        if bar_df is None:
+                        if bar_df is None or bar_df.empty:
                             continue
 
                         hist_df['timestamp'] = pd.to_datetime(hist_df['date']).dt.tz_convert(IST)
@@ -3829,7 +4840,10 @@ class Engine:
         picks the best candidate, performs final sizing, checks risk, and queues the trade.
         Runs at a faster interval (e.g., 2 seconds).
         """
+        start_time = time.perf_counter() # Timer starts *before* lock
+            
         with self.master_lock:
+            logic_start_time = time.perf_counter() # Timer for logic starts *after* lock
             now = now_ist()
 
             # --- 0. Check/Update Daily State ---
@@ -3905,132 +4919,152 @@ class Engine:
             # --- 3. Master Halt Check (Check *after* potential Theta Halt engagement/disengagement) ---
             if self.halt_trading:
                 # L.debug("Trading halted. Skipping strategy evaluation.")
-                return
+                pass # Allow function to exit and run profiling
+            else:
+                # --- 4. Timing & Cooldown Guard Clauses ---
+                now_time = now.time()
+                final_entry_time = self.timings_config["final_entry_time"]
+                # Adjust final entry on expiry days if configured
+                is_expiry_day = self.book.find_nearest_expiry_date("NIFTY") == now.date() # Check Nifty expiry
+                if is_expiry_day and self.timings_config.get("final_expiry_entry_time"):
+                     final_entry_time = self.timings_config["final_expiry_entry_time"]
 
-            # --- 4. Timing & Cooldown Guard Clauses ---
-            now_time = now.time()
-            final_entry_time = self.timings_config["final_entry_time"]
-            # Adjust final entry on expiry days if configured
-            is_expiry_day = self.book.find_nearest_expiry_date("NIFTY") == today # Check Nifty expiry
-            if is_expiry_day and self.timings_config.get("final_expiry_entry_time"):
-                 final_entry_time = self.timings_config["final_expiry_entry_time"]
+                if not (self.timings_config["market_settling_time"] <= now_time < final_entry_time):
+                    # L.debug("Outside trading window.") # Optional debug
+                    pass # Allow function to exit
+                else:
+                    cooldown_ok = not self.last_trade_timestamp or (now - self.last_trade_timestamp) > timedelta(minutes=self.trading_config["trade_cooldown_minutes"])
+                    if not cooldown_ok:
+                        # L.debug("Trade cooldown active.") # Optional debug
+                        pass # Allow function to exit
+                    else:
+                        # --- 5. Universe Scan (Corrected Loop) ---
+                        strategies_to_run = []
+                        if self.regime in self.strategies: strategies_to_run.extend(self.strategies[self.regime])
+                        if "AGNOSTIC" in self.strategies: strategies_to_run.extend(self.strategies["AGNOSTIC"])
+                        
+                        if strategies_to_run: # Only scan if there are strategies
+                            universe_tokens = [self.nifty_token, self.bn_token] # Expandable later
+                            all_potential_signals = [] # List to store {"signal": TradeSignal, "token": int}
 
-            if not (self.timings_config["market_settling_time"] <= now_time < final_entry_time):
-                # L.debug("Outside trading window.") # Optional debug
-                return
-
-            cooldown_ok = not self.last_trade_timestamp or (now - self.last_trade_timestamp) > timedelta(minutes=self.trading_config["trade_cooldown_minutes"])
-            if not cooldown_ok:
-                # L.debug("Trade cooldown active.") # Optional debug
-                return
-
-            # --- 5. Universe Scan (Corrected Loop) ---
-            strategies_to_run = []
-            if self.regime in self.strategies: strategies_to_run.extend(self.strategies[self.regime])
-            if "AGNOSTIC" in self.strategies: strategies_to_run.extend(self.strategies["AGNOSTIC"])
-            if not strategies_to_run: return # No strategies for this regime/agnostic
-
-            universe_tokens = [self.nifty_token, self.bn_token] # Expandable later
-            all_potential_signals = [] # List to store {"signal": TradeSignal, "token": int}
-
-            for token in universe_tokens:
-                if not token: continue
-                
-                cooldown_minutes = self.trading_config.get("trade_cooldown_minutes", 1)
-                last_trade_time = self.underlying_cooldown.get(token)
-                if last_trade_time and (now - last_trade_time) < timedelta(minutes=cooldown_minutes):
-                    # L.debug(f"Skipping {self.book.get_symbol(token)} due to trade cooldown.")
-                    continue
-                
-                for strategy in strategies_to_run:
-                    try:
-                        if signal := strategy.evaluate(token, self.regime, now):
-                            all_potential_signals.append({"signal": signal, "token": token})
-                    except Exception as e:
-                         L.error(f"Error evaluating strategy {strategy.name.value} on token {token}: {e}", exc_info=True)
-
-
-            if not all_potential_signals: return # No signals generated
-
-            # --- 6. Score All Signals (Gets Preliminary Params) ---
-            scored_trades = [] # List to store {"package": Dict, "signal": TradeSignal, "token": int}
-            for potential in all_potential_signals:
-                signal, token = potential["signal"], potential["token"]
-                try:
-                    # Returns {"score": float, "params": Dict (prelim), "is_agnostic": bool} or None
-                    trade_package = self._score_and_size_trade(signal, token)
-                    if trade_package:
-                        scored_trades.append({
-                            "package": trade_package,
-                            "signal": signal,
-                            "token": token
-                        })
-                except Exception as e:
-                    L.error(f"Error scoring signal {signal.strategy_name.value} on token {token}: {e}", exc_info=True)
+                            for token in universe_tokens:
+                                if not token: continue
+                                
+                                cooldown_minutes = self.trading_config.get("trade_cooldown_minutes", 1)
+                                last_trade_time = self.underlying_cooldown.get(token)
+                                if last_trade_time and (now - last_trade_time) < timedelta(minutes=cooldown_minutes):
+                                    # L.debug(f"Skipping {self.book.get_symbol(token)} due to trade cooldown.")
+                                    continue
+                                
+                                for strategy in strategies_to_run:
+                                    try:
+                                        if signal := strategy.evaluate(token, self.regime, now):
+                                            all_potential_signals.append({"signal": signal, "token": token})
+                                    except Exception as e:
+                                         L.error(f"Error evaluating strategy {strategy.name.value} on token {token}: {e}", exc_info=True)
 
 
-            if not scored_trades: return # No signals passed minimum score threshold
-
-            # --- 7. Pick Best Trade ---
-            try:
-                # Sort by score (desc), prefer non-agnostic in ties
-                best_scored_package = max(scored_trades, key=lambda x: (x['package']['score'], not x['package']['is_agnostic']))
-            except Exception as e:
-                 L.error(f"Error selecting best trade: {e}", exc_info=True)
-                 return
-
-            # Log the chosen candidate *before* final sizing
-            strat_name = best_scored_package['signal'].strategy_name.value
-            underlying_sym = self.book.get_symbol(best_scored_package['token']) or f"Token {best_scored_package['token']}"
-            prelim_opt_sym = best_scored_package['package']['params']['opt']['tradingsymbol']
-            is_agnostic = best_scored_package['package']['is_agnostic']
-            score = best_scored_package['package']['score']
-            L.info(f">>> SCANNER Top Candidate: {strat_name} on {underlying_sym} -> {prelim_opt_sym} "
-                   f"(Agnostic: {is_agnostic}) Score: {score:.2f}")
-
-            # --- 8. Perform Final Sizing (Only for the Best Candidate) ---
-            signal_details = best_scored_package['signal']
-            token_details = best_scored_package['token']
-            score_details = best_scored_package['package']['score']
-
-            try:
-                # Call get_trade_params again - this time it calculates the *actual* size
-                final_sized_params = self.get_trade_params(
-                    token=token_details,
-                    side=signal_details.side,
-                    risk_points_on_underlying=signal_details.risk_points,
-                    reward_points_on_underlying=signal_details.reward_points,
-                    strategy=signal_details.strategy_name.value,
-                    regime=self.regime, # Pass current consensus regime
-                    confidence_score=score_details # Pass the calculated confluence score
-                )
-            except Exception as e:
-                L.error(f"Error during final sizing for {strat_name} on {underlying_sym}: {e}", exc_info=True)
-                return # Abort if sizing fails
-
-            # Check if sizing was successful and resulted in > 0 lots
-            if not final_sized_params or final_sized_params.get('lots', 0) <= 0:
-                 L.warning(f"--- Top trade {strat_name} ({prelim_opt_sym}) scored {score_details:.1f} resulted in 0 lots. Dropped. ---")
-                 return # Skip if sizing fails
-
-            L.info(f"--- Final Sizing OK: {final_sized_params['lots']} lots ({final_sized_params['total_trade_risk']:.2f} INR risk) for {prelim_opt_sym} ---")
-
-            # --- 9. Final Risk Check (Using fully sized params) ---
-            try:
-                if not self.risk_manager.risk_ok(hypothetical_params=final_sized_params):
-                    L.warning(f"--- Best trade {strat_name} on {prelim_opt_sym} blocked by master risk controls (DD, portfolio limits, etc.). ---")
-                    return
-            except Exception as e:
-                 L.error(f"Error during final risk check for {strat_name} on {prelim_opt_sym}: {e}", exc_info=True)
-                 return # Abort if risk check fails
+                            if all_potential_signals: # Only score if signals generated
+                                # --- 6. Score All Signals (Gets Preliminary Params) ---
+                                scored_trades = [] # List to store {"package": Dict, "signal": TradeSignal, "token": int}
+                                for potential in all_potential_signals:
+                                    signal, token = potential["signal"], potential["token"]
+                                    try:
+                                        # Returns {"score": float, "params": Dict (prelim), "is_agnostic": bool} or None
+                                        trade_package = self._score_and_size_trade(signal, token)
+                                        if trade_package:
+                                            scored_trades.append({
+                                                "package": trade_package,
+                                                "signal": signal,
+                                                "token": token
+                                            })
+                                    except Exception as e:
+                                        L.error(f"Error scoring signal {signal.strategy_name.value} on token {token}: {e}", exc_info=True)
 
 
-            # --- 10. Queue the Trade ---
-            L.info(f"==> Queuing trade for {strat_name} on {final_sized_params['opt']['tradingsymbol']} ({final_sized_params['lots']} lots)")
-            self.trade_signal_queue.put(final_sized_params)
-            self.last_trade_timestamp = now # Apply cooldown after successfully queuing
-            
-            self.underlying_cooldown[token_details] = now
+                                if scored_trades: # Only proceed if signals passed min score
+                                    # --- 7. Pick Best Trade ---
+                                    try:
+                                        # Sort by score (desc), prefer non-agnostic in ties
+                                        best_scored_package = max(scored_trades, key=lambda x: (x['package']['score'], not x['package']['is_agnostic']))
+                                    except Exception as e:
+                                         L.error(f"Error selecting best trade: {e}", exc_info=True)
+                                         best_scored_package = None
+
+                                    if best_scored_package:
+                                        # Log the chosen candidate *before* final sizing
+                                        strat_name = best_scored_package['signal'].strategy_name.value
+                                        underlying_sym = self.book.get_symbol(best_scored_package['token']) or f"Token {best_scored_package['token']}"
+                                        prelim_opt_sym = best_scored_package['package']['params']['opt']['tradingsymbol']
+                                        is_agnostic = best_scored_package['package']['is_agnostic']
+                                        score = best_scored_package['package']['score']
+                                        L.info(f">>> SCANNER Top Candidate: {strat_name} on {underlying_sym} -> {prelim_opt_sym} "
+                                               f"(Agnostic: {is_agnostic}) Score: {score:.2f}")
+
+                                        # --- 8. Perform Final Sizing (Only for the Best Candidate) ---
+                                        signal_details = best_scored_package['signal']
+                                        token_details = best_scored_package['token']
+                                        score_details = best_scored_package['package']['score']
+
+                                        try:
+                                            # Call get_trade_params again - this time it calculates the *actual* size
+                                            final_sized_params = self.get_trade_params(
+                                                token=token_details,
+                                                side=signal_details.side,
+                                                risk_points_on_underlying=signal_details.risk_points,
+                                                reward_points_on_underlying=signal_details.reward_points,
+                                                strategy=signal_details.strategy_name.value,
+                                                regime=self.regime, # Pass current consensus regime
+                                                confidence_score=score_details # Pass the calculated confluence score
+                                            )
+                                        except Exception as e:
+                                            L.error(f"Error during final sizing for {strat_name} on {underlying_sym}: {e}", exc_info=True)
+                                            final_sized_params = None # Abort if sizing fails
+
+                                        # Check if sizing was successful and resulted in > 0 lots
+                                        if not final_sized_params or final_sized_params.get('lots', 0) <= 0:
+                                             L.warning(f"--- Top trade {strat_name} ({prelim_opt_sym}) scored {score_details:.1f} resulted in 0 lots. Dropped. ---")
+                                        else:
+                                            L.info(f"--- Final Sizing OK: {final_sized_params['lots']} lots ({final_sized_params['total_trade_risk']:.2f} INR risk) for {prelim_opt_sym} ---")
+
+                                            # --- 9. Final Risk Check (Using fully sized params) ---
+                                            risk_check_passed = False
+                                            try:
+                                                if self.risk_manager.risk_ok(hypothetical_params=final_sized_params):
+                                                    risk_check_passed = True
+                                                else:
+                                                    L.warning(f"--- Best trade {strat_name} on {prelim_opt_sym} blocked by master risk controls (DD, portfolio limits, etc.). ---")
+                                            except Exception as e:
+                                                 L.error(f"Error during final risk check for {strat_name} on {prelim_opt_sym}: {e}", exc_info=True)
+                                                 # Abort if risk check fails
+
+                                            if risk_check_passed:
+                                                # --- 10. Queue the Trade ---
+                                                L.info(f"==> Queuing trade for {strat_name} on {final_sized_params['opt']['tradingsymbol']} ({final_sized_params['lots']} lots)")
+                                                self.trade_signal_queue.put(final_sized_params)
+                                                self.last_trade_timestamp = now # Apply cooldown after successfully queuing
+                                                self.underlying_cooldown[token_details] = now
+        
+        # --- PROFILING LOGIC (runs outside the master_lock) ---
+        logic_end_time = time.perf_counter()
+        
+        exec_time_ms = (logic_end_time - logic_start_time) * 1000.0
+        lock_wait_ms = (logic_start_time - start_time) * 1000.0
+        
+        try:
+            # Get interval from the scheduler config, which is set up in _setup_scheduler
+            interval_s = self.scheduler["strategic_planner"][1]
+            interval_ms = interval_s * 1000.0
+            warn_threshold_ms = interval_ms * 0.5 # 50% threshold
+        except (AttributeError, KeyError, IndexError, TypeError):
+            # Fallback in case self.scheduler isn't populated yet (e.g., first run)
+            interval_ms = 2000.0 # Default to 2s
+            warn_threshold_ms = 1000.0 # Default to 1s
+        
+        if exec_time_ms > warn_threshold_ms:
+            L.warning(f"PERF WARN: _run_strategic_planner logic took {exec_time_ms:.2f}ms. (Threshold: {warn_threshold_ms:.2f}ms, Lock Wait: {lock_wait_ms:.2f}ms)")
+        else:
+            L.debug(f"Strategic planner executed. Logic: {exec_time_ms:.2f}ms, Lock Wait: {lock_wait_ms:.2f}ms.")
 
     def _trade_executor_worker(self):
         L.info("Trade executor worker started.")
@@ -4066,7 +5100,8 @@ class Engine:
             L.info(f"✅ Entry fill received for {pos.tradingsymbol}. Qty: {new_fills}. Total Filled: {filled_qty}.")
 
             if pos.status == PositionStatus.PENDING_ENTRY.value:
-                avg_price = self.trader._get_order_avg_price(pos.entry_order_id)
+                # This method (trader._get_order_avg_price) is already refactored
+                avg_price = self.trader._get_order_avg_price(pos.entry_order_id) 
                 if not avg_price:
                     send_alert(f"CRITICAL: Could not get avg price for entry {pos.entry_order_id}. Closing position.", "critical")
                     self.trader.close_position(pos, "AVG_PRICE_FAILURE")
@@ -4083,7 +5118,10 @@ class Engine:
 
             pos.qty = filled_qty
             pos.status = PositionStatus.OPEN_AWAITING_BRACKETS
-            self.store.upsert_position(pos)
+            
+            # --- FIXED: Use StoreActor ---
+            self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+            # --- END FIX ---
 
         if order.get('status') in ['COMPLETE', 'CANCELLED', 'REJECTED']:
             if pos.qty == 0:
@@ -4092,7 +5130,10 @@ class Engine:
             else:
                 L.info(f"Entry order for {pos.tradingsymbol} is final. Total filled: {pos.qty}/{pos.initial_qty}.")
                 pos.status = PositionStatus.OPEN_AWAITING_BRACKETS
-                self.store.upsert_position(pos)
+                
+                # --- FIXED: Use StoreActor ---
+                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                # --- END FIX ---
                 self.risk_manager.verify_position_risk(pos)
 
     def _handle_exit_fill(self, pos: Position, order: Dict):
@@ -4103,8 +5144,10 @@ class Engine:
 
         reason = pos.exit_reason or "EXIT_FILL"
         L.info(f"Exit order {order.get('order_id')} ({reason}) complete for {pos.id}.")
+        # This method (trader._cancel_all_open_orders_for_pos) is already refactored
         self.trader._cancel_all_open_orders_for_pos(pos, cancel_entry=pos.is_entry_order_open)
 
+        # This method (trader._get_order_avg_price) is already refactored
         exit_price = self.trader._get_order_avg_price(order.get('order_id')) or self.prices.ltp(pos.token)
         if not exit_price and reason == "TP_HIT":
             exit_price = pos.tp_price
@@ -4118,17 +5161,24 @@ class Engine:
         if final_filled_qty > 0:
             pnl_for_this_exit = (exit_price - pos.entry_price) * final_filled_qty
             self.trader.daily_realized_pnl += pnl_for_this_exit # Add only the PnL from this final chunk
-            self.store.log_strategy_performance(pos.strategy, pnl_for_this_exit)
+            
+            # --- FIXED: Use StoreActor ---
+            self.store_actor.q.put({
+                "type": "log_strategy_performance",
+                "name": pos.strategy,
+                "pnl": pnl_for_this_exit
+            })
+            # --- END FIX ---
+            
             L.info(f"Final exit fill PnL contribution: {pnl_for_this_exit:.2f} for {final_filled_qty} qty.")
         else:
-    # This case should ideally not happen for a COMPLETE order, but handle defensively
             L.warning(f"Final exit order {order.get('order_id')} for {pos.tradingsymbol} completed with 0 fills? PnL contribution is 0.")
 
         pos.status = PositionStatus.CLOSED.value
         pos.exit_price = exit_price # Store the final average exit price
 
         with self.risk_manager.lock:
-            if final_filled_qty > 0 and pos.greeks: # Check if greeks exist
+            if final_filled_qty > 0 and pos.greeks: 
                 delta_change = pos.greeks.get("delta", 0.0) * final_filled_qty
                 vega_change = pos.greeks.get("vega", 0.0) * final_filled_qty
                 gamma_change = pos.greeks.get("gamma", 0.0) * final_filled_qty
@@ -4147,8 +5197,16 @@ class Engine:
 
         pos.greeks = {}
 
-        self.store.upsert_position(pos)
-        self.store.log_closed_trade(pos, exit_price, reason)
+        # --- FIXED: Use StoreActor ---
+        self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+        self.store_actor.q.put({
+            "type": "log_closed_trade",
+            "pos": pos,
+            "price": exit_price,
+            "reason": reason
+        })
+        # --- END FIX ---
+        
         self.risk_manager.update_performance_metrics(pnl_for_this_exit)
         self.trader.positions.pop(pos.id, None)
         send_alert(f"❌ CLOSED {pos.tradingsymbol} ({reason}). Final Piece PnL: {pnl_for_this_exit:.2f}. Daily PnL: {self.trader.daily_realized_pnl:.2f}")
@@ -4162,6 +5220,7 @@ class Engine:
             if not pos:
                 pos = next((p for p in self.trader.positions.values() if oid in [p.tp_order_id, p.exit_order_id, p.slm_order_id] or oid in p.partial_exit_order_ids), None)
                 if not pos:
+                    L.debug(f"Received order update for {oid} but no matching position found.")
                     return
 
             if oid == pos.entry_order_id:
@@ -4169,6 +5228,7 @@ class Engine:
 
             elif (oid in [pos.tp_order_id, pos.exit_order_id, pos.slm_order_id] or oid in pos.partial_exit_order_ids) and status == 'COMPLETE':
                 if oid in pos.partial_exit_order_ids:
+                    # This method (trader._handle_partial_exit_fill) is already refactored
                     self.trader._handle_partial_exit_fill(pos, order)
                 else:
                     if oid == pos.slm_order_id:
@@ -4176,17 +5236,27 @@ class Engine:
                     elif oid == pos.tp_order_id:
                         pos.exit_reason = "TP_HIT_BROKER"
                     self._handle_exit_fill(pos, order)
+            
             elif status == 'REJECTED':
                 if oid == pos.entry_order_id:
                     L.error(f"Entry order {oid} for {pos.tradingsymbol} REJECTED. Reason: {order.get('status_message')}")
                     pos.status = PositionStatus.REJECTED.value
                     pos.exit_reason = f"ENTRY_REJECTED: {order.get('status_message')}"
-                    self.store.upsert_position(pos)
+                    
+                    # --- FIXED: Use StoreActor ---
+                    self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                    # --- END FIX ---
+                    
                     self.trader.positions.pop(pos.id, None)
                 elif oid in [pos.tp_order_id, pos.slm_order_id]:
                     L.critical(f"Bracket order {oid} ({'TP' if oid == pos.tp_order_id else 'SL'}) for {pos.tradingsymbol} REJECTED: {order.get('status_message')}")
                     send_alert(f"🔥 CRITICAL: BRACKET ORDER REJECTED for {pos.tradingsymbol}. Closing position!", "critical")
                     self.trader.close_position(pos, "BRACKET_REJECTED")
+            
+            elif status == 'CANCELLED':
+                L.info(f"Order {oid} for {pos.tradingsymbol} was CANCELLED.")
+                # This is informational. The fill handlers manage state.
+                pass
 
     # Insert this method inside the Engine class in main1.py
     def run_regime_classification(self, current_time: datetime):
@@ -4444,13 +5514,45 @@ class Engine:
             return
         L.info("--- Starting State Reconciliation with Broker ---")
         try:
-            broker_positions_data = self.k.positions()
+            # --- FIXED: Use OrderActor ---
+            L.debug("Reconcile: Fetching broker positions...")
+            pos_reply_q = queue.Queue()
+            self.trader.order_actor.q.put({"type": "positions", "reply_q": pos_reply_q})
+            
+            broker_positions_data = None
+            try:
+                pos_resp = pos_reply_q.get(timeout=10.0)
+                if pos_resp['ok']:
+                    broker_positions_data = pos_resp['res']
+                else:
+                    raise Exception(pos_resp.get('error'))
+            except Exception as e:
+                L.error(f"Reconcile: Failed to get broker positions from OrderActor: {e}")
+                return
+            # --- END FIX ---
+
             if not broker_positions_data:
                 L.warning("Could not get broker positions for reconciliation.")
                 return
 
+            # --- FIXED: Use StoreActor ---
+            L.debug("Reconcile: Fetching DB positions...")
+            db_reply_q = queue.Queue()
+            self.store_actor.q.put({"type": "load_open_positions", "reply_q": db_reply_q})
+            
+            db_positions = {}
+            try:
+                db_resp = db_reply_q.get(timeout=10.0)
+                if db_resp['ok']:
+                    db_positions = db_resp['res']
+                else:
+                    raise Exception(db_resp.get('error'))
+            except Exception as e:
+                L.error(f"Reconcile: Failed to get DB positions from StoreActor: {e}")
+                return
+            # --- END FIX ---
+
             broker_positions_raw = broker_positions_data.get('net', [])
-            db_positions = self.store.load_open_positions()
             broker_positions_map = {pos['tradingsymbol']: pos for pos in broker_positions_raw if pos.get('product') == 'MIS' and abs(pos.get('quantity', 0)) > 0}
             broker_symbols, db_symbols = set(broker_positions_map.keys()), {p.tradingsymbol for p in db_positions.values()}
 
@@ -4460,24 +5562,62 @@ class Engine:
                     send_alert(f"RECONCILE: DB has {symbol} but broker does not. Marking as closed.", "warning")
                     pos.status = PositionStatus.CLOSED.value
                     pos.exit_reason = "RECONCILE_GHOST_CLOSE"
-                    self.store.upsert_position(pos)
+                    
+                    # --- FIXED: Use StoreActor ---
+                    self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                    # --- END FIX ---
 
             for symbol in broker_symbols - db_symbols:
                 rogue_pos_data = broker_positions_map[symbol]
                 qty = rogue_pos_data['quantity']
                 send_alert(f"🔥 RECONCILE: Rogue position for {symbol} (Qty: {qty}) found at broker! Auto-flattening.", "critical")
-                transaction_type = self.k.TRANSACTION_TYPE_SELL if qty > 0 else self.k.TRANSACTION_TYPE_BUY
-                oid = self.k.place_order(variety=self.k.VARIETY_REGULAR, exchange="NFO", tradingsymbol=symbol,
-                                         transaction_type=transaction_type, quantity=abs(qty),
-                                         product=self.k.PRODUCT_MIS, order_type=self.k.ORDER_TYPE_MARKET)
+                transaction_type = self.trader.TRANSACTION_TYPE_SELL if qty > 0 else self.trader.TRANSACTION_TYPE_BUY
+                
+                # --- FIXED: Use OrderActor ---
+                L.info(f"Reconcile: Placing market order to flatten rogue {symbol}...")
+                place_params = {
+                    "variety": self.trader.VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": symbol,
+                    "transaction_type": transaction_type, "quantity": abs(qty),
+                    "product": self.trader.PRODUCT_MIS, "order_type": self.trader.ORDER_TYPE_MARKET
+                }
+                reply_q = queue.Queue()
+                self.trader.order_actor.q.put({
+                    "type": "place_order",
+                    "params": place_params,
+                    "reply_q": reply_q
+                })
+                
+                oid = None
+                try:
+                    resp = reply_q.get(timeout=10.0)
+                    if resp['ok'] and resp['res']:
+                        oid = resp['res'].get('order_id')
+                except queue.Empty:
+                    L.error("Timeout placing flatten order")
+                # --- END FIX ---
+
                 if oid is None:
                     send_alert(f"🔥🔥 FATAL: FAILED to auto-flatten rogue position {symbol}. MANUAL INTERVENTION REQUIRED!", "critical")
                 else:
                     L.info(f"Placed market order {oid} to flatten rogue position {symbol}.")
 
             L.info("--- Reconciliation Complete ---")
-            with self.trader.lock:
-                self.trader.positions = self.store.load_open_positions()
+            
+            # --- FIXED: Use StoreActor (to reload) ---
+            L.debug("Reconcile: Reloading trader positions from DB...")
+            reload_reply_q = queue.Queue()
+            self.store_actor.q.put({"type": "load_open_positions", "reply_q": reload_reply_q})
+            try:
+                reload_resp = reload_reply_q.get(timeout=10.0)
+                if reload_resp['ok']:
+                    with self.trader.lock:
+                        self.trader.positions = reload_resp['res']
+                else:
+                    raise Exception(reload_resp.get('error'))
+            except Exception as e:
+                L.error(f"Reconcile: Failed to reload trader positions: {e}")
+            # --- END FIX ---
+
         except Exception as e:
             L.error(f"Reconciliation failed: {e}", exc_info=True)
 
@@ -4531,25 +5671,18 @@ class Engine:
                 "TickProcessor": self.tick_thread,
                 "OrderProcessor": self.order_thread,
                 "TradeExecutor": self.trade_executor_thread,
-                # Check specific, essential scheduled tasks by name from the dict
                 "position_management": self.scheduler_threads.get("position_management"),
                 "strategic_planner": self.scheduler_threads.get("strategic_planner")
-            # Add any other scheduler tasks you deem critical (e.g., "health_check" itself?)
             }
 
         for name, thread_obj in critical_threads_to_check.items():
-            # Check if thread object exists (was successfully created) and if it's no longer alive
             if thread_obj and not thread_obj.is_alive():
-                # Check if the engine is already stopping to avoid redundant alerts/actions
-                # Use master_lock to safely check/set fatal_error_event
                 with self.master_lock:
-                     # Double-check running flag inside lock
                     if self.running.is_set() and not self.fatal_error_event.is_set():
                         msg = f"🔥 CRITICAL: Worker thread '{name}' appears dead! Initiating shutdown."
                         L.critical(msg)
                         send_alert(msg, "critical")
-                        self.fatal_error_event.set() # Signal main loop to halt and shutdown
-                        # Stop further health checks for this run if a critical thread is down
+                        self.fatal_error_event.set() 
                         return 
 
         L.debug("Worker thread liveness check passed.")
@@ -4643,7 +5776,14 @@ def _update_prometheus_metrics(self):
             self._persist_bar_data()
 
             if self.last_trading_day:
-                self.store.set_kv(f"daily_pnl_{self.last_trading_day}", str(self.trader.daily_realized_pnl))
+                # --- FIXED: Use StoreActor ---
+                self.store_actor.q.put({
+                    "type": "set_kv",
+                    "key": f"daily_pnl_{self.last_trading_day}",
+                    "value": str(self.trader.daily_realized_pnl)
+                })
+                # --- END FIX ---
+                
             send_alert("🛑 Sentinel PRIME disengaged.")
             L.info("Shutdown complete.")
 
@@ -4780,38 +5920,56 @@ def main():
         L.critical(f"Login failed: {e}")
         return
 
+    # --- REFACTOR START ---
+
+    # 1. Create original objects
     store = Store()
-    kite_gov = GovernedKite(kite_raw)
-    book = InstrumentBook(kite_gov, store).load()
+    kite_gov = GovernedKite(kite_raw) # This is now ONLY for actors
+
+    # 2. Create Actors (These will be the *only* things that use the objects above)
+    order_actor = OrderActor(kite_gov)
+    store_actor = StoreActor(store)
+    
+    # 3. Pass ACTORS as dependencies
+    
+    # FIXED: InstrumentBook now receives actors, not the original objects.
+    # This forces it to use the actor model for all its DB/API calls.
+    # NOTE: This requires you to update InstrumentBook's __init__
+    book = InstrumentBook(store_actor, order_actor).load()
+    
+    # PriceBus is OK: It *only* manages the WebSocket, not state-changing API calls.
     prices = PriceBus(kite_gov, access_token)
 
-    # Initialize modular components
-    risk_manager = RiskManager(None, None, book, prices, store, config)
-    micro_monitor = MicrostructureMonitor(prices, config)
-    pos_manager = PositionManager(None, None, book, prices, store, risk_manager, config)
+    # Inject the ACTORS
+    risk_manager = RiskManager(None, None, book, prices, store_actor, config)
+    micro_monitor = Micromonitor(prices, config)
+    pos_manager = PositionManager(None, None, book, prices, store_actor, risk_manager, config)
 
-    # Initialize Trader based on mode
+    # Initialize Trader based on mode, injecting actors (This part was already correct)
     if PAPER_TRADING:
-        trader = PaperTrader(None, book, prices, store, config, risk_manager.update_performance_metrics)
+        trader = PaperTrader(None, book, prices, store_actor, config, risk_manager.update_performance_metrics)
     else:
-        trader = Trader(None, kite_gov, store, book, prices, config, risk_manager.update_performance_metrics)
+        # Pass original `store` for startup-read, and actors for runtime I/O
+        trader = Trader(None, store, store_actor, order_actor, book, prices, config, risk_manager.update_performance_metrics)
 
     # Inject dependencies back into RiskManager and PositionManager
     risk_manager.trader = trader
     pos_manager.trader = trader
 
-    # Initialize Engine and set dependencies
-    engine = Engine(kite_gov, store, book, prices, config)
+    # FIXED: Engine no longer receives the kite_gov object.
+    # This forces it to use self.trader.order_actor for all API calls.
+    # NOTE: This requires you to update Engine's __init__
+    engine = Engine(store_actor, book, prices, config)
+    
+    # This injection is now CRITICAL, as Engine relies on it for all broker access.
     engine.set_dependencies(trader, risk_manager, micro_monitor, pos_manager)
 
     # Inject Engine dependency into modular components that need it
     risk_manager.engine = engine
     pos_manager.engine = engine
-    if PAPER_TRADING:
-        trader.engine = engine
-    else: # Live Trader
-        trader.engine = engine
+    trader.engine = engine # <-- Important injection
 
+    # --- REFACTOR END ---
 
     _engine_instance = engine # Make engine accessible to signal handler
 
@@ -4823,19 +5981,39 @@ def main():
         start_metrics_server(port=config.get("metrics_port", 9095))
 
     try:
+        # 4. Start Actors BEFORE engine
+        L.info("Starting StoreActor...")
+        store_actor.start()
+        if not PAPER_TRADING:
+            L.info("Starting OrderActor...")
+            order_actor.start()
+        
         engine.start() # This blocks until engine stops or is interrupted
+    
     except KeyboardInterrupt:
         L.info("Keyboard interrupt received in main. Stopping engine...")
-        engine.stop()
     except SystemExit as e:
         L.warning(f"SystemExit caught in main: {e}")
-        if _engine_instance: # Ensure engine exists before trying to stop
-            _engine_instance.stop()
     except Exception as e:
         L.critical(f"Unhandled FATAL exception in main execution: {e}", exc_info=True)
         send_alert(f"🔥 FATAL ERROR: Unhandled exception caused bot crash: {e}", "critical")
+    finally:
+        # 5. Add stop/join calls for actors in finally block for clean shutdown
+        L.info("Shutting down... Stopping actors.")
+        store_actor.stop()
+        if not PAPER_TRADING:
+            order_actor.stop()
+        
         if _engine_instance: # Ensure engine exists before trying to stop
             _engine_instance.stop() 
+
+        # Wait for actors to finish their queues
+        L.info("Waiting for StoreActor to join...")
+        store_actor.join(timeout=5.0)
+        if not PAPER_TRADING:
+            L.info("Waiting for OrderActor to join...")
+            order_actor.join(timeout=5.0)
+        L.info("Shutdown complete.")
 
 if __name__ == "__main__":
     main()
