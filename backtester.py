@@ -1,490 +1,823 @@
-from __future__ import annotations
-import optuna
 import pandas as pd
-import pandas_ta as ta
 import numpy as np
-import pytz
-import math
-import logging
+import json
+import uuid
 import os
+import math
+from datetime import datetime, time as dtime
 from dataclasses import dataclass, field
-from datetime import datetime, time as dtime, date, timedelta
-from typing import List, Dict, Optional, Tuple
-from scipy.interpolate import interp1d
+from queue import Queue, Empty
+import logging
 
+# ==================================================================================================
+# --- IMPORT SENTINEL-PRIME CORE COMPONENTS ---
+# ==================================================================================================
 try:
-    from main import (
-        Regime, OrderSide, StrategyName,
-        MomentumBreakoutStrategy, TrendPullbackStrategy, MeanReversionStrategy,
-        RegimeClassifier, TradeSignal, StrategyPerformanceTracker, HypotheticalTrade,
-        _get_underlying, black_scholes_price
+    from main1 import (
+        AbstractTrader, Position, PositionStatus, OrderSide, OptionType,
+        RiskManager, PositionManager, MicrostructureMonitor, RegimeClassifier,
+        BarStore, InstrumentBook, Engine, StoreActor, OrderActor,
+        BaseStrategy, MomentumBreakoutStrategy, TrendPullbackStrategy,
+        MeanReversionStrategy, VolatilityMeanReversionStrategy, OpeningRangeBreakout,
+        StrategyName, Regime, Clock,
+        load_config, now_ist, _get_underlying,
+        black_scholes_price, bs_delta, calculate_greeks,
+        calculate_historical_volatility, calculate_iv, _calculate_time_to_expiry,
+        PERSIST_DIR, IST
     )
-except ImportError:
-    print("FATAL: Could not import from 'sentinel_apex_v4_advanced_bot.py'.")
-    print("Please ensure the required classes are present and the file is in the same directory.")
-    import sys
-    sys.exit(1)
+except ImportError as e:
+    print(f"FATAL: Could not import core classes from main1.py. Make sure this file is in the same directory.")
+    print(f"Error: {e}")
+    exit(1)
 
-# --- Constants & Configuration ---
-L = logging.getLogger("BACKTESTER")
-IST = pytz.timezone("Asia/Kolkata")
-STARTING_EQUITY = 100000.0
-TRANSACTION_COST_PCT = 0.0003
-RISK_FREE_RATE = 0.05
-EARLIEST_TIMESTAMP = IST.localize(datetime(2000, 1, 1))
+L = logging.getLogger("SENTINEL-PRIME-BACKTESTER")
+L.setLevel(logging.INFO)
+if not L.handlers:
+    L.addHandler(logging.StreamHandler())
 
-# --- Mock Objects to Mimic Live Engine ---
-class MockPriceBus:
-    def __init__(self): self._ltps = {}
-    def ltp(self, token: int) -> Optional[float]: return self._ltps.get(token)
-    def update_ltp(self, token: int, price: float): self._ltps[token] = price
+# ==================================================================================================
+# --- 1. SIMULATED "SENSES" (HIGH-FIDELITY PRICEBUS) ---
+# ==================================================================================================
 
-class MockBarStore:
-    def __init__(self, full_data: pd.DataFrame):
-        ts_col = pd.to_datetime(full_data['date'])
-        if ts_col.dt.tz is None:
-            self.full_df = full_data.set_index(ts_col.dt.tz_localize(IST))
-        else:
-            self.full_df = full_data.set_index(ts_col.dt.tz_convert(IST))
+class SimulatedPriceBus:
+    """
+    A high-fidelity "fake" PriceBus. It serves real futures data
+    and dynamically estimates option prices on-the-fly when asked.
+    """
+    def __init__(self, book: InstrumentBook, engine: 'BacktestEngine'):
+        self.book = book
+        self.engine = engine # To get IV cache, config, etc.
+        self._current_futures_ticks = {}
+        self._current_futures_bar = None
+        self._risk_free_rate = 0.05 # Hardcoded for BS
+        self._market_close_time = dtime.fromisoformat("15:30:00")
+        
+        # Cache for estimated prices to avoid re-calculating 5x per bar
+        self._bar_option_cache = {}
 
-    def get_ohlc(self, timeframe: int, until_time: datetime) -> pd.DataFrame:
-        sliced_1min_df = self.full_df.loc[self.full_df.index < until_time].copy()
-        if timeframe == 1:
-            return sliced_1min_df
-        return sliced_1min_df.resample(f'{timeframe}min').agg(
-            {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
-        ).dropna()
+    def update_futures_bar(self, bar: pd.Series):
+        """Called by the BacktestEngine on each new bar."""
+        self._current_futures_bar = bar
+        self._bar_option_cache = {} # Clear cache on new bar
+        
+        # We only update the FUTURES ticks
+        for token, prefix in [(256265, "NIFTY"), (260105, "BN"), (257281, "VIX")]:
+            if f"{prefix}_open" in bar.index:
+                self._current_futures_ticks[token] = {
+                    "instrument_token": token,
+                    "last_price": bar[f"{prefix}_close"],
+                    "open": bar[f"{prefix}_open"],
+                    "high": bar[f"{prefix}_high"],
+                    "low": bar[f"{prefix}_low"],
+                    "close": bar[f"{prefix}_close"],
+                    "volume": bar[f"{prefix}_volume"],
+                    "depth": { # Simulate basic depth
+                        "buy": [{"price": bar[f"{prefix}_close"] * 0.999, "quantity": 100}],
+                        "sell": [{"price": bar[f"{prefix}_close"] * 1.001, "quantity": 100}]
+                    }
+                }
+    
+    def ltp(self, token: int) -> float | None:
+        """Gets the Last Traded Price (simulated)."""
+        if token in self._current_futures_ticks:
+            return self._current_futures_ticks[token]["last_price"]
+        
+        # If it's an option, estimate its LTP
+        tick = self.get_full_tick(token)
+        return tick.get("last_price") if tick else None
 
-class MockEngine:
-    # --- FIX #1: Update the __init__ method to accept a price_bus ---
-    def __init__(self, nifty_bars: MockBarStore, bn_bars: MockBarStore, price_bus: MockPriceBus):
-        self.bars = {1: nifty_bars, 2: bn_bars}
-        self.book = {1: "NIFTY 50", 2: "NIFTY BANK"}
-        self.prices = price_bus # Add the prices attribute
+    def get_full_tick(self, token: int) -> dict | None:
+        """
+        --- THIS IS THE CORE OF THE SIMULATION ---
+        If a future is requested, returns the bar data.
+        If an option is requested, it calculates its price *on-the-fly*.
+        """
+        # 1. Check if it's a future
+        if token in self._current_futures_ticks:
+            return self._current_futures_ticks[token]
+            
+        # 2. Check if it's an option we've already priced this bar
+        if token in self._bar_option_cache:
+            return self.get_estimated_option_ohlc(token) # Returns full bar dict
 
-    def get_ohlc(self, token: int, timeframe: int, until_time: datetime) -> pd.DataFrame:
-        return self.bars[token].get_ohlc(timeframe, until_time)
-
-# --- Data Structures for Backtesting ---
-@dataclass
-class BacktestTrade:
-    entry_time: datetime; exit_time: datetime; entry_price_underlying: float
-    exit_price_underlying: float; qty: int; side: OrderSide; pnl: float
-    exit_reason: str; strategy: str; regime: str
-    entry_option_price: float; exit_option_price: float
-
-@dataclass
-class BacktestPosition:
-    entry_time: datetime; side: OrderSide; qty: int; token: int;
-    entry_price_underlying: float; sl_price_underlying: float; tp_price_underlying: float
-    strategy: str; regime: str;
-    strike_price: float; expiry_date: date; is_call: bool
-    entry_option_price: float; favorable_price_since_entry: float = 0.0
-
-# --- The Main Backtesting Engine ---
-class BacktestEngine:
-    def __init__(self, nifty_data: pd.DataFrame, bn_data: pd.DataFrame, vix_data: pd.DataFrame, strategy_params: Dict, config: Dict):
-        nifty_bars, bn_bars = MockBarStore(nifty_data), MockBarStore(bn_data)
-        self.vix_data = vix_data.copy()
-        ts_col = pd.to_datetime(self.vix_data['date'])
-        if ts_col.dt.tz is None: self.vix_data['timestamp'] = ts_col.dt.tz_localize(IST)
-        else: self.vix_data['timestamp'] = ts_col.dt.tz_convert(IST)
-        self.vix_data = self.vix_data.set_index('timestamp')
-
-        self.mock_prices = MockPriceBus()
-        # --- FIX #2: Pass the mock_prices object when creating MockEngine ---
-        self.mock_engine = MockEngine(nifty_bars, bn_bars, self.mock_prices)
-
-        self.config = config; self.params = strategy_params
-        self.classifier = RegimeClassifier(self.mock_engine, self.mock_prices, 1, 2, 260105)
-        self.strategies: Dict[Regime, List] = {
-            Regime.COMPRESSION: [MomentumBreakoutStrategy(StrategyName.MOMENTUM_BREAKOUT, self.mock_engine, self.params["momentum_breakout"])],
-            Regime.TRENDING_UP: [TrendPullbackStrategy(StrategyName.TREND_PULLBACK, self.mock_engine, self.params["trend_pullback"])],
-            Regime.TRENDING_DOWN: [TrendPullbackStrategy(StrategyName.TREND_PULLBACK, self.mock_engine, self.params["trend_pullback"])],
-            Regime.CHOP: [MeanReversionStrategy(StrategyName.MEAN_REVERSION, self.mock_engine, self.params["mean_reversion"])]
-        }
-        self.performance_tracker = StrategyPerformanceTracker(lookback=self.config["trading"]["meta_strategy"]["performance_lookback_trades"])
-        self.open_hypothetical_trades: Dict[str, HypotheticalTrade] = {}
-        self.trade_log: List[BacktestTrade] = []; self.equity = STARTING_EQUITY; self.equity_curve = []
-        self.current_regime = Regime.UNCLEAR
-        self.last_regime_change_time: Optional[datetime] = None
-        self._load_vol_surfaces()
-
-    def _load_vol_surfaces(self):
-        self.vol_surfaces: Dict[str, Dict[date, Optional[interp1d]]] = {"NIFTY": {}, "BANKNIFTY": {}}
-        surface_dir = os.path.join("data", "vol_surface")
-        if not os.path.exists(surface_dir):
-            L.warning(f"Volatility surface directory not found at '{surface_dir}'. Backtester will fallback to VIX.")
-            return
-
-        for file_name in os.listdir(surface_dir):
-            try:
-                parts = file_name.replace('.csv', '').split('_')
-                name, dt_str = parts[0], parts[1]
-                surface_date = datetime.strptime(dt_str, '%Y-%m-%d').date()
-                df = pd.read_csv(os.path.join(surface_dir, file_name)).sort_values('strike').drop_duplicates(subset=['strike'])
-                if len(df) < 4: continue
-                self.vol_surfaces[name][surface_date] = interp1d(df['strike'], df['iv'], kind='cubic', fill_value="extrapolate")
-            except Exception as e:
-                L.warning(f"Could not load vol surface file {file_name}: {e}")
-
-    def _get_iv_for_strike(self, token: int, strike: float, trade_date: date) -> Optional[float]:
-        name = "BANKNIFTY" if token == 2 else "NIFTY"
-        surface_func = self.vol_surfaces[name].get(trade_date)
-        if surface_func is not None:
-            try:
-                return float(surface_func(strike))
-            except Exception:
-                L.warning(f"Could not extrapolate IV for strike {strike} on {trade_date}. Falling back to VIX.")
-
-        L.debug(f"No vol surface for {name} on {trade_date}, falling back to VIX.")
+        # 3. If it's a new option request, estimate its price (LTP)
         try:
-            vix_for_day = self.vix_data.loc[self.vix_data.index.date == trade_date]
-            return vix_for_day.iloc[0]['close'] / 100 if not vix_for_day.empty else None
-        except IndexError:
+            opt_details = self.book.df_by_token.loc[token]
+            strike = opt_details['strike']
+            is_call = opt_details['instrument_type'] == 'CE'
+            expiry_date = opt_details['expiry'].date()
+            
+            underlying_name = _get_underlying(opt_details['name'])
+            underlying_token = 256265 if "NIFTY" in underlying_name else 260105
+            
+            spot = self.ltp(underlying_token)
+            if not spot: return None # Can't price
+                
+            T = _calculate_time_to_expiry(expiry_date, now_ist(), self._market_close_time)
+            
+            # Get IV from the *real* engine's cache
+            sigma = self.engine.engine.atm_iv_cache.get(underlying_name, 0.2) # Default 20% IV
+            
+            price = black_scholes_price(spot, strike, T, self._risk_free_rate, sigma, is_call)
+            
+            # Return a "fake" tick
+            return {
+                "instrument_token": token,
+                "last_price": price,
+                "volume": 100000, # Fake
+                "open_interest": 100000, # Fake
+                "depth": { # Return a perfectly neutral book so OBI is 0
+                    "buy": [{"price": price * 0.999, "quantity": 100}],
+                    "sell": [{"price": price * 1.001, "quantity": 100}]
+                }
+            }
+        except Exception as e:
+            # L.warning(f"Failed to estimate price for token {token}: {e}")
             return None
+            
+    def get_estimated_option_ohlc(self, token: int) -> dict | None:
+        """
+        Estimates the OHLC for an option token based on the
+        underlying futures bar.
+        """
+        if token in self._bar_option_cache:
+            return self._bar_option_cache[token]
+            
+        try:
+            opt_details = self.book.df_by_token.loc[token]
+            strike = opt_details['strike']
+            is_call = opt_details['instrument_type'] == 'CE'
+            expiry_date = opt_details['expiry'].date()
+            
+            underlying_name = _get_underlying(opt_details['name'])
+            underlying_token = 256265 if "NIFTY" in underlying_name else 260105
+            
+            fut_bar = self._current_futures_ticks.get(underlying_token)
+            if not fut_bar: return None
+                
+            T = _calculate_time_to_expiry(expiry_date, now_ist(), self._market_close_time)
+            sigma = self.engine.engine.atm_iv_cache.get(underlying_name, 0.2)
 
-    def run(self):
-        idx1 = self.mock_engine.bars[1].full_df.index
-        idx2 = self.mock_engine.bars[2].full_df.index
-        idx3 = self.vix_data.index
-        common_index = idx1.intersection(idx2).intersection(idx3).sort_values()
+            # Calculate OHLC prices
+            opt_open = black_scholes_price(fut_bar['open'], strike, T, self._risk_free_rate, sigma, is_call)
+            opt_high = black_scholes_price(fut_bar['high'], strike, T, self._risk_free_rate, sigma, is_call)
+            opt_low = black_scholes_price(fut_bar['low'], strike, T, self._risk_free_rate, sigma, is_call)
+            opt_close = black_scholes_price(fut_bar['close'], strike, T, self._risk_free_rate, sigma, is_call)
 
-        position: Optional[BacktestPosition] = None
-        cooldown_until = EARLIEST_TIMESTAMP
-        L.info(f"Starting backtest on {len(common_index)} synchronized bars...")
+            # Handle call/put high/low inversion
+            if is_call:
+                o_h, o_l = opt_high, opt_low
+            else:
+                o_h, o_l = opt_low, opt_high # Inverted for puts
 
-        if len(common_index) == 0:
-            L.error("No common data found across Nifty, BankNifty, and VIX files. Aborting backtest.")
-            return self.generate_report()
+            bar_dict = {
+                "instrument_token": token,
+                "last_price": opt_close,
+                "open": opt_open,
+                "high": o_h,
+                "low": o_l,
+                "close": opt_close,
+                "volume": 100000, # Fake
+                "last_traded_quantity": 100, # Fake
+                "exchange_timestamp": now_ist()
+            }
+            self._bar_option_cache[token] = bar_dict # Cache it
+            return bar_dict
+            
+        except Exception as e:
+            # L.warning(f"Failed to estimate OHLC for token {token}: {e}")
+            return None
+    
+    def subscribe(self, tokens: list[int]):
+        pass # Not needed for simulation
 
-        for bar_time in common_index:
-            self.mock_prices.update_ltp(1, self.mock_engine.bars[1].full_df.loc[bar_time, 'close'])
-            self.mock_prices.update_ltp(2, self.mock_engine.bars[2].full_df.loc[bar_time, 'close'])
-            self.mock_prices.update_ltp(260105, self.vix_data.loc[bar_time, 'close'])
+# ==================================================================================================
+# --- 2. SIMULATED "LIMBS" (FAKE TRADER) ---
+# ==================================================================================================
 
-            self._update_regime_state(bar_time)
-            self._manage_hypothetical_trades(bar_time)
-
-            if position:
-                row = self.mock_engine.bars[position.token].full_df.loc[bar_time]
-                position = self._manage_open_position(position, row)
-
-            if not position and bar_time > cooldown_until:
-                pos, cooldown_until_new = self._check_for_new_entry(bar_time)
-                if pos:
-                    position = pos
-                    cooldown_until = cooldown_until_new
-
-            self.equity_curve.append({'timestamp': bar_time, 'equity': self.equity})
-
-        L.info("Backtest finished.")
-        return self.generate_report()
-
-    def _update_regime_state(self, current_time: datetime):
-        old_regime = self.current_regime
-        raw_regime, _ = self.classifier.get_raw_classification(self.current_regime, current_time)
-        if self.classifier.potential_regime and raw_regime == self.classifier.potential_regime[0]:
-            self.classifier.confirmation_count += 1
-        else:
-            self.classifier.potential_regime = (raw_regime, None)
-            self.classifier.confirmation_count = 1
+@dataclass
+class ClosedTradeLog:
+    id: str
+    tradingsymbol: str
+    strategy: str
+    regime: str
+    entry_time: datetime
+    exit_time: datetime
+    entry_price: float
+    exit_price: float
+    qty: int
+    pnl: float
+    exit_reason: str
+    
+class SimulatedTrader(AbstractTrader):
+    def __init__(self,
+                 engine: 'BacktestEngine',
+                 book: InstrumentBook,
+                 prices: SimulatedPriceBus,
+                 store: 'SimulatedStore',
+                 config: dict):
         
-        if self.classifier.confirmation_count >= self.classifier.confirmation_threshold:
-            confirmed_regime, _ = self.classifier.potential_regime
-            if self.current_regime != confirmed_regime:
-                self.current_regime = confirmed_regime
-                self.last_regime_change_time = current_time
-                L.info(f"REGIME SHIFT at {current_time}: {old_regime.name} -> {self.current_regime.name}")
-
-    def _manage_open_position(self, pos: BacktestPosition, row: pd.Series) -> Optional[BacktestPosition]:
-        exit_price_underlying, exit_reason = None, None
+        super().__init__(engine, book, prices, store, config, perf_callback=None)
         
-        if pos.side == OrderSide.BUY:
-            if row['low'] <= pos.sl_price_underlying:
-                exit_price_underlying, exit_reason = pos.sl_price_underlying, "SL_HIT"
-            elif pos.tp_price_underlying > 0 and row['high'] >= pos.tp_price_underlying:
-                exit_price_underlying, exit_reason = pos.tp_price_underlying, "TP_HIT"
+        self.engine = engine
+        self.prices = prices
+        self.store = store
+        
+        self.backtest_config = config.get("backtester", {})
+        self.slippage_pct = self.backtest_config.get("slippage_pct", 0.05) / 100.0
+        self.commission_per_lot = self.backtest_config.get("commission_per_lot", 40)
+        
+        self.positions: dict[str, Position] = {}
+        self.closed_trades_log: list[ClosedTradeLog] = []
+        self.trade_id_counter = 1
+        self.daily_realized_pnl = 0.0
+
+    def _get_lot_size(self, tradingsymbol: str) -> int:
+        underlying = _get_underlying(tradingsymbol)
+        return self.book.lot_size(underlying)
+
+    def _calculate_fill_price(self, target_price: float, side: OrderSide) -> float:
+        if side == OrderSide.BUY:
+            return target_price * (1 + self.slippage_pct)
         else: # SELL
-            if row['high'] >= pos.sl_price_underlying:
-                exit_price_underlying, exit_reason = pos.sl_price_underlying, "SL_HIT"
-            elif pos.tp_price_underlying > 0 and row['low'] <= pos.tp_price_underlying:
-                exit_price_underlying, exit_reason = pos.tp_price_underlying, "TP_HIT"
+            return target_price * (1 - self.slippage_pct)
+
+    def _calculate_commission(self, tradingsymbol: str, qty: int) -> float:
+        lot_size = self._get_lot_size(tradingsymbol)
+        if not lot_size or lot_size == 0:
+            L.warning(f"Could not find lot size for {tradingsymbol}, commission will be 0")
+            return 0
+        lots = qty / lot_size
+        return lots * self.commission_per_lot # Commission is for a round trip
+
+    def open_position(self, trade_params: dict) -> Position | None:
+        """
+        Simulates an immediate fill. The `trade_params` now contain
+        the *real* option contract chosen by the planner.
+        """
+        current_bar = self.prices._current_futures_bar
+        if current_bar is None: return None
+
+        opt = trade_params['opt']
         
-        if exit_reason:
-            self._close_position(pos, row.name, exit_price_underlying, exit_reason)
-            return None
+        # Get the estimated fill price, which was already calculated by the
+        # planner and stored in `ltp_opt`. We'll use this as the "open" price.
+        target_price = trade_params['ltp_opt']
+        fill_price = self._calculate_fill_price(target_price, OrderSide.BUY)
+        
+        lot_size = self._get_lot_size(opt['tradingsymbol'])
+        if not lot_size: return None
+             
+        qty = trade_params['lots'] * lot_size
+        pos_id = f"BACKTEST_{self.trade_id_counter}"
+        self.trade_id_counter += 1
+
+        pos = Position(
+            id=pos_id,
+            tradingsymbol=opt['tradingsymbol'],
+            token=int(opt['instrument_token']),
+            option_type=opt['instrument_type'],
+            qty=qty,
+            initial_qty=qty,
+            entry_price=fill_price,
+            initial_sl_price=fill_price - trade_params['option_sl_points'],
+            sl_price=fill_price - trade_params['option_sl_points'],
+            tp_price=fill_price + trade_params['option_tp_points'],
+            opened_at=current_bar.name, # bar.name is the timestamp
+            strategy=trade_params['strategy'],
+            market_regime_at_entry=trade_params['regime'],
+            underlying_sl_level=trade_params['underlying_sl'],
+            status=PositionStatus.ACTIVE.value,
+            entry_order_id=pos_id,
+            scaled_out_qty=0,
+            trailing_sl_armed=False,
+            initial_risk_points=trade_params['option_sl_points'],
+            option_sl_points=trade_params['option_sl_points'],
+            option_tp_points=trade_params['option_tp_points'],
+            high_price_since_entry=fill_price,
+            scale_out_rules=trade_params['scale_out_rules'],
+            greeks=trade_params['greeks'],
+            max_trade_duration_minutes=trade_params.get('max_trade_duration_minutes', 90),
+            oi_profit_target=trade_params.get('oi_profit_target'),
+            intended_risk_rupees=trade_params.get('total_trade_risk', 0.0),
+        )
+        
+        self.positions[pos.id] = pos
+        self.store.upsert_position(pos)
+        
+        L.info(f"[{current_bar.name}] ✅ OPENED {pos.strategy} {pos.tradingsymbol} Qty={pos.qty} @ {pos.entry_price:.2f}")
         return pos
 
-    def _check_for_new_entry(self, bar_time: datetime) -> Tuple[Optional[BacktestPosition], datetime]:
-        cooldown_time = bar_time + pd.Timedelta(minutes=self.config["trading"]["trade_cooldown_minutes"])
-        now_time = bar_time.time()
-        settling_time = dtime.fromisoformat(self.config["timings"]["market_settling_time"])
-        final_entry = dtime.fromisoformat(self.config["timings"]["final_entry_time"])
+    def close_position(self, p: Position, reason: str, exit_price: float) -> bool:
+        if p.status == PositionStatus.CLOSED.value:
+            return True
 
-        if not (settling_time <= now_time < final_entry): return None, cooldown_time
-        if self.last_regime_change_time and (bar_time - self.last_regime_change_time) < timedelta(minutes=15): return None, cooldown_time
-
-        all_valid_signals: List[Tuple[int, TradeSignal]] = []
-        for token in [1, 2]:
-            if strategies_for_regime := self.strategies.get(self.current_regime):
-                for strategy in strategies_for_regime:
-                    if signal := strategy.evaluate(token, self.current_regime, bar_time):
-                        L.info(f">>> SIGNAL DETECTED at {bar_time} by {signal.strategy_name.value} for token {token} <<<")
-                        all_valid_signals.append((token, signal))
+        p.status = PositionStatus.CLOSED.value
+        p.exit_reason = reason
         
-        if not all_valid_signals: return None, cooldown_time
+        final_exit_price = self._calculate_fill_price(exit_price, OrderSide.SELL)
+        commission = self._calculate_commission(p.tradingsymbol, p.initial_qty)
         
-        filtered_signals = self._filter_signals_by_rs(all_valid_signals, bar_time)
-        if not filtered_signals: return None, cooldown_time
-        best_signal_tuple = self.performance_tracker.get_best_strategy(filtered_signals) if self.config["trading"]["meta_strategy"]["enabled"] else filtered_signals[0]
+        pnl = (final_exit_price - p.entry_price) * p.initial_qty - commission
+        self.daily_realized_pnl += pnl
         
-        if best_signal_tuple:
-            best_token, best_signal = best_signal_tuple
-            row = self.mock_engine.bars[best_token].full_df.loc[bar_time]
-            position = self._open_position(best_token, best_signal, row, bar_time)
-            if position:
-                for token, signal in all_valid_signals:
-                    try:
-                        entry_price_underlying = self.mock_engine.bars[token].full_df.loc[bar_time, 'close']
-                        hypo_id = f"hypo_{signal.strategy_name.value}_{token}_{bar_time.timestamp()}"
-                        self.open_hypothetical_trades[hypo_id] = HypotheticalTrade(
-                            signal=signal, token=token, entry_time=bar_time,
-                            entry_price_underlying=entry_price_underlying,
-                            sl_price_underlying=entry_price_underlying - signal.risk_points if signal.side == OrderSide.BUY else entry_price_underlying + signal.risk_points,
-                            tp_price_underlying=entry_price_underlying + signal.reward_points if signal.side == OrderSide.BUY else entry_price_underlying - signal.reward_points
-                        )
-                    except KeyError: continue
-            return position, cooldown_time
-        return None, cooldown_time
-
-    def _filter_signals_by_rs(self, signals: List[Tuple[int, TradeSignal]], current_time: datetime) -> List[Tuple[int, TradeSignal]]:
-        if not self.config["trading"]["intermarket_analysis"]["enabled"]: return signals
-        rs_status = self._get_simulated_relative_strength(current_time)
-        final_signals = []
-        for token, signal in signals:
-            underlying_name = _get_underlying(self.mock_engine.book[token])
-            if signal.side == OrderSide.BUY:
-                if underlying_name == "BANKNIFTY" and rs_status == "NIFTY_OUTPERFORMING": continue
-                elif underlying_name == "NIFTY" and rs_status == "BNF_OUTPERFORMING": continue
-            final_signals.append((token, signal))
-        if len(signals) > 0 and len(final_signals) < len(signals): L.info(f"Signal filtered by Inter-Market Analysis at {current_time}.")
-        return final_signals
-
-    def _get_simulated_relative_strength(self, current_time: datetime) -> str:
-        ma_period = self.config["trading"]["intermarket_analysis"]["ratio_ma_period"]
-        df_n = self.mock_engine.get_ohlc(1, 1, current_time)
-        df_bn = self.mock_engine.get_ohlc(2, 1, current_time)
-        if len(df_n) < ma_period or len(df_bn) < ma_period: return "NEUTRAL"
+        self.engine.risk_manager.update_performance_metrics(pnl)
         
-        aligned_n, aligned_bn = df_n['close'].align(df_bn['close'], join='inner')
-        if aligned_n.empty or len(aligned_n) < ma_period: return "NEUTRAL"
-        
-        ratio = aligned_bn / aligned_n
-        ratio_ma = ratio.rolling(window=ma_period).mean()
-        if pd.isna(ratio.iloc[-1]) or pd.isna(ratio_ma.iloc[-1]): return "NEUTRAL"
-        
-        if ratio.iloc[-1] > ratio_ma.iloc[-1] * 1.001: return "BNF_OUTPERFORMING"
-        elif ratio.iloc[-1] < ratio_ma.iloc[-1] * 0.999: return "NIFTY_OUTPERFORMING"
-        else: return "NEUTRAL"
-
-    def _open_position(self, token: int, signal: TradeSignal, row: pd.Series, bar_time: datetime) -> Optional[BacktestPosition]:
-        underlying_price = row['close']
-        underlying_name = "BANKNIFTY" if token == 2 else "NIFTY"
-        step_size = 100 if token == 2 else 50
-        strike_price = round(underlying_price / step_size) * step_size
-        is_call = (signal.side == OrderSide.BUY)
-
-        today = bar_time.date()
-        days_to_thursday = (3 - today.weekday() + 7) % 7
-        expiry_date = today + timedelta(days=days_to_thursday if days_to_thursday > 0 else 7)
-        time_to_expiry = max(1e-6, (datetime.combine(expiry_date, dtime(15, 30)) - bar_time.replace(tzinfo=None)).total_seconds() / (365 * 24 * 60 * 60))
-        
-        iv = self._get_iv_for_strike(token, strike_price, today)
-        if iv is None: return None
-
-        entry_option_price = black_scholes_price(S=underlying_price, K=strike_price, T=time_to_expiry, r=RISK_FREE_RATE, sigma=iv, is_call=is_call)
-        sl_underlying = underlying_price - signal.risk_points if signal.side == OrderSide.BUY else underlying_price + signal.risk_points
-        tp_underlying = underlying_price + signal.reward_points if signal.side == OrderSide.BUY else underlying_price - signal.reward_points
-        sl_option_price = black_scholes_price(S=sl_underlying, K=strike_price, T=time_to_expiry, r=RISK_FREE_RATE, sigma=iv, is_call=is_call)
-        risk_per_option = abs(entry_option_price - sl_option_price)
-        
-        max_sl_pct = self.config["trading"].get("max_sl_pct_of_premium", 100)
-        sl_as_pct_of_premium = (risk_per_option / entry_option_price * 100) if entry_option_price > 0 else float('inf')
-        
-        if risk_per_option <= 0.1 or sl_as_pct_of_premium > max_sl_pct: return None
-        
-        lot_sizes = self.config["trading"]["lot_sizes"]
-        lot_size = lot_sizes.get(underlying_name, 0)
-        if lot_size == 0:
-            L.error(f"Lot size for {underlying_name} not found in config.")
-            return None
-
-        risk_per_contract = risk_per_option * lot_size
-        allowed_risk = self.equity * (self.config["trading"]["risk_tiers"]["standard"] / 100.0)
-        qty = int(allowed_risk // risk_per_contract) * lot_size if risk_per_contract > 0 else 0
-        
-        if qty == 0: return None
-
-        return BacktestPosition(
-            entry_time=row.name, side=signal.side, qty=qty, token=token,
-            entry_price_underlying=underlying_price, sl_price_underlying=sl_underlying,
-            tp_price_underlying=tp_underlying if signal.reward_points > 0 else 0,
-            strategy=signal.strategy_name.value, regime=self.current_regime.name, strike_price=strike_price, expiry_date=expiry_date,
-            is_call=is_call, entry_option_price=entry_option_price, favorable_price_since_entry=underlying_price
+        log_entry = ClosedTradeLog(
+            id=p.id, tradingsymbol=p.tradingsymbol,
+            strategy=p.strategy, regime=p.market_regime_at_entry,
+            entry_time=p.opened_at, exit_time=self.prices._current_futures_bar.name,
+            entry_price=p.entry_price, exit_price=final_exit_price,
+            qty=p.initial_qty, pnl=pnl, exit_reason=reason
         )
+        
+        self.closed_trades_log.append(log_entry)
+        self.positions.pop(p.id, None)
+        self.store.log_closed_trade(p, final_exit_price, reason)
+        
+        L.info(f"[{self.prices._current_futures_bar.name}] ❌ CLOSED {p.tradingsymbol} @ {final_exit_price:.2f} ({reason}). PnL: {pnl:.2f}")
+        return True
 
-    def _close_position(self, pos: BacktestPosition, exit_time: datetime, exit_price_underlying: float, reason: str):
-        time_to_expiry = max(1e-6, (datetime.combine(pos.expiry_date, dtime(15, 30)) - exit_time.replace(tzinfo=None)).total_seconds() / (365 * 24 * 60 * 60))
-        
-        iv = self._get_iv_for_strike(pos.token, pos.strike_price, exit_time.date())
-        if iv is None:
-            try: iv = self.vix_data.loc[exit_time, 'close'] / 100
-            except KeyError: iv = self.vix_data.loc[self.vix_data.index < exit_time].iloc[-1]['close'] / 100
-        
-        exit_option_price = black_scholes_price(S=exit_price_underlying, K=pos.strike_price, T=time_to_expiry, r=RISK_FREE_RATE, sigma=iv, is_call=pos.is_call)
-        
-        gross_pnl = (exit_option_price - pos.entry_option_price) * pos.qty
-        
-        entry_turnover = pos.entry_option_price * pos.qty
-        exit_turnover = exit_option_price * pos.qty
-        total_turnover = entry_turnover + exit_turnover
-        costs = total_turnover * TRANSACTION_COST_PCT
-        
-        net_pnl = gross_pnl - costs
-        
-        self.equity += net_pnl
-        trade = BacktestTrade(
-            entry_time=pos.entry_time, exit_time=exit_time, entry_price_underlying=pos.entry_price_underlying,
-            exit_price_underlying=exit_price_underlying, qty=pos.qty, side=pos.side, pnl=net_pnl, 
-            exit_reason=reason, strategy=pos.strategy, regime=pos.regime,
-            entry_option_price=pos.entry_option_price, exit_option_price=exit_option_price
-        )
-        self.trade_log.append(trade)
+    def modify_sl(self, p: Position, new_trigger: float):
+        if new_trigger > p.sl_price:
+            L.debug(f"[{self.prices._current_futures_bar.name}] 📈 TSL {p.tradingsymbol} from {p.sl_price:.2f} to {new_trigger:.2f}")
+            p.sl_price = new_trigger
+            self.store.upsert_position(p)
 
-    def _manage_hypothetical_trades(self, bar_time: datetime):
-        if not self.open_hypothetical_trades: return
-        closed_hypo_ids = []
-        for hypo_id, hypo in self.open_hypothetical_trades.items():
-            if hypo.entry_time.date() != bar_time.date():
-                closed_hypo_ids.append(hypo_id); continue
+    def scale_out(self, p: Position, qty_to_close: int) -> bool:
+        if qty_to_close <= 0 or qty_to_close > p.qty:
+            return False
+            
+        # Estimate current price
+        current_price = self.prices.ltp(p.token)
+        if not current_price:
+            L.warning(f"Could not get LTP for {p.token} to scale out.")
+            return False
+            
+        exit_price = self._calculate_fill_price(current_price, OrderSide.SELL)
+        commission = self._calculate_commission(p.tradingsymbol, qty_to_close)
+        pnl = (exit_price - p.entry_price) * qty_to_close - commission
+        
+        self.daily_realized_pnl += pnl
+        self.engine.risk_manager.update_performance_metrics(pnl)
+        
+        L.info(f"[{self.prices._current_futures_bar.name}] 💰 SCALED OUT {qty_to_close} of {p.tradingsymbol} @ {exit_price:.2f}. PnL: {pnl:.2f}")
+        
+        p.qty -= qty_to_close
+        p.scaled_out_qty += qty_to_close
+        p.status = PositionStatus.PARTIALLY_CLOSED.value
+        self.store.upsert_position(p)
+        return True
 
-            df_underlying = self.mock_engine.bars[hypo.token].full_df
+    def unrealized_pnl(self) -> float:
+        pnl = 0.0
+        for p in self.positions.values():
+            if p.status in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value]:
+                current_price = self.prices.ltp(p.token)
+                if current_price:
+                    pnl += (current_price - p.entry_price) * p.qty
+        return pnl
+
+    def place_bracket_orders(self, p: Position) -> bool:
+        p.status = PositionStatus.ACTIVE.value
+        return True
+    def cancel_pending_entry(self, p: Position) -> bool: return True
+    def execute_simulated_sl(self, p: Position) -> bool: return True
+
+# ==================================================================================================
+# --- 3. MODIFIED POSITION MANAGER (WITH FULL TSL) ---
+# ==================================================================================================
+
+class BacktestPositionManager(PositionManager):
+    """
+    Overrides the real PositionManager to work with historical bars
+    and includes the FULL TSL logic from main1.py.
+    """
+    
+    # --- COPIED FROM main1.py ---
+    def _calculate_trailing_stop(self, p: Position) -> float | None:
+        try:
+            trail_params = self.trailing_sl_config
+            trail_tf = trail_params["timeframe_scaled_out"] if p.triggered_scale_out_targets else trail_params["timeframe"]
+            
+            # This now reads the ESTIMATED option bar data from the BarStore
+            df = self.engine.get_ohlc(p.token, trail_tf) 
+
+            period = trail_params["chandelier_period"]
+            if len(df) < period:
+                return None
+
             try:
-                trade_bars = df_underlying.loc[(df_underlying.index > hypo.entry_time) & (df_underlying.index <= bar_time)]
-                if trade_bars.empty: continue
-            except KeyError: continue
-            
-            exit_reason, exit_price = None, None
-            if hypo.signal.side == OrderSide.BUY:
-                sl_hit = (trade_bars['low'] <= hypo.sl_price_underlying).any()
-                tp_hit = hypo.tp_price_underlying > 0 and (trade_bars['high'] >= hypo.tp_price_underlying).any()
-            else: # SELL
-                sl_hit = (trade_bars['high'] >= hypo.sl_price_underlying).any()
-                tp_hit = hypo.tp_price_underlying > 0 and (trade_bars['low'] <= hypo.tp_price_underlying).any()
-            
-            if sl_hit: exit_reason, exit_price = "SL_HIT", hypo.sl_price_underlying
-            elif tp_hit: exit_reason, exit_price = "TP_HIT", hypo.tp_price_underlying
-            
-            if exit_reason:
-                pnl_points = exit_price - hypo.entry_price_underlying
-                if hypo.signal.side == OrderSide.SELL: pnl_points *= -1
-                self.performance_tracker.add_hypothetical_result(hypo.signal, pnl_points)
-                closed_hypo_ids.append(hypo_id)
+                import pandas_ta as ta
+                df.ta.atr(length=period, append=True)
+                atr_col = f'ATRr_{period}'
+                if atr_col not in df.columns:
+                     raise Exception(f"Failed to calculate ATR, column {atr_col} not found.")
+                atr = df[atr_col].iloc[-1]
+            except Exception as e:
+                L.warning(f"Could not get ATR for TSL: {e}. Install pandas-ta.")
+                return None
 
-        for hypo_id in closed_hypo_ids:
-            self.open_hypothetical_trades.pop(hypo_id, None)
-    
-    def generate_report(self) -> Dict:
-        if not self.trade_log: return {"error": "No trades were executed."}
+            if pd.isna(atr):
+                return None
+
+            multiplier = trail_params["chandelier_multiplier_scaled_out"] if p.triggered_scale_out_targets else trail_params["chandelier_multiplier"]
+            high_over_period = df['high'].rolling(period).max().iloc[-1]
+            new_sl_price = high_over_period - atr * multiplier
+            return new_sl_price
+        except Exception as e:
+            L.warning(f"Could not calculate trailing stop for {p.tradingsymbol}: {e}")
+            return None
+    # --- END COPY ---
+
+    def update_option_bars_for_open_positions(self):
+        """
+        Estimates and adds the current bar's OHLC for all open
+        options to the BarStore. This is VITAL for the TSL.
+        """
+        for p in self.trader.positions.values():
+            if p.status in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value]:
+                # Get the estimated OHLC bar for this option
+                opt_bar = self.prices.get_estimated_option_ohlc(p.token)
+                if opt_bar:
+                    # Add it to the BarStore so TSL can read it
+                    self.engine.bars.add_tick(opt_bar)
+
+    def manage_positions_backtest(self, bar_timestamp: datetime):
+        """
+        Checks for SL/TP hits against the estimated High/Low.
+        """
+        with self.trader.lock:
+            active_positions = list(self.trader.positions.values())
+
+        now = bar_timestamp
+
+        for p in active_positions:
+            with self.trader.lock:
+                if p.id not in self.trader.positions:
+                    continue
+            
+            # Get the estimated OHLC for this option
+            opt_bar = self.prices.get_estimated_option_ohlc(p.token)
+            if not opt_bar:
+                L.warning(f"Could not get estimated OHLC for {p.tradingsymbol}, skipping mgmt.")
+                continue
+                
+            bar_high = opt_bar['high']
+            bar_low = opt_bar['low']
+            ltp = opt_bar['close']
+
+            # --- CRITICAL HIT CHECKING ---
+            if bar_low <= p.sl_price:
+                L.debug(f"[{now}] SL HIT for {p.tradingsymbol} (BarLow: {bar_low:.2f} <= SL: {p.sl_price:.2f})")
+                self.trader.close_position(p, "SL_HIT_BACKTEST", p.sl_price)
+                continue
+
+            if bar_high >= p.tp_price and p.tp_price > 0:
+                L.debug(f"[{now}] TP HIT for {p.tradingsymbol} (BarHigh: {bar_high:.2f} >= TP: {p.tp_price:.2f})")
+                self.trader.close_position(p, "TP_HIT_BACKTEST", p.tp_price)
+                continue
+
+            if (now - p.opened_at).total_seconds() / 60 > p.max_trade_duration_minutes:
+                L.info(f"[{now}] TIME STOP for {p.tradingsymbol}. Closing at bar open.")
+                self.trader.close_position(p, "TIME_STOP_EXIT", opt_bar['open'])
+                continue
+
+            # --- IF NO HITS, run normal TSL logic ---
+            p.high_price_since_entry = max(p.high_price_since_entry, ltp)
+
+            # --- FULL TRAILING STOP LOGIC (from main1.py) ---
+            with self.trader.lock:
+                profit_points = ltp - p.entry_price
+                current_rr = profit_points / p.initial_risk_points if p.initial_risk_points > 0 else 0
+                highest_sl_floor = p.initial_sl_price
+
+                trailing_stages = self.trade_mgmt_config.get("trailing_stop_stages", [])
+                for stage in trailing_stages:
+                    if current_rr >= stage['rr_target']:
+                        new_floor = p.entry_price + (p.initial_risk_points * stage['trail_behind_rr'])
+                        highest_sl_floor = max(highest_sl_floor, new_floor)
+
+                final_new_sl = highest_sl_floor
+
+                if not p.trailing_sl_armed and profit_points >= p.initial_risk_points * self.trading_config['trailing_sl_activation_rr']:
+                    p.trailing_sl_armed = True
+                    L.info(f"[{now}] Chandelier TSL armed for {p.tradingsymbol}")
+
+                if p.trailing_sl_armed:
+                    if calculated_chandelier_sl := self._calculate_trailing_stop(p):
+                        final_new_sl = max(final_new_sl, calculated_chandelier_sl)
+
+                if final_new_sl > p.sl_price:
+                    if final_new_sl >= p.entry_price and p.tp_price > 0:
+                        L.info(f"[{now}] TSL for {p.tradingsymbol} is profitable, cancelling static TP.")
+                        p.tp_price = 0 # 0 means no TP
+                        
+                    self.trader.modify_sl(p, final_new_sl)
+
+            self.store_actor.upsert_position(p)
+
+# ==================================================================================================
+# --- 4. FAKE STORE & CLOCK (Dependencies) ---
+# ==================================================================================================
+
+class SimulatedStore:
+    """A fake, in-memory store that mimics the StoreActor's interface."""
+    def __init__(self):
+        self.positions = {}
+        self.closed_trades = []
+        self.kv = {}
+        L.info("SimulatedStore (in-memory) initialized.")
+
+    def upsert_position(self, pos: Position): self.positions[pos.id] = pos
+    def log_closed_trade(self, pos: Position, price: float, reason: str):
+        self.closed_trades.append(pos); self.positions.pop(pos.id, None)
+    def log_strategy_performance(self, name: str, pnl: float): pass
+    def get_strategy_performance(self, lookback_days: int) -> pd.DataFrame:
+        return pd.DataFrame(columns=["strategy_name", "pnl"])
+    def load_open_positions(self) -> dict[str, Position]: return {}
+    def get_todays_trades_stats(self) -> tuple[int, int]: return 0, 0
+    def set_kv(self, key: str, value: str): self.kv[key] = value
+    def get_kv(self, key: str, default: str | None = None) -> str | None:
+        return self.kv.get(key, default)
+
+class BacktestClock(Clock):
+    """A Clock that gets its time from the BacktestEngine."""
+    def __init__(self): self._now = datetime.now()
+    def set_time(self, new_time: datetime): self._now = new_time
+    def now(self) -> datetime: return self._now
+
+# ==================================================================================================
+# --- 5. THE BACKTEST ENGINE (The "Runner") ---
+# ==================================================================================================
+
+class BacktestEngine:
+    def __init__(self, config_dict: dict, historical_data_path: str): # <-- MODIFIED
+        L.info("Initializing BacktestEngine...")
+        self.config = config_dict # <-- MODIFIED
+        self.historical_data = self._load_data(historical_data_path)
         
-        df = pd.DataFrame(self.trade_log)
-        df['duration_mins'] = (df['exit_time'] - df['entry_time']).dt.total_seconds() / 60
-        df['win'] = df['pnl'] > 0
+        # --- Create FAKE Components ---
+        self.clock = BacktestClock()
+        self.store = SimulatedStore()
         
-        total_trades = len(df)
-        wins = df['win'].sum()
-        win_rate = (wins / total_trades) * 100 if total_trades > 0 else 0
+        global now_ist
+        now_ist = self.clock.now
+        
+        # --- Create REAL Components ---
+        self.book = self._load_real_book()
+        
+        # SimulatedPriceBus needs the book and engine
+        self.prices = SimulatedPriceBus(self.book, self)
+        
+        # The Engine is the "coordinator"
+        self.engine = Engine(None, self.book, self.prices, self.config)
+        
+        self.trader = SimulatedTrader(self, self.book, self.prices, self.store, self.config)
+        self.risk_manager = RiskManager(self.engine, self.trader, self.book, self.prices, self.store, self.config)
+        self.micro_monitor = MicrostructureMonitor(self.prices, self.config)
+        self.pos_manager = BacktestPositionManager(self.engine, self.trader, self.book, self.prices, self.store, self.risk_manager, self.config)
+        
+        def neutral_check(*args, **kwargs):
+            return 0  # Return 0 (Neutral)
+            
+        self.micro_monitor.check_order_book_imbalance = neutral_check
+        self.micro_monitor.check_tfi = neutral_check
+        L.warning("BACKTESTER: MicrostructureMonitor (TFI/OBI) has been patched to always return 0 (Neutral).")
+
+        # --- Link all components together ---
+        self.engine.set_dependencies(self.trader, self.risk_manager, self.micro_monitor, self.pos_manager)
+        
+        # Set the (real) BarStore on the (real) Engine
+        self.engine.bars = BarStore(timeframes=[1, 3, 5, 15])
+        
+        # Set the (real) classifier on the (real) Engine
+        self.engine.nifty_token = 256265
+        self.engine.bn_token = 260105
+        self.engine.vix_token = 257281
+        self.engine.classifier = RegimeClassifier(self.engine, 256265, 260105, 257281, self.config["strategies"]["regime_classifier"])
+        
+        L.info("BacktestEngine initialized successfully.")
+        
+    def _load_real_book(self) -> InstrumentBook:
+        """Loads the real InstrumentBook from the cached CSV."""
+        L.info("Loading REAL InstrumentBook...")
+        instrument_file = os.path.join(PERSIST_DIR, "instruments_nfo.csv")
+        if not os.path.exists(instrument_file):
+            L.critical(f"CRITICAL: `instruments_nfo.csv` not found in `{PERSIST_DIR}`.")
+            L.critical("Please run `main1.py` once in live mode to generate this file.")
+            exit(1)
+            
+        try:
+            book = InstrumentBook(store_actor=None, order_actor=None)
+            book.df = pd.read_csv(instrument_file, parse_dates=["expiry"])
+            book.df['expiry'] = pd.to_datetime(book.df['expiry']).dt.tz_localize(IST) # Ensure TZ
+            book.df_by_token = book.df.set_index('instrument_token')
+            book.df_by_symbol = book.df.set_index('tradingsymbol')
+            L.info(f"Real InstrumentBook loaded with {len(book.df)} instruments.")
+            return book
+        except Exception as e:
+            L.critical(f"Failed to load real InstrumentBook: {e}", exc_info=True)
+            exit(1)
+
+
+    def _load_data(self, path: str) -> pd.DataFrame:
+        """
+        Loads and prepares the historical data.
+        NOTE: This NO LONGER creates fake OPT_ columns.
+        """
+        L.info(f"Loading historical data from {path}...")
+        try:
+            df = pd.read_csv(path, parse_dates=['timestamp'], index_col='timestamp')
+            df = df.tz_localize('UTC').tz_convert('Asia/Kolkata') # Ensure IST
+            
+            # Remove any fake columns if they exist
+            df = df.loc[:, ~df.columns.str.startswith('OPT_')]
+            
+            L.info(f"Data loaded. {len(df)} bars from {df.index[0]} to {df.index[-1]}")
+            return df
+        except Exception as e:
+            L.critical(f"Failed to load data: {e}")
+            exit(1)
+
+    def _prime_barstore(self):
+        """
+        PRE-LOADS THE ENTIRE DATASET for futures/VIX
+        to ensure indicators are fully "warmed up".
+        """
+        L.info(f"Pre-loading BarStore with {len(self.historical_data)} FUTURES bars...")
+        
+        # NIFTY
+        if 'NIFTY_open' in self.historical_data.columns:
+            prime_data_nifty = self.historical_data[['NIFTY_open', 'NIFTY_high', 'NIFTY_low', 'NIFTY_close', 'NIFTY_volume']].copy()
+            prime_data_nifty.columns = ['open', 'high', 'low', 'close', 'volume']
+            prime_data_nifty['date'] = prime_data_nifty.index
+            self.engine.bars.prime(256265, prime_data_nifty) # NIFTY
+        
+        # BANKNIFTY
+        if 'BN_open' in self.historical_data.columns:
+            prime_data_bn = self.historical_data[['BN_open', 'BN_high', 'BN_low', 'BN_close', 'BN_volume']].copy()
+            prime_data_bn.columns = ['open', 'high', 'low', 'close', 'volume']
+            prime_data_bn['date'] = prime_data_bn.index
+            self.engine.bars.prime(260105, prime_data_bn) # BN
+
+        # VIX
+        if 'VIX_open' in self.historical_data.columns:
+            prime_data_vix = self.historical_data[['VIX_open', 'VIX_high', 'VIX_low', 'VIX_close', 'VIX_volume']].copy()
+            prime_data_vix.columns = ['open', 'high', 'low', 'close', 'volume']
+            prime_data_vix['date'] = prime_data_vix.index
+            self.engine.bars.prime(257281, prime_data_vix) # VIX
+        
+        L.info("BarStore (Futures/VIX) pre-loading complete.")
+
+
+    def run_backtest(self):
+        L.info("--- STARTING HIGH-FIDELITY BACKTEST RUN ---")
+        
+        self._prime_barstore()
+        
+        warmup_period = 200 # Must match your longest indicator
+        L.info(f"Skipping first {warmup_period} bars for indicator warmup...")
+
+        for i, bar in enumerate(self.historical_data.iloc[warmup_period:].itertuples()):
+            try:
+                # 1. Update "Time" and "Senses" (Futures only)
+                self.clock.set_time(bar.Index)
+                self.prices.update_futures_bar(bar)
+                
+                # 2. Update BarStore (Futures only, for indicators)
+                for token, prefix in [(256265, "NIFTY"), (260105, "BN")]:
+                     if f"{prefix}_close" in bar.index:
+                         vol = bar[f"{prefix}_volume"]
+                         self.engine.bars.add_tick({
+                             "instrument_token": token,
+                             "exchange_timestamp": bar.Index,
+                             "last_price": bar[f"{prefix}_close"],
+                             "last_traded_quantity": vol / 10 if vol > 10 else 1,
+                         })
+
+                # 3. Run "Brain" - Phase 1 (Regime & IV)
+                self.engine.run_regime_classification(bar.Index)
+                self.engine._update_atm_iv_cache() # CRITICAL: Update IV
+                
+                # 4. Run "Brain" - Phase 2 (Planner)
+                # This runs the REAL planner. It will call the
+                # SimulatedPriceBus to get on-the-fly option prices.
+                self.engine._run_strategic_planner()
+                
+                # 5. Update Option Bars for TSL
+                # This feeds the *estimated* option OHLC to the BarStore
+                # so the PositionManager can calculate TSL.
+                self.pos_manager.update_option_bars_for_open_positions()
+                
+                # 6. Manage Open Trades (Check SL/TP)
+                self.pos_manager.manage_positions_backtest(bar.Index)
+                
+                # 7. Execute Queued Trades (Simulate Fills)
+                while not self.engine.trade_signal_queue.empty():
+                    try:
+                        trade_params = self.engine.trade_signal_queue.get_nowait()
+                        self.trader.open_position(trade_params)
+                    except Empty:
+                        break
+                
+                # 8. Update PnL for RiskManager
+                self.risk_manager.last_unrealized_pnl = self.trader.unrealized_pnl()
+
+            except Exception as e:
+                L.error(f"Error on bar {bar.Index}: {e}", exc_info=True)
+                
+            if i % 1000 == 0 and i > 0:
+                L.info(f"Processed {i} bars... Current PnL: {self.trader.daily_realized_pnl:.2f}")
+
+        L.info("--- BACKTEST RUN COMPLETE ---")
+        self.generate_report()
+
+    def generate_report(self, return_metrics: bool = False): # <-- MODIFIED
+        """Prints a final PnL and trade summary."""
+        L.info("--- Backtest Report ---")
+        
+        if not self.trader.closed_trades_log:
+            L.warning("No trades were executed.")
+            if return_metrics: # <-- ADDED
+                return {"total_pnl": 0, "total_trades": 0, "win_rate": 0, "profit_factor": 0}
+            return
+
+        df = pd.DataFrame(self.trader.closed_trades_log)
         total_pnl = df['pnl'].sum()
+        total_trades = len(df)
+        wins = df[df['pnl'] > 0]
+        losses = df[df['pnl'] <= 0]
         
-        winning_trades = df[df['win']]
-        losing_trades = df[~df['win']]
+        win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
+        avg_win = wins['pnl'].mean() if len(wins) > 0 else 0
+        avg_loss = losses['pnl'].mean() if len(losses) > 0 else 0
         
-        avg_win = winning_trades['pnl'].mean() if not winning_trades.empty else 0
-        avg_loss = losing_trades['pnl'].mean() if not losing_trades.empty else 0
+        total_loss = losses['pnl'].sum()
+        total_win = wins['pnl'].sum()
+        profit_factor = abs(total_win / total_loss) if total_loss != 0 else float('inf')
         
-        reward_risk_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
-        profit_factor = abs(winning_trades['pnl'].sum() / losing_trades['pnl'].sum()) if not losing_trades.empty and losing_trades['pnl'].sum() != 0 else float('inf')
+        print("\n" + "="*30)
+        print("PERFORMANCE SUMMARY")
+        print("="*30)
+        print(f"Total Net PnL:     {total_pnl:,.2f}")
+        print(f"Total Trades:      {total_trades}")
+        print(f"Win Rate:          {win_rate:.2f}%")
+        print(f"Profit Factor:     {profit_factor:.2f}")
+        print(f"Average Win:       {avg_win:,.2f}")
+        print(f"Average Loss:      {avg_loss:,.2f}")
         
-        equity_df = pd.DataFrame(self.equity_curve).set_index('timestamp')
-        returns = equity_df['equity'].pct_change().dropna()
+        print("\n" + "="*30)
+        print("PNL BY STRATEGY")
+        print("="*30)
+        print(df.groupby('strategy')['pnl'].sum())
         
-        sharpe_ratio = (returns.mean() / returns.std()) * np.sqrt(252 * (6.5*60)) if returns.std() > 0 else 0.0
-        max_drawdown = (equity_df['equity'] / equity_df['equity'].cummax() - 1).min()
+        print("\n" + "="*30)
+        print("PNL BY REGIME")
+        print("="*30)
+        print(df.groupby('regime')['pnl'].sum())
         
-        return {
-            "Total PNL": round(total_pnl, 2),
-            "Profit Factor": round(profit_factor, 2),
-            "Sharpe Ratio": round(sharpe_ratio, 2),
-            "Max Drawdown Pct": round(max_drawdown * 100, 2),
-            "Total Trades": total_trades,
-            "Win Rate": round(win_rate, 2),
-            "Avg Win": round(avg_win, 2),
-            "Avg Loss": round(avg_loss, 2),
-            "Reward Risk Ratio": round(reward_risk_ratio, 2),
-            "Avg Trade Duration Mins": round(df['duration_mins'].mean(), 2)
-        }
+        if return_metrics:
+            return {
+                "total_pnl": total_pnl,
+                "total_trades": total_trades,
+                "win_rate": win_rate,
+                "profit_factor": profit_factor
+            }
+        
+        # Plotting (optional, but very useful)
+        try:
+            import matplotlib.pyplot as plt
+            df.set_index('exit_time')['pnl'].cumsum().plot(title='Cumulative PnL Over Time', grid=True)
+            plt.show()
+        except ImportError:
+            L.info("Install `matplotlib` to see a PnL equity curve.")
 
-def objective(trial: 'optuna.Trial', nifty_df: pd.DataFrame, bn_df: pd.DataFrame, vix_df: pd.DataFrame) -> float:
-    backtest_config = {
-        "trading": { "lot_sizes": {"NIFTY": 25, "BANKNIFTY": 15}, "risk_tiers": {"standard": 1.5}, "scale_out_rules": [{"rr_target": trial.suggest_float("rr_target", 1.5, 2.5), "pct_to_close": 50}], "trade_cooldown_minutes": trial.suggest_int("cooldown", 5, 15), "meta_strategy": {"enabled": True, "performance_lookback_trades": 5}, "intermarket_analysis": {"enabled": True, "ratio_ma_period": 20} },
-        "timings": { "market_settling_time": "09:30:00", "final_entry_time": "14:45:00" }
-    }
-    strategy_params = {
-        "momentum_breakout": { "target_delta": 0.55, "resample_minutes": 5, "bb_period": 20, "squeeze_period": 50, "squeeze_factor": 0.8, "volume_factor": 1.75, "atr_sl_multiplier": trial.suggest_float("m_atr_sl", 1.5, 2.2), "atr_tp_multiplier": trial.suggest_float("m_atr_tp", 2.5, 3.5), "max_iv_entry": trial.suggest_float("m_max_iv", 25.0, 32.0) },
-        "trend_pullback": { "target_delta": 0.6, "primary_tf": 5, "confirm_tf": 15, "ema_period": trial.suggest_int("t_ema_period", 18, 25), "atr_sl_multiplier": trial.suggest_float("t_atr_sl", 1.8, 2.5), "atr_tp_multiplier": trial.suggest_float("t_atr_tp", 3.0, 4.5) },
-        "mean_reversion": { "target_delta": 0.45, "resample_minutes": 5, "bb_period": 20, "atr_sl_multiplier": trial.suggest_float("mr_atr_sl", 1.2, 1.8), "atr_tp_multiplier": 1.5 }
-    }
-    engine = BacktestEngine(nifty_df, bn_df, vix_df, strategy_params, backtest_config)
-    report = engine.run()
-    if "error" in report or report["total_trades"] < 15: return -999.0
-    
-    sharpe = report["Sharpe Ratio"]
-    drawdown = report["Max Drawdown Pct"]
-    profit_factor = report["Profit Factor"]
-    pnl = report["Total PNL"]
-    
-    drawdown_penalty = 1.0 if drawdown > -25.0 else 0.1
-    fitness_score = ((sharpe * 0.6) + (profit_factor * 0.4)) * drawdown_penalty
-    
-    if pnl < 0: fitness_score = -abs(fitness_score)
-    return fitness_score
+# ==================================================================================================
+# --- 6. MAIN EXECUTION SCRIPT ---
+# ==================================================================================================
 
-if __name__ == '__main__':
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+if __name__ == "__main__":
+    CONFIG_FILE = "config.json"
     
-    default_params = {
-        "momentum_breakout": { "target_delta": 0.55, "resample_minutes": 5, "bb_period": 20, "squeeze_period": 50, "squeeze_factor": 0.8, "volume_factor": 1.75, "atr_sl_multiplier": 1.8, "atr_tp_multiplier": 3.0, "max_iv_entry": 28.0 },
-        "trend_pullback": { "target_delta": 0.6, "primary_tf": 5, "confirm_tf": 15, "ema_period": 21, "atr_sl_multiplier": 2.0, "atr_tp_multiplier": 3.5 },
-        "mean_reversion": { "target_delta": 0.45, "resample_minutes": 5, "bb_period": 20, "atr_sl_multiplier": 1.5, "atr_tp_multiplier": 1.5 }
-    }
-    default_config = {
-        "trading": { "lot_sizes": {"NIFTY": 25, "BANKNIFTY": 15}, "risk_tiers": {"standard": 1.5}, "scale_out_rules": [{"rr_target": 1.8, "pct_to_close": 50}], "trade_cooldown_minutes": 10, "meta_strategy": {"enabled": True, "performance_lookback_trades": 5}, "intermarket_analysis": {"enabled": True, "ratio_ma_period": 20}, "max_sl_pct_of_premium": 50 },
-        "timings": { "market_settling_time": "09:30:00", "final_entry_time": "14:45:00" }
-    }
+    # --- !!! YOU MUST CREATE THIS FILE !!! ---
+    # This CSV needs to have (at minimum):
+    # timestamp,NIFTY_open,NIFTY_high,NIFTY_low,NIFTY_close,NIFTY_volume,BN_open,...
+    HISTORICAL_DATA_FILE = "historical_data.csv"
+    
+    # You will also need the 'instruments_nfo.csv' file in your 'PERSIST_DIR'
+    
+    L.info("Starting High-Fidelity Backtester...")
     
     try:
-        nifty_df = pd.read_csv("data/nifty_1min_data.csv")
-        bn_df = pd.read_csv("data/banknifty_1min_data.csv")
-        vix_df = pd.read_csv("data/india_vix_1min_data.csv")
-        
-        backtest_engine = BacktestEngine(nifty_df, bn_df, vix_df, default_params, default_config)
-        final_report = backtest_engine.run()
-        
-        print("\n--- Backtest Performance Report ---")
-        for key, value in final_report.items():
-            print(f"{key:<25}: {value}")
-        print("---------------------------------")
+        backtester = BacktestEngine(
+            config_path=CONFIG_FILE,
+            historical_data_path=HISTORICAL_DATA_FILE
+        )
+        backtester.run_backtest()
         
     except FileNotFoundError as e:
-        print(f"\nERROR: Data file not found: {e.filename}. Please run 'python download_data.py' first.")
+        L.critical(f"CRITICAL: Could not find file: {e.filename}")
+        L.critical(f"Please create {CONFIG_FILE}, {HISTORICAL_DATA_FILE}, and run `main1.py` to create `instruments_nfo.csv`")
+    except Exception as e:
+        L.critical(f"An unhandled error occurred: {e}", exc_info=True)

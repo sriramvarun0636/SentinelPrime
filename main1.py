@@ -198,6 +198,15 @@ class StoreActor(threading.Thread):
         self.running = False
         self.q.put(None) # Unblock .get()
 
+class Clock(ABC):
+    @abstractmethod
+    def now(self) -> datetime:
+        pass
+
+class RealTimeClock(Clock):
+    """The clock for live trading."""
+    def now(self) -> datetime:
+        return datetime.now(tz=IST)
 
 # ==================================================================================================
 # CONFIGURATION LOADER
@@ -458,6 +467,89 @@ def _calculate_time_to_expiry(expiry_date: date, current_datetime: datetime, mar
     seconds_in_year = 365.25 * 24 * 60 * 60
     T = time_delta_seconds / seconds_in_year
     return max(1e-9, T)
+# --- ADD THIS NEW FUNCTION TO main1.py ---
+
+def calculate_trading_time_to_expiry(
+    current_datetime: datetime, 
+    expiry_date: date, 
+    market_open_time: dtime, 
+    market_close_time: dtime,
+    nse_calendar
+) -> float:
+    """
+    Calculates time to expiry (T) in fractional years based on TRADING time.
+    T = (Trading Days Remaining) / 252.0
+    For intraday expiry, it calculates the fraction of the trading day left.
+    """
+    
+    # --- Constants ---
+    # Total trading minutes in a standard session (e.g., 9:15 to 15:30 = 375 mins)
+    total_session_minutes = (
+        (market_close_time.hour * 60 + market_close_time.minute) -
+        (market_open_time.hour * 60 + market_open_time.minute)
+    )
+    if total_session_minutes <= 0:
+        total_session_minutes = 375 # Failsafe
+        
+    TRADING_DAYS_PER_YEAR = 252.0
+    MINUTES_PER_TRADING_YEAR = TRADING_DAYS_PER_YEAR * total_session_minutes
+
+    current_date = current_datetime.date()
+    current_time = current_datetime.time()
+
+    # --- Case 1: Already Past Expiry ---
+    # If it's expiry day and past market close
+    if current_date > expiry_date or (current_date == expiry_date and current_time >= market_close_time):
+        return 1e-9 # Return a tiny non-zero number to avoid division by zero
+
+    # --- Case 2: On Expiry Day (Intraday Calculation) ---
+    if current_date == expiry_date:
+        if current_time < market_open_time:
+            # Pre-market on expiry day, counts as 1 full day
+            minutes_remaining = total_session_minutes
+        else:
+            # Mid-session on expiry day
+            minutes_remaining = (
+                (market_close_time.hour * 60 + market_close_time.minute) -
+                (current_time.hour * 60 + current_time.minute)
+            )
+        
+        # Return the fraction of the *entire trading year* that is left today
+        return max(1e-9, minutes_remaining / MINUTES_PER_TRADING_YEAR)
+
+    # --- Case 3: Before Expiry Day (Interday Calculation) ---
+    # Use the market calendar to find the number of trading days
+    try:
+        trading_days = nse_calendar.valid_days(
+            start_date=current_date, 
+            end_date=expiry_date
+        )
+        
+        # .size includes the start day. We need to adjust.
+        # If today is a trading day and market is open: count today + future days
+        # If today is a trading day and market is closed: count only future days
+        # If today is a holiday: count only future days
+        
+        is_today_trading_day = current_date in trading_days
+        
+        if is_today_trading_day and current_time < market_close_time:
+            # Market is open, or pre-market. Today counts as a full day
+            # (plus fractional part if we want to be hyper-accurate, but for
+            # interday, this is good enough)
+            trading_days_left = len(trading_days)
+        else:
+            # Market is closed, or it's a holiday. Today doesn't count.
+            trading_days_left = len(trading_days)
+            if is_today_trading_day:
+                trading_days_left -= 1 # Don't count today
+                
+        return max(1e-9, trading_days_left / TRADING_DAYS_PER_YEAR)
+        
+    except Exception as e:
+        L.warning(f"Failed to calculate trading days, falling back to calendar estimate: {e}")
+        # Fallback to a (better) calendar estimate
+        days_left = (expiry_date - current_date).days
+        return max(1e-9, (days_left * (TRADING_DAYS_PER_YEAR / 365.25)) / TRADING_DAYS_PER_YEAR)
 
 
 def _get_d1_d2(S: float, K: float, T: float, r: float, sigma: float) -> Tuple[Optional[float], Optional[float]]:
@@ -2847,9 +2939,14 @@ class RiskManager:
         time_of_day_multiplier = self._get_time_of_day_risk_multiplier()
 
         chaos_risk_factor = 1.0
+        is_agnostic = strategy_name in [s.name.value for s in self.engine.strategies.get("AGNOSTIC", [])]
+
         if self.engine.regime == Regime.CHAOS:
-            chaos_risk_factor = self.trading_config.get("chaos_risk_reduction_factor", 0.25)
-            L.warning(f"CHAOS regime active. Applying risk reduction factor of {chaos_risk_factor}.")
+            if not is_agnostic:
+                chaos_risk_factor = self.trading_config.get("chaos_risk_reduction_factor", 0.25)
+                L.warning(f"CHAOS regime active. Applying risk reduction factor of {chaos_risk_factor} to non-agnostic strategy.")
+            else:
+                L.info(f"Sizing: Agnostic strategy ({strategy_name}) detected. Skipping CHAOS risk penalty.")
 
         final_risk_factor = self.risk_factor * vol_adjustment * vix_risk_factor * expiry_day_risk_factor * time_of_day_multiplier * chaos_risk_factor
         allowed_risk = self.dynamic_account_equity * (active_risk_pct / 100.0) * final_risk_factor
@@ -2894,7 +2991,7 @@ class RiskManager:
 
     def risk_ok(self, hypothetical_params: Dict) -> bool:
         with self.engine.master_lock:
-            if self.engine.halt_trading:
+            if self.engine.master_halt:
                 return False
 
             lot_size = self.book.lot_size(_get_underlying(hypothetical_params['opt']['tradingsymbol']))
@@ -2954,7 +3051,7 @@ class RiskManager:
 
             if current_equity < final_floor:
                 send_alert(f"⛔ DD LIMIT HIT. HALTING. Peak Equity: {self.daily_high_water_mark:.2f}, Current: {current_equity:.2f} (Floor: {final_floor:.2f})", "critical")
-                self.engine.halt_trading = True
+                self.engine.master_halt = True
                 if G_HALTED_STATUS:
                     G_HALTED_STATUS.set(1)
 
@@ -3664,6 +3761,7 @@ class BaseStrategy(ABC):
         self.name = name
         self.engine = engine
         self.params = params
+        self.is_agnostic: bool = False
 
     @abstractmethod
     def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
@@ -3986,7 +4084,8 @@ class Engine:
             raise SystemExit("FATAL: Could not find NIFTY/BANKNIFTY futures contracts from instrument file.")
 
         self.running = threading.Event()
-        self.halt_trading = False
+        self.master_halt = False      
+        self.regime_halt = False
         self.regime = Regime.UNCLEAR
         self.regime_confidence: float = 0.0
         self.regime_change_history = deque(maxlen=100) 
@@ -4397,7 +4496,7 @@ class Engine:
                 is_halted_check = False
                 if name in ["strategic_planner"]:
                     with self.master_lock:
-                        is_halted_check = self.halt_trading
+                        is_halted_check = self.master_halt
 
                 if not is_halted_check:
                     func()
@@ -4464,20 +4563,20 @@ class Engine:
                 if self.fatal_error_event.is_set():
                     send_alert("🔥 FATAL ERROR EVENT RECEIVED. HALTING ALL TRADING.", "critical")
                     with self.master_lock:
-                        self.halt_trading = True
+                        self.master_halt = True
                     self.fatal_error_event.clear()
 
                 with self.master_lock:
                     if os.path.exists(KILL_SWITCH_FILE):
-                        if not self.halt_trading:
+                        if not self.master_halt:
                             send_alert("⛔ KILL SWITCH DETECTED. HALTING ALL NEW TRADES. ⛔", "critical")
-                            self.halt_trading = True
+                            self.master_halt = True
                             if G_HALTED_STATUS:
                                 G_HALTED_STATUS.set(1)
 
                     if not self.eod_flatten_triggered and now_time >= self.timings_config["eod_flatten_time"]:
                         L.warning("EOD flatten time reached. Halting new trades and closing all positions.")
-                        self.halt_trading = True
+                        self.master_halt = True
                         if G_HALTED_STATUS:
                             G_HALTED_STATUS.set(1)
                         self.eod_flatten_triggered = True
@@ -4550,9 +4649,9 @@ class Engine:
              orb_params = self.config['strategies']['OpeningRangeBreakout']
              # Ensure the Enum was updated
              if hasattr(StrategyName, 'OPENING_RANGE_BREAKOUT'):
-                 strategies["AGNOSTIC"].append(
-                     OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, orb_params)
-                 )
+                 orb_strategy = OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, orb_params)
+                 orb_strategy.is_agnostic = True  # <-- ADD THIS LINE
+                 strategies["AGNOSTIC"].append(orb_strategy)
                  L.info("Loaded OpeningRangeBreakout strategy (Regime Agnostic)")
              else:
                   L.error("OpeningRangeBreakout strategy configured but Enum not updated!")
@@ -4593,7 +4692,8 @@ class Engine:
         self.risk_manager.reset_daily_state(self.last_trading_day) 
 
         with self.master_lock:
-            self.halt_trading = False
+            self.master_halt = False
+            self.regime_halt = False
             if os.path.exists(KILL_SWITCH_FILE):
                 try:
                     os.remove(KILL_SWITCH_FILE)
@@ -4847,14 +4947,11 @@ class Engine:
             now = now_ist()
 
             # --- 0. Check/Update Daily State ---
-            # (Ensures _reset_daily_state runs if needed, important for ORB)
             is_trading_day = self.nse_calendar.valid_days(start_date=now.date(), end_date=now.date()).size > 0
-            # Use >= to handle potential missed reset on startup
             if self.last_trading_day is None or (now.date() >= self.last_trading_day and is_trading_day):
                  if self.last_trading_day is None or now.date() > self.last_trading_day:
                      self._reset_daily_state()
             elif not is_trading_day:
-                 # Ensure state is reset if today becomes non-trading day somehow
                  if self.last_trading_day is not None: self._reset_daily_state()
                  return # Not a trading day
 
@@ -4864,38 +4961,37 @@ class Engine:
             theta_filter_iv_rank_threshold = self.trading_config.get("theta_filter_iv_rank_threshold", 25.0)
             is_theta_halt_condition_met = False
             if theta_filter_active:
-                iv_rank = self._get_iv_rank() # Needs to be implemented
-                # Check if current regime is CHOP *AND* IV Rank is low
+                iv_rank = self._get_iv_rank()
                 if self.regime == Regime.CHOP and iv_rank is not None and iv_rank < theta_filter_iv_rank_threshold:
                     is_theta_halt_condition_met = True
-                    # Activate halt only if not already active
                     if not getattr(self, '_theta_halt_active', False):
-                        L.warning(f"THETA FILTER ENGAGED: Regime=CHOP, IV Rank ({iv_rank:.1f}%) < Threshold ({theta_filter_iv_rank_threshold}%). Halting.")
-                        send_alert(f"⚠️ THETA FILTER ENGAGED: CHOP & Low IV Rank ({iv_rank:.1f}%). Halting.")
-                        self.halt_trading = True
+                        L.warning(f"THETA FILTER ENGAGED: Regime=CHOP, IV Rank ({iv_rank:.1f}%) < Threshold ({theta_filter_iv_rank_threshold}%). Setting REGIME halt.")
+                        send_alert(f"⚠️ THETA FILTER ENGAGED: CHOP & Low IV Rank ({iv_rank:.1f}%). Halting regime-specific trades.")
+                        # --- FIX: Use regime_halt ---
+                        self.regime_halt = True
                         self._theta_halt_active = True
                         if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
 
             # Check for resumption separately
             if getattr(self, '_theta_halt_active', False) and not is_theta_halt_condition_met:
-                # If theta halt was on, but conditions are no longer met
-                if not os.path.exists(KILL_SWITCH_FILE): # Only resume if no manual halt
-                    L.info("Theta Filter conditions cleared. Resuming trading.")
+                if not os.path.exists(KILL_SWITCH_FILE): 
+                    L.info("Theta Filter conditions cleared. Resuming regime-specific trading.")
                     send_alert("✅ Theta Filter conditions cleared. Resuming.")
-                    self.halt_trading = False # Release master only if no other halts exist
+                    # --- FIX: Use regime_halt ---
+                    self.regime_halt = False
                     self._theta_halt_active = False
-                    if G_HALTED_STATUS: G_HALTED_STATUS.set(0)
+                    # Only set global halt to 0 if master_halt is ALSO false
+                    if G_HALTED_STATUS and not self.master_halt: G_HALTED_STATUS.set(0)
                 else:
-                    self._theta_halt_active = False # Clear flag, but keep master halt on
+                    self._theta_halt_active = False
                     L.warning("Theta Filter cleared, but Kill Switch active. Trading remains halted.")
 
             # --- 2. Update Regime Classification (Needed for scoring even if halted) ---
             self.run_regime_classification(now)
-            # --- NEW: 2a. Regime Stability/Confidence Check ---
+            # --- 2a. Regime Stability/Confidence Check ---
             low_conf_thresh = self.trading_config.get("low_regime_confidence_threshold", 0.0)
             flip_rate_thresh = self.trading_config.get("high_regime_flip_rate_threshold", 99)
             
-            # Calculate flip rate (flips in last 1 hour)
             flips_last_hour = 0
             if self.regime_change_history:
                 one_hour_ago = now - timedelta(hours=1)
@@ -4903,49 +4999,56 @@ class Engine:
             
             is_unstable = False
             if self.regime_confidence < low_conf_thresh:
-                L.warning(f"REGIME STABILITY HALT: Confidence ({self.regime_confidence:.2f}) is below threshold ({low_conf_thresh}). Halting.")
+                L.warning(f"REGIME STABILITY HALT: Confidence ({self.regime_confidence:.2f}) is below threshold ({low_conf_thresh}). Setting REGIME halt.")
                 is_unstable = True
                 
             if flips_last_hour > flip_rate_thresh:
-                L.warning(f"REGIME STABILITY HALT: Flip rate ({flips_last_hour}/hr) is above threshold ({flip_rate_thresh}). Halting.")
+                L.warning(f"REGIME STABILITY HALT: Flip rate ({flips_last_hour}/hr) is above threshold ({flip_rate_thresh}). Setting REGIME halt.")
                 is_unstable = True
 
             if is_unstable:
-                if not self.halt_trading: # Only log/alert on the transition
-                     send_alert(f"⚠️ REGIME UNSTABLE: Confidence {self.regime_confidence:.2f}, Flip Rate {flips_last_hour}/hr. Halting new entries.", "warning")
-                self.halt_trading = True
+                if not self.regime_halt: # Only log/alert on the transition
+                     send_alert(f"⚠️ REGIME UNSTABLE: Confidence {self.regime_confidence:.2f}, Flip Rate {flips_last_hour}/hr. Halting regime-specific entries.", "warning")
+                # --- FIX: Use regime_halt ---
+                self.regime_halt = True
                 if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
+            elif not is_theta_halt_condition_met: # Don't resume if theta filter is still on
+                if self.regime_halt and not os.path.exists(KILL_SWITCH_FILE):
+                    L.info("Regime has stabilized. Resuming regime-specific trading.")
+                    send_alert("✅ Regime stabilized. Resuming regime-specific trades.")
+                self.regime_halt = False
+                if G_HALTED_STATUS and not self.master_halt: G_HALTED_STATUS.set(0)
 
-            # --- 3. Master Halt Check (Check *after* potential Theta Halt engagement/disengagement) ---
-            if self.halt_trading:
-                # L.debug("Trading halted. Skipping strategy evaluation.")
+
+            # --- 3. Master Halt Check (Blocks EVERYTHING) ---
+            if self.master_halt:
+                # L.debug("MASTER halt active. Skipping all strategy evaluation.")
                 pass # Allow function to exit and run profiling
             else:
                 # --- 4. Timing & Cooldown Guard Clauses ---
                 now_time = now.time()
                 final_entry_time = self.timings_config["final_entry_time"]
-                # Adjust final entry on expiry days if configured
-                is_expiry_day = self.book.find_nearest_expiry_date("NIFTY") == now.date() # Check Nifty expiry
+                is_expiry_day = self.book.find_nearest_expiry_date("NIFTY") == now.date()
                 if is_expiry_day and self.timings_config.get("final_expiry_entry_time"):
                      final_entry_time = self.timings_config["final_expiry_entry_time"]
 
                 if not (self.timings_config["market_settling_time"] <= now_time < final_entry_time):
-                    # L.debug("Outside trading window.") # Optional debug
                     pass # Allow function to exit
                 else:
                     cooldown_ok = not self.last_trade_timestamp or (now - self.last_trade_timestamp) > timedelta(minutes=self.trading_config["trade_cooldown_minutes"])
                     if not cooldown_ok:
-                        # L.debug("Trade cooldown active.") # Optional debug
                         pass # Allow function to exit
                     else:
-                        # --- 5. Universe Scan (Corrected Loop) ---
+                        # --- 5. Universe Scan ---
                         strategies_to_run = []
                         if self.regime in self.strategies: strategies_to_run.extend(self.strategies[self.regime])
                         if "AGNOSTIC" in self.strategies: strategies_to_run.extend(self.strategies["AGNOSTIC"])
                         
-                        if strategies_to_run: # Only scan if there are strategies
-                            universe_tokens = [self.nifty_token, self.bn_token] # Expandable later
-                            all_potential_signals = [] # List to store {"signal": TradeSignal, "token": int}
+                        if not strategies_to_run:
+                            pass # Allow function to exit
+                        else:
+                            universe_tokens = [self.nifty_token, self.bn_token]
+                            all_potential_signals = [] 
 
                             for token in universe_tokens:
                                 if not token: continue
@@ -4953,10 +5056,16 @@ class Engine:
                                 cooldown_minutes = self.trading_config.get("trade_cooldown_minutes", 1)
                                 last_trade_time = self.underlying_cooldown.get(token)
                                 if last_trade_time and (now - last_trade_time) < timedelta(minutes=cooldown_minutes):
-                                    # L.debug(f"Skipping {self.book.get_symbol(token)} due to trade cooldown.")
                                     continue
                                 
                                 for strategy in strategies_to_run:
+                                
+                                    # --- FIX 1: Apply Halt Logic ---
+                                    # If regime_halt is on, only allow agnostic strategies
+                                    if self.regime_halt and not strategy.is_agnostic:
+                                        continue # Skip this regime-specific strategy
+                                    # --- END FIX 1 ---
+
                                     try:
                                         if signal := strategy.evaluate(token, self.regime, now):
                                             all_potential_signals.append({"signal": signal, "token": token})
@@ -4964,13 +5073,16 @@ class Engine:
                                          L.error(f"Error evaluating strategy {strategy.name.value} on token {token}: {e}", exc_info=True)
 
 
-                            if all_potential_signals: # Only score if signals generated
+                            # --- REFACTOR START (FIX 4: Biased Signal Selection) ---
+                            
+                            if not all_potential_signals:
+                                pass # No signals found
+                            else:
                                 # --- 6. Score All Signals (Gets Preliminary Params) ---
-                                scored_trades = [] # List to store {"package": Dict, "signal": TradeSignal, "token": int}
+                                scored_trades = []
                                 for potential in all_potential_signals:
                                     signal, token = potential["signal"], potential["token"]
                                     try:
-                                        # Returns {"score": float, "params": Dict (prelim), "is_agnostic": bool} or None
                                         trade_package = self._score_and_size_trade(signal, token)
                                         if trade_package:
                                             scored_trades.append({
@@ -4981,69 +5093,67 @@ class Engine:
                                     except Exception as e:
                                         L.error(f"Error scoring signal {signal.strategy_name.value} on token {token}: {e}", exc_info=True)
 
-
-                                if scored_trades: # Only proceed if signals passed min score
-                                    # --- 7. Pick Best Trade ---
-                                    try:
-                                        # Sort by score (desc), prefer non-agnostic in ties
-                                        best_scored_package = max(scored_trades, key=lambda x: (x['package']['score'], not x['package']['is_agnostic']))
-                                    except Exception as e:
-                                         L.error(f"Error selecting best trade: {e}", exc_info=True)
-                                         best_scored_package = None
-
-                                    if best_scored_package:
-                                        # Log the chosen candidate *before* final sizing
-                                        strat_name = best_scored_package['signal'].strategy_name.value
-                                        underlying_sym = self.book.get_symbol(best_scored_package['token']) or f"Token {best_scored_package['token']}"
-                                        prelim_opt_sym = best_scored_package['package']['params']['opt']['tradingsymbol']
-                                        is_agnostic = best_scored_package['package']['is_agnostic']
-                                        score = best_scored_package['package']['score']
-                                        L.info(f">>> SCANNER Top Candidate: {strat_name} on {underlying_sym} -> {prelim_opt_sym} "
-                                               f"(Agnostic: {is_agnostic}) Score: {score:.2f}")
-
-                                        # --- 8. Perform Final Sizing (Only for the Best Candidate) ---
-                                        signal_details = best_scored_package['signal']
-                                        token_details = best_scored_package['token']
-                                        score_details = best_scored_package['package']['score']
-
+                                if not scored_trades:
+                                    pass # No signals passed min score
+                                else:
+                                    # --- 7. Perform Final Sizing for ALL Candidates ---
+                                    fully_sized_candidates = []
+                                    for candidate in scored_trades:
+                                        signal = candidate["signal"]
+                                        token = candidate["token"]
+                                        score = candidate["package"]["score"]
+                                        
                                         try:
-                                            # Call get_trade_params again - this time it calculates the *actual* size
                                             final_sized_params = self.get_trade_params(
-                                                token=token_details,
-                                                side=signal_details.side,
-                                                risk_points_on_underlying=signal_details.risk_points,
-                                                reward_points_on_underlying=signal_details.reward_points,
-                                                strategy=signal_details.strategy_name.value,
-                                                regime=self.regime, # Pass current consensus regime
-                                                confidence_score=score_details # Pass the calculated confluence score
+                                                token=token,
+                                                side=signal.side,
+                                                risk_points_on_underlying=signal.risk_points,
+                                                reward_points_on_underlying=signal.reward_points,
+                                                strategy=signal.strategy_name.value,
+                                                regime=self.regime,
+                                                confidence_score=score # Use the REAL score
                                             )
+                                            
+                                            if final_sized_params and final_sized_params.get('lots', 0) > 0:
+                                                fully_sized_candidates.append({
+                                                    "score": score, 
+                                                    "params": final_sized_params,
+                                                    "is_agnostic": candidate["package"]["is_agnostic"]
+                                                })
+                                            else:
+                                                L.debug(f"Signal {signal.strategy_name.value} dropped at final sizing (0 lots).")
+
                                         except Exception as e:
-                                            L.error(f"Error during final sizing for {strat_name} on {underlying_sym}: {e}", exc_info=True)
-                                            final_sized_params = None # Abort if sizing fails
+                                            L.error(f"Error during final sizing for {signal.strategy_name.value}: {e}", exc_info=True)
 
-                                        # Check if sizing was successful and resulted in > 0 lots
-                                        if not final_sized_params or final_sized_params.get('lots', 0) <= 0:
-                                             L.warning(f"--- Top trade {strat_name} ({prelim_opt_sym}) scored {score_details:.1f} resulted in 0 lots. Dropped. ---")
-                                        else:
-                                            L.info(f"--- Final Sizing OK: {final_sized_params['lots']} lots ({final_sized_params['total_trade_risk']:.2f} INR risk) for {prelim_opt_sym} ---")
-
-                                            # --- 9. Final Risk Check (Using fully sized params) ---
-                                            risk_check_passed = False
+                                    if not fully_sized_candidates:
+                                        pass # All candidates sized to 0 lots
+                                    else:
+                                        # --- 8. Final Risk Check on ALL Sized Candidates ---
+                                        risk_approved_candidates = []
+                                        for candidate in fully_sized_candidates:
                                             try:
-                                                if self.risk_manager.risk_ok(hypothetical_params=final_sized_params):
-                                                    risk_check_passed = True
+                                                if self.risk_manager.risk_ok(hypothetical_params=candidate['params']):
+                                                    risk_approved_candidates.append(candidate)
                                                 else:
-                                                    L.warning(f"--- Best trade {strat_name} on {prelim_opt_sym} blocked by master risk controls (DD, portfolio limits, etc.). ---")
+                                                    L.debug(f"Signal {candidate['params']['strategy']} dropped by master risk controls.")
                                             except Exception as e:
-                                                 L.error(f"Error during final risk check for {strat_name} on {prelim_opt_sym}: {e}", exc_info=True)
-                                                 # Abort if risk check fails
-
-                                            if risk_check_passed:
-                                                # --- 10. Queue the Trade ---
-                                                L.info(f"==> Queuing trade for {strat_name} on {final_sized_params['opt']['tradingsymbol']} ({final_sized_params['lots']} lots)")
-                                                self.trade_signal_queue.put(final_sized_params)
-                                                self.last_trade_timestamp = now # Apply cooldown after successfully queuing
-                                                self.underlying_cooldown[token_details] = now
+                                                L.error(f"Error during final risk check for {candidate['params']['strategy']}: {e}", exc_info=True)
+                                    
+                                    if not risk_approved_candidates:
+                                        pass # All viable signals blocked by risk manager
+                                    else:
+                                        # --- 9. Pick the BEST from the final, approved list ---
+                                        # Sort by score (desc), prefer non-agnostic in ties
+                                        best_trade = max(risk_approved_candidates, key=lambda x: (x['score'], not x['is_agnostic']))
+                                        
+                                        # --- 10. Queue the single best trade ---
+                                        L.info(f"==> Queuing trade for {best_trade['params']['strategy']} on {best_trade['params']['opt']['tradingsymbol']} ({best_trade['params']['lots']} lots, Score: {best_trade['score']:.2f})")
+                                        self.trade_signal_queue.put(best_trade['params'])
+                                        self.last_trade_timestamp = now
+                                        self.underlying_cooldown[best_trade['params']['opt']['instrument_token']] = now
+                            
+                            # --- REFACTOR END ---
         
         # --- PROFILING LOGIC (runs outside the master_lock) ---
         logic_end_time = time.perf_counter()
@@ -5052,14 +5162,12 @@ class Engine:
         lock_wait_ms = (logic_start_time - start_time) * 1000.0
         
         try:
-            # Get interval from the scheduler config, which is set up in _setup_scheduler
             interval_s = self.scheduler["strategic_planner"][1]
             interval_ms = interval_s * 1000.0
             warn_threshold_ms = interval_ms * 0.5 # 50% threshold
         except (AttributeError, KeyError, IndexError, TypeError):
-            # Fallback in case self.scheduler isn't populated yet (e.g., first run)
-            interval_ms = 2000.0 # Default to 2s
-            warn_threshold_ms = 1000.0 # Default to 1s
+            interval_ms = 2000.0 # Fallback
+            warn_threshold_ms = 1000.0 
         
         if exec_time_ms > warn_threshold_ms:
             L.warning(f"PERF WARN: _run_strategic_planner logic took {exec_time_ms:.2f}ms. (Threshold: {warn_threshold_ms:.2f}ms, Lock Wait: {lock_wait_ms:.2f}ms)")
@@ -5652,18 +5760,19 @@ class Engine:
 
             with self.master_lock:
                 if stale_feed:
-                    if not self.halt_trading:
+                    if not self.master_halt:
                         L.warning("Stale data protocol activated. Halting new entries.")
                         send_alert("🔥 CRITICAL: Stale Feed! Halting new trades.", "critical")
-                        self.halt_trading = True
+                        self.master_halt = True
                         if G_HALTED_STATUS:
                             G_HALTED_STATUS.set(1)
                 else:
                     # Feed is healthy
-                    if self.halt_trading and not os.path.exists(KILL_SWITCH_FILE):
+                    # Check master_halt, but only resume if regime_halt is ALSO false
+                    if self.master_halt and not self.regime_halt and not os.path.exists(KILL_SWITCH_FILE):
                         L.info("Data feed is healthy. Resuming trading.")
                         send_alert("✅ Data feed healthy. Resuming new trades.", "info")
-                        self.halt_trading = False
+                        self.master_halt = False
                         if G_HALTED_STATUS:
                             G_HALTED_STATUS.set(0)
             if self.running.is_set():
@@ -5705,7 +5814,7 @@ def _update_prometheus_metrics(self):
 
         # --- Trading Status ---
         with self.master_lock:
-            G_HALTED_STATUS.set(1 if self.halt_trading else 0)
+            G_HALTED_STATUS.set(1 if self.master_halt or self.regime_halt else 0)
 
         # --- Regime Metrics ---
         # Ensure gauges exist before setting
