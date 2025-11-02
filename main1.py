@@ -4614,6 +4614,8 @@ class Engine:
         self.stop()
 
     # Inside Engine class
+    # [Location: main1.py -> class Engine]
+
     def _load_strategies(self) -> Dict[Union[Regime, str], List[BaseStrategy]]: # Allow str key for agnostic
         strategies: Dict[Union[Regime, str], List[BaseStrategy]] = {
             # --- Regime Specific ---
@@ -4631,30 +4633,41 @@ class Engine:
             strategies[Regime.COMPRESSION].append(
                 MomentumBreakoutStrategy(StrategyName.MOMENTUM_BREAKOUT, self, self.config['strategies']['MomentumBreakout'])
             )
+            
+        # --- MODIFICATION: Moved ORB strategy here ---
+        if "OpeningRangeBreakout" in self.config["strategies"]:
+             orb_params = self.config['strategies']['OpeningRangeBreakout']
+             # Ensure the Enum was updated
+             if hasattr(StrategyName, 'OPENING_RANGE_BREAKOUT'):
+                 orb_strategy = OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, orb_params)
+                 # Note: We DO NOT set .is_agnostic = True
+                 strategies[Regime.COMPRESSION].append(orb_strategy)
+                 L.info("Loaded OpeningRangeBreakout strategy (Regime: COMPRESSION)")
+             else:
+                  L.error("OpeningRangeBreakout strategy configured but Enum not updated!")
+        # --- END MODIFICATION ---
+
         if "TrendPullback" in self.config["strategies"]:
             tp_params = self.config['strategies']['TrendPullback']
             strategies[Regime.TRENDING_UP].append(TrendPullbackStrategy(StrategyName.TREND_PULLBACK, self, tp_params))
             strategies[Regime.TRENDING_DOWN].append(TrendPullbackStrategy(StrategyName.TREND_PULLBACK, self, tp_params))
+            
         if "MeanReversion" in self.config["strategies"]:
             strategies[Regime.CHOP].append(
                 MeanReversionStrategy(StrategyName.MEAN_REVERSION, self, self.config['strategies']['MeanReversion'])
             )
+            
         if "VolatilityMeanReversion" in self.config["strategies"]:
              strategies[Regime.CHAOS].append(
                  VolatilityMeanReversionStrategy(StrategyName.VOLATILITY_MEAN_REVERSION, self, self.config['strategies']['VolatilityMeanReversion'])
              )
 
         # Load Agnostic strategies
-        if "OpeningRangeBreakout" in self.config["strategies"]:
-             orb_params = self.config['strategies']['OpeningRangeBreakout']
-             # Ensure the Enum was updated
-             if hasattr(StrategyName, 'OPENING_RANGE_BREAKOUT'):
-                 orb_strategy = OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, orb_params)
-                 orb_strategy.is_agnostic = True  # <-- ADD THIS LINE
-                 strategies["AGNOSTIC"].append(orb_strategy)
-                 L.info("Loaded OpeningRangeBreakout strategy (Regime Agnostic)")
-             else:
-                  L.error("OpeningRangeBreakout strategy configured but Enum not updated!")
+        
+        # --- MODIFICATION: Removed ORB from this section ---
+        # (The original loading block for ORB has been deleted from here)
+        # --- END MODIFICATION ---
+
 
         # Log loaded strategies
         for key, strat_list in strategies.items():
