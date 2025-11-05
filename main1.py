@@ -2593,13 +2593,8 @@ class Trader(AbstractTrader):
                 send_alert(f"🔥 CRITICAL: DOUBLE SL {p.tradingsymbol}. Old SL {old_slm_id} FAILED TO CANCEL. New SL {new_slm_id} active.", "critical")
                 cancel_success = False
 
-                # Put position into SAFE MODE
-                p.status = PositionStatus.PENDING_CLOSURE.value 
-                p.exit_reason = "SAFE_MODE_DOUBLE_SL"
-                p.sl_price = new_trigger_rounded # Store the *new* SL info
-                p.slm_order_id = new_slm_id
-                self.store_actor.q.put({"type": "upsert_position", "pos": p}) 
-                return # Stop processing this position
+                self.close_position(p, "SAFE_MODE_DOUBLE_SL")
+                return
 
         # --- 3. Success (or old order cancel failed but we proceed with new SL) ---
         if cancel_success: # Only update state if cancel succeeded or wasn't needed
@@ -2836,11 +2831,48 @@ class RiskManager:
         self.weekly_high_water_mark = max(self.weekly_high_water_mark, self.daily_high_water_mark)
         L.info(f"RiskManager state loaded. Daily PnL: {self.trader.daily_realized_pnl}. Daily HWM: {self.daily_high_water_mark}. Weekly HWM: {self.weekly_high_water_mark}")
         
+    def _calculate_calmar_ratio(self, pnl_series: pd.Series) -> float:
+        """Helper to calculate the Calmar Ratio from a daily PnL series."""
+        if pnl_series.empty or len(pnl_series) < 2:
+            return 0.0 # Not enough data
+
+        # Use the account's base equity for return calculation
+        capital = self.account_equity_base 
+        if capital == 0: capital = 100000.0 # Failsafe
+            
+        daily_returns_pct = pnl_series / capital
+        
+        # Calculate cumulative return
+        cumulative_return = (1 + daily_returns_pct).cumprod()
+        
+        # Calculate total annualized return
+        total_days = (cumulative_return.index[-1] - cumulative_return.index[0]).days
+        if total_days < 1: total_days = 1
+        years = max(1.0, total_days / 365.25) # Ensure at least 1 year for non-fractional power
+            
+        total_return = (cumulative_return.iloc[-1]**(1/years)) - 1
+        
+        if total_return <= 0:
+            return 0.0 # We don't reward losing strategies
+
+        # Calculate Max Drawdown
+        peak = cumulative_return.cummax()
+        drawdown = (cumulative_return - peak) / peak
+        max_drawdown = abs(drawdown.min())
+
+        if max_drawdown == 0:
+            return 100.0 # Arbitrarily high score if positive return and no drawdown
+            
+        calmar = total_return / max_drawdown
+        
+        # Return the positive Calmar, clamped at 0
+        return max(0.0, calmar)
+        
         
     def _update_strategy_weights(self):
-        L.info("Updating dynamic strategy weights...")
+        L.info("Updating dynamic strategy weights (Risk-Adjusted)...")
         
-        # --- FIXED: Use StoreActor (Blocking Read) ---
+        # --- 1. Get PnL data from StoreActor (No change here) ---
         df = pd.DataFrame() # Default to empty df
         try:
             reply_q = queue.Queue()
@@ -2858,43 +2890,62 @@ class RiskManager:
             L.error("Timeout getting strategy performance from StoreActor.")
         except Exception as e:
             L.error(f"Error getting strategy performance from StoreActor: {e}")
-        # --- END FIX ---
 
         if df.empty:
             L.warning("No strategy performance data found. Using default weights.")
-            # Reset all known strategies to 1.0
             all_strategy_names = [name.value for name in StrategyName]
             self.strategy_weights = {name: 1.0 for name in all_strategy_names}
             return
 
-        # Calculate sum of PnL per strategy
-        strategy_pnl = df.groupby('strategy_name')['pnl'].sum()
-
-        # Simple weighting: normalize PnL
-        # You can make this much more complex (e.g., Sharpe, profit factor)
+        # --- 2. REFACTOR: Calculate Calmar Ratio instead of PnL Sum ---
         
-        # Avoid division by zero if all PnL is zero
-        total_pnl_magnitude = abs(strategy_pnl).sum()
-        if total_pnl_magnitude == 0:
-            return # Keep existing weights
+        # Convert to datetime and get daily PnL series for each strategy
+        df['close_time'] = pd.to_datetime(df['close_time'])
+        df = df.set_index('close_time')
+        daily_pnl = df.groupby('strategy_name')['pnl'].resample('D').sum()
 
-        # Scale weights based on PnL contribution.
-        # This is a simple example; you might want a more robust metric.
-        # This example scales from 0 to 1 based on PnL.
-        pnl_min = strategy_pnl.min()
-        pnl_max = strategy_pnl.max()
+        # Calculate Calmar for each strategy using the new helper
+        # This returns a pd.Series: index=strategy_name, value=calmar_ratio
+        strategy_metrics = daily_pnl.groupby('strategy_name').apply(self._calculate_calmar_ratio)
         
-        if pnl_max == pnl_min:
-            # All strategies have same PnL, set all to 1.0
-            weights = pd.Series(1.0, index=strategy_pnl.index)
+        L.info(f"Calculated Strategy Risk/Return Metrics (Calmar): \n{strategy_metrics}")
+        
+        # --- 3. REFACTOR: Normalize based on metrics, not PnL ---
+        
+        # Filter out non-performing (0 or negative) metrics
+        strategy_metrics = strategy_metrics[strategy_metrics > 0]
+        
+        if strategy_metrics.empty:
+            L.warning("All strategies have zero or negative risk-adjusted performance. Using default weights.")
+            all_strategy_names = [name.value for name in StrategyName]
+            self.strategy_weights = {name: 1.0 for name in all_strategy_names}
+            return
+
+        metrics_min = strategy_metrics.min()
+        metrics_max = strategy_metrics.max()
+        
+        if metrics_max == metrics_min:
+            # All strategies have same positive score, set all to max weight
+            weights = pd.Series(self.strategy_weight_max, index=strategy_metrics.index)
         else:
-            # Normalize PnL from 0 to 1
-            normalized_pnl = (strategy_pnl - pnl_min) / (pnl_max - pnl_min)
+            # Normalize from 0 to 1
+            normalized_metrics = (strategy_metrics - metrics_min) / (metrics_max - metrics_min)
             # Scale from min_weight to max_weight
-            weights = self.strategy_weight_min + (normalized_pnl * (self.strategy_weight_max - self.strategy_weight_min))
+            weights = self.strategy_weight_min + (normalized_metrics * (self.strategy_weight_max - self.strategy_weight_min))
 
-        self.strategy_weights = weights.to_dict()
-        L.info(f"New strategy weights: {self.strategy_weights}")
+        # Convert to dictionary
+        final_weights_dict = weights.to_dict()
+        
+        # --- 4. Add back losing strategies at minimum weight ---
+        # Ensure all known strategies are in the final map
+        all_strategy_names = [name.value for name in StrategyName]
+        for name in all_strategy_names:
+            if name not in final_weights_dict:
+                # If a strategy had 0 or negative Calmar, assign it the minimum weight
+                final_weights_dict[name] = self.strategy_weight_min
+
+        self.strategy_weights = final_weights_dict
+        L.info(f"New strategy weights (Calmar-based): {self.strategy_weights}")
 
     def calculate_position_size(self, underlying_token: int, risk_per_lot: float, vega_per_lot: float,confidence_score: float,strategy_name: str) -> int:
         if risk_per_lot <= 0:
@@ -3428,6 +3479,10 @@ class PositionManager:
             # PaperTrader._manage_pending_entries is safe, uses store_actor
             self.trader._manage_pending_entries(now)
 
+        # ----------------------------------------------------------------------
+        #  CRITICAL FIX: ALL LOGIC BELOW THIS LINE MUST BE INDENTED
+        #  INSIDE THIS 'for p in active_positions:' LOOP
+        # ----------------------------------------------------------------------
         for p in active_positions:
             # --- Check if position still exists locally (might be closed by another thread) ---
             with self.trader.lock:
@@ -3437,13 +3492,18 @@ class PositionManager:
 
             # --- Handle Pending Entry ---
             if p.status == PositionStatus.PENDING_ENTRY.value:
-                # Calls _manage_adaptive_entry which is now fixed
-                self._manage_adaptive_entry(p, now)
+                # --- REFACTOR: Spawn in new thread to prevent blocking the main 1s loop ---
+                # Check if enough time has passed to even bother spawning a thread
+                if not p.last_entry_modification or (now - p.last_entry_modification).total_seconds() > 1.0:
+                    # This call is now non-blocking
+                    threading.Thread(target=self._manage_adaptive_entry, args=(p, now), daemon=True).start()
                 continue # Move to next position
 
             # --- Handle Placing Brackets ---
             if p.status == PositionStatus.OPEN_AWAITING_BRACKETS.value:
-                # trader.place_bracket_orders is already refactored
+                # This call is blocking, but it's a one-time event per trade
+                # and MUST be completed before the position can become ACTIVE.
+                # This is an acceptable blocking call.
                 if not self.trader.place_bracket_orders(p):
                     send_alert(f"CRITICAL: FAILED to place brackets for {p.tradingsymbol}. Closing position.", "critical")
                     # trader.close_position is already refactored
@@ -3533,11 +3593,14 @@ class PositionManager:
                     target = rule['rr_target']
                     if target not in p.triggered_scale_out_targets and profit_points >= p.initial_risk_points * target:
                         qty_to_close = int(p.initial_qty * (rule['pct_to_close'] / 100.0))
-                        # trader.scale_out uses actors internally
-                        if self.trader.scale_out(p, qty_to_close):
-                            p.triggered_scale_out_targets.append(target)
-                            scaled_out_this_cycle = True
-                            break # Only one scale-out per cycle
+                        
+                        # --- REFACTOR: Spawn scale_out in a new thread to prevent blocking ---
+                        L.info(f"[PositionManager] Spawning scale-out thread for {p.tradingsymbol} ({qty_to_close} qty)")
+                        p.triggered_scale_out_targets.append(target) # Optimistic update to prevent re-trigger
+                        threading.Thread(target=self.trader.scale_out, args=(p, qty_to_close), daemon=True).start()
+                        
+                        scaled_out_this_cycle = True
+                        break # Only one scale-out per cycle
 
             if scaled_out_this_cycle:
                 continue # Let next cycle handle TSL after scale-out state settles
@@ -3585,8 +3648,10 @@ class PositionManager:
                         p.tp_order_id = None # Clear local ID immediately
                         # --- END FIX ---
 
-                    # trader.modify_sl uses actors internally
-                    self.trader.modify_sl(p, final_new_sl)
+                    # --- REFACTOR: Spawn in new thread to prevent blocking the main 1s loop ---
+                    L.info(f"[PositionManager] Spawning SL modification thread for {p.tradingsymbol} to {final_new_sl:.2f}")
+                    p.sl_price = final_new_sl # Optimistic update to prevent re-triggering
+                    threading.Thread(target=self.trader.modify_sl, args=(p, final_new_sl), daemon=True).start()
 
             # --- Final DB Update ---
             # Update position in DB via actor (non-blocking)
@@ -4633,19 +4698,6 @@ class Engine:
             strategies[Regime.COMPRESSION].append(
                 MomentumBreakoutStrategy(StrategyName.MOMENTUM_BREAKOUT, self, self.config['strategies']['MomentumBreakout'])
             )
-            
-        # --- MODIFICATION: Moved ORB strategy here ---
-        if "OpeningRangeBreakout" in self.config["strategies"]:
-             orb_params = self.config['strategies']['OpeningRangeBreakout']
-             # Ensure the Enum was updated
-             if hasattr(StrategyName, 'OPENING_RANGE_BREAKOUT'):
-                 orb_strategy = OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, orb_params)
-                 # Note: We DO NOT set .is_agnostic = True
-                 strategies[Regime.COMPRESSION].append(orb_strategy)
-                 L.info("Loaded OpeningRangeBreakout strategy (Regime: COMPRESSION)")
-             else:
-                  L.error("OpeningRangeBreakout strategy configured but Enum not updated!")
-        # --- END MODIFICATION ---
 
         if "TrendPullback" in self.config["strategies"]:
             tp_params = self.config['strategies']['TrendPullback']
@@ -4663,11 +4715,15 @@ class Engine:
              )
 
         # Load Agnostic strategies
-        
-        # --- MODIFICATION: Removed ORB from this section ---
-        # (The original loading block for ORB has been deleted from here)
-        # --- END MODIFICATION ---
-
+        if "OpeningRangeBreakout" in self.config["strategies"]:
+         orb_params = self.config['strategies']['OpeningRangeBreakout']
+         if hasattr(StrategyName, 'OPENING_RANGE_BREAKOUT'):
+             orb_strategy = OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, orb_params)
+             orb_strategy.is_agnostic = True  # <-- VITAL FIX
+             strategies["AGNOSTIC"].append(orb_strategy) # <-- VITAL FIX
+             L.info("Loaded OpeningRangeBreakout strategy (Regime: AGNOSTIC)")
+         else:
+              L.error("OpeningRangeBreakout strategy configured but Enum not updated!")
 
         # Log loaded strategies
         for key, strat_list in strategies.items():

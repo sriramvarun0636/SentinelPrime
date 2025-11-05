@@ -181,6 +181,7 @@
         "entry_window_end": "10:00:00",
         "rr_multiplier": 1.5
     }
+    
 
   },
   "technical": {
@@ -192,6 +193,11 @@
       "hv_period": 20,
       "iv_hv_spread_threshold_low": -0.05,
       "iv_hv_spread_threshold_high": 0.10
+    },
+    "backtester": {
+      "slippage_pct": 0.05,
+      "commission_per_lot": 40,
+      "volatility_fudge_factor_pct": 2.5
     },
     "iv_contraction_lookback": 120,
     "iv_contraction_threshold_pct": 15,

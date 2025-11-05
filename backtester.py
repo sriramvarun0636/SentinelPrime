@@ -138,12 +138,18 @@ class SimulatedPriceBus:
     def get_estimated_option_ohlc(self, token: int) -> dict | None:
         """
         Estimates the OHLC for an option token based on the
-        underlying futures bar.
+        underlying futures bar AND the VIX bar.
         """
         if token in self._bar_option_cache:
             return self._bar_option_cache[token]
             
         try:
+            # --- THIS IS THE NEW CODE ---
+            # Get the fudge factor from the config, defaulting to 0%
+            backtest_cfg = self.engine.config.get("backtester", {})
+            fudge_factor = backtest_cfg.get("volatility_fudge_factor_pct", 0.0) / 100.0
+            # --- END NEW CODE ---
+
             opt_details = self.book.df_by_token.loc[token]
             strike = opt_details['strike']
             is_call = opt_details['instrument_type'] == 'CE'
@@ -156,26 +162,56 @@ class SimulatedPriceBus:
             if not fut_bar: return None
                 
             T = _calculate_time_to_expiry(expiry_date, now_ist(), self._market_close_time)
-            sigma = self.engine.engine.atm_iv_cache.get(underlying_name, 0.2)
 
-            # Calculate OHLC prices
-            opt_open = black_scholes_price(fut_bar['open'], strike, T, self._risk_free_rate, sigma, is_call)
-            opt_high = black_scholes_price(fut_bar['high'], strike, T, self._risk_free_rate, sigma, is_call)
-            opt_low = black_scholes_price(fut_bar['low'], strike, T, self._risk_free_rate, sigma, is_call)
-            opt_close = black_scholes_price(fut_bar['close'], strike, T, self._risk_free_rate, sigma, is_call)
+            # --- MODIFICATION START ---
+            # REMOVED: sigma = self.engine.engine.atm_iv_cache.get(underlying_name, 0.2)
+            
+            # 1. Get the VIX bar for dynamic IV
+            #    (257281 is the INDIA VIX token, which update_futures_bar already processes)
+            vix_bar = self._current_futures_ticks.get(257281) 
+            
+            if not vix_bar:
+                # Fallback if VIX data is missing for this bar
+                L.warning(f"VIX bar not found for IV simulation. Falling back to 20% flat IV.")
+                sigma_open = sigma_high = sigma_low = sigma_close = 0.20
+            else:
+                # 2. Use VIX OHLC for dynamic IV, ensuring a floor of 1%
+                sigma_open = max(0.01, vix_bar['open'] / 100.0)
+                sigma_high = max(0.01, vix_bar['high'] / 100.0)
+                sigma_low = max(0.01, vix_bar['low'] / 100.0)
+                sigma_close = max(0.01, vix_bar['close'] / 100.0)
+
+            # 3. Calculate OHLC prices using the corresponding dynamic IV
+            opt_open = black_scholes_price(fut_bar['open'], strike, T, self._risk_free_rate, sigma_open, is_call)
+            opt_high = black_scholes_price(fut_bar['high'], strike, T, self._risk_free_rate, sigma_high, is_call)
+            opt_low = black_scholes_price(fut_bar['low'], strike, T, self._risk_free_rate, sigma_low, is_call)
+            opt_close = black_scholes_price(fut_bar['close'], strike, T, self._risk_free_rate, sigma_close, is_call)
+            # --- MODIFICATION END ---
+
 
             # Handle call/put high/low inversion
             if is_call:
                 o_h, o_l = opt_high, opt_low
             else:
+                # Inverted for puts: a drop in underlying (fut_bar['low'])
+                # combined with a spike in IV (sigma_high) creates the
+                # *highest* price for the put option.
                 o_h, o_l = opt_low, opt_high # Inverted for puts
+
+            # --- APPLY THE FUDGE FACTOR ---
+            # Artificially widen the bar to simulate real-world gamma/vega risk
+            # We add a % to the high and subtract a % from the low.
+            o_h = o_h * (1.0 + fudge_factor)
+            o_l = o_l * (1.0 - fudge_factor)
+            o_l = max(0.01, o_l) # Ensure low price doesn't go to or below zero
+            # --- END MODIFICATION ---
 
             bar_dict = {
                 "instrument_token": token,
                 "last_price": opt_close,
                 "open": opt_open,
-                "high": o_h,
-                "low": o_l,
+                "high": o_h,  # <-- Use modified high
+                "low": o_l,   # <-- Use modified low
                 "close": opt_close,
                 "volume": 100000, # Fake
                 "last_traded_quantity": 100, # Fake
@@ -577,13 +613,6 @@ class BacktestEngine:
         self.risk_manager = RiskManager(self.engine, self.trader, self.book, self.prices, self.store, self.config)
         self.micro_monitor = MicrostructureMonitor(self.prices, self.config)
         self.pos_manager = BacktestPositionManager(self.engine, self.trader, self.book, self.prices, self.store, self.risk_manager, self.config)
-        
-        def neutral_check(*args, **kwargs):
-            return 0  # Return 0 (Neutral)
-            
-        self.micro_monitor.check_order_book_imbalance = neutral_check
-        self.micro_monitor.check_tfi = neutral_check
-        L.warning("BACKTESTER: MicrostructureMonitor (TFI/OBI) has been patched to always return 0 (Neutral).")
 
         # --- Link all components together ---
         self.engine.set_dependencies(self.trader, self.risk_manager, self.micro_monitor, self.pos_manager)
@@ -598,6 +627,73 @@ class BacktestEngine:
         self.engine.classifier = RegimeClassifier(self.engine, 256265, 260105, 257281, self.config["strategies"]["regime_classifier"])
         
         L.info("BacktestEngine initialized successfully.")
+        
+    # In backtester.py, add this new function inside the BacktestEngine class
+
+    def _generate_synthetic_microstructure(self, bar: pd.Series):
+        """
+        Generates plausible OBI/TFI scores based on the underlying bar
+        and injects them into the MicrostructureMonitor.
+        """
+        for token, prefix in [(256265, "NIFTY"), (260105, "BN")]:
+            if f"{prefix}_close" not in bar.index:
+                continue
+
+            bar_close = bar[f"{prefix}_close"]
+            bar_open = bar[f"{prefix}_open"]
+            bar_high = bar[f"{prefix}_high"]
+            bar_low = bar[f"{prefix}_low"]
+
+            if bar_close == bar_open:
+                continue # Do-nothing on a doji bar
+
+            # 1. Calculate bar "strength" (e.g., -1.0 to +1.0)
+            # This is a simple % of bar that was a green/red candle
+            bar_range = bar_high - bar_low
+            if bar_range == 0: continue
+            
+            body = bar_close - bar_open
+            strength = (body / bar_range) * 2.0 # Scale to roughly -2.0 to +2.0
+            strength = max(-1.0, min(1.0, strength)) # Clamp to -1.0 to +1.0
+
+            # 2. Get all option contracts for this underlying
+            underlying_name = _get_underlying(self.book.get_symbol(token))
+            expiry = self.book.find_nearest_expiry_date(underlying_name)
+            if not expiry: continue
+            
+            chain = self.book.get_option_chain(underlying_name, expiry)
+            if chain.empty: continue
+            
+            # 3. Inject synthetic data for ALL options in the chain
+            for opt_token in chain['instrument_token']:
+                # --- Fake TFI Score ---
+                # A strong up-bar (strength=1.0) creates a TFI score of +350
+                # A strong down-bar (strength=-1.0) creates a TFI score of -350
+                fake_tfi_score = strength * 350 # 350 is just below the 400 threshold
+                
+                # Add some randomness so it's not perfect
+                fake_tfi_score += np.random.normal(0, 50) 
+                
+                # Inject this fake score into the *real* monitor
+                if opt_token not in self.micro_monitor.tfi_score_history:
+                    self.micro_monitor.tfi_score_history[opt_token] = deque(maxlen=self.micro_monitor.persistence_window)
+                self.micro_monitor.tfi_score_history[opt_token].append(fake_tfi_score)
+
+
+                # --- Fake OBI Score ---
+                # A strong up-bar (strength=1.0) creates OBI of 65% (0.65)
+                # A strong down-bar (strength=-1.0) creates OBI of 35% (0.35)
+                # 0.5 is the neutral mid-point
+                fake_obi_ratio = 0.5 + (strength * 0.15) # 0.15 maps to the 65/35 range
+                
+                # Add some randomness
+                fake_obi_ratio += np.random.normal(0, 0.05)
+                fake_obi_ratio = max(0.01, min(0.99, fake_obi_ratio)) # Clamp
+                
+                # Inject this fake score
+                if opt_token not in self.micro_monitor.obi_ratio_history:
+                    self.micro_monitor.obi_ratio_history[opt_token] = deque(maxlen=self.micro_monitor.persistence_window)
+                self.micro_monitor.obi_ratio_history[opt_token].append(fake_obi_ratio)
         
     def _load_real_book(self) -> InstrumentBook:
         """Loads the real InstrumentBook from the cached CSV."""
@@ -699,6 +795,8 @@ class BacktestEngine:
                 # 3. Run "Brain" - Phase 1 (Regime & IV)
                 self.engine.run_regime_classification(bar.Index)
                 self.engine._update_atm_iv_cache() # CRITICAL: Update IV
+                
+                self._generate_synthetic_microstructure(bar)
                 
                 # 4. Run "Brain" - Phase 2 (Planner)
                 # This runs the REAL planner. It will call the
