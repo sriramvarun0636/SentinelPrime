@@ -7,10 +7,12 @@ import time
 import math
 import json
 import queue
+import dataclasses
 import signal
 import logging
 import threading
 import uuid
+import gc
 import sqlite3
 import stat
 from enum import Enum, auto
@@ -20,6 +22,8 @@ from typing import List, Dict, Optional, Tuple, Callable, Type
 from datetime import datetime, timedelta, time as dtime, date
 from abc import ABC, abstractmethod
 from collections import deque
+from numba import jit
+
 
 
 from dotenv import load_dotenv
@@ -27,6 +31,8 @@ import numpy as np
 import pandas as pd
 import pytz
 import pandas_market_calendars as mcal
+from scipy.optimize import newton
+from scipy.stats import norm
 
 # --- Dependency Checks ---
 try:
@@ -67,12 +73,30 @@ except ImportError:
 L_ACTORS = logging.getLogger("SENTINEL-PRIME.ACTORS")
 
 class OrderActor(threading.Thread):
-    """A single-threaded actor for all broker API I/O."""
+    """A thread-safe actor for all broker API I/O with internal rate limiting."""
     def __init__(self, kite_client: GovernedKite):
         super().__init__(daemon=True, name="OrderActor")
         self.q = queue.Queue()
         self.kite = kite_client
         self.running = True
+        # Rate Limiter: 3 tokens/sec, max 10 tokens burst
+        self.tokens = 10.0
+        self.last_update = time.time()
+        self.rate_lock = threading.Lock()
+
+    def _wait_for_token(self):
+        while True:
+            with self.rate_lock:
+                now = time.time()
+                elapsed = now - self.last_update
+                self.last_update = now
+                # FIX: 2.5 tokens/sec instead of 3.0 to allow overhead
+                self.tokens = min(10.0, self.tokens + (elapsed * 2.5)) 
+                
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+            time.sleep(0.1)
 
     def run(self):
         while self.running:
@@ -81,9 +105,15 @@ class OrderActor(threading.Thread):
                 if msg is None:
                     continue
 
-                L_ACTORS.debug(f"OrderActor processing: {msg.get('type')}")
                 msg_type = msg['type']
-                reply_q = msg.get('reply_q') # Reply queue is optional
+                reply_q = msg.get('reply_q') 
+
+                # --- RATE LIMITING ---
+                # Only CANCEL operations are allowed to bypass the rate limiter.
+                # place_order MUST consume tokens to prevent spam bans.
+                if msg_type not in ["cancel_all_orders", "cancel_order"]:
+                     self._wait_for_token()
+                # ---------------------
 
                 try:
                     res = None
@@ -91,15 +121,39 @@ class OrderActor(threading.Thread):
                     if msg_type == "place_order":
                         res = self.kite.place_order(**msg['params'])
                     elif msg_type == "modify_order":
-                        res = self.kite.modify_order(**msg['params'])
+                        try:
+                            res = self.kite.modify_order(**msg['params'])
+                        except KiteException as e:
+                            # RACE CONDITION HANDLER
+                            # If error is "NetworkException" or order id not found, it likely closed.
+                            # We log it as a warning, NOT an error, and don't crash the thread.
+                            err_str = str(e).lower()
+                            if "unable to modify" in err_str or "does not exist" in err_str or "completed" in err_str:
+                                L_ACTORS.warning(f"Race Condition caught: Tried to modify dead order. Ignoring. ({e})")
+                                res = {"status": "RACE_CONDITION_IGNORED"}
+                            else:
+                                raise e # Real error, re-raise
                     elif msg_type == "cancel_order":
                         res = self.kite.cancel_order(**msg['params'])
                     
+                    # --- Panic / Risk Management Methods ---
+                    elif msg_type == "cancel_all_orders":
+                        try:
+                            orders = self.kite.orders()
+                            count = 0
+                            for o in orders:
+                                if o['status'] == 'OPEN':
+                                    try:
+                                        self.kite.cancel_order(variety='regular', order_id=o['order_id'])
+                                        count += 1
+                                    except: pass
+                            res = f"Cancelled {count} orders"
+                        except Exception as e:
+                            res = f"Cancel All Failed: {e}"
+
                     # --- Read/Data Methods ---
                     elif msg_type == "order_history":
                         res = self.kite.order_history(**msg['params'])
-                    
-                    # --- NEWLY ADDED METHODS ---
                     elif msg_type == "orders":
                         res = self.kite.orders()
                     elif msg_type == "positions":
@@ -112,7 +166,6 @@ class OrderActor(threading.Thread):
                         res = self.kite.historical_data(**msg['params'])
                     elif msg_type == "quote":
                         res = self.kite.quote(**msg['params'])
-                    # --- END NEW METHODS ---
 
                     else:
                         L_ACTORS.error(f"OrderActor unknown message type: {msg_type}")
@@ -132,8 +185,7 @@ class OrderActor(threading.Thread):
 
     def stop(self):
         self.running = False
-        self.q.put(None) # Unblock .get()
-
+        self.q.put(None)
 class StoreActor(threading.Thread):
     """A single-threaded actor for all database I/O."""
     def __init__(self, store: Store):
@@ -207,6 +259,16 @@ class RealTimeClock(Clock):
     """The clock for live trading."""
     def now(self) -> datetime:
         return datetime.now(tz=IST)
+    
+class LeakyQueue(queue.Queue):
+    """A Queue that drops the oldest item when full (LIFO eviction for fresh data)."""
+    def put(self, item, block=True, timeout=None):
+        if self.full():
+            try:
+                self.get_nowait() # Discard oldest tick
+            except queue.Empty:
+                pass
+        super().put(item, block, timeout)
 
 # ==================================================================================================
 # CONFIGURATION LOADER
@@ -325,11 +387,13 @@ class Regime(Enum):
 
 
 class StrategyName(Enum):
-    MOMENTUM_BREAKOUT = "MomentumBreakout"
-    TREND_PULLBACK = "TrendPullback"
+    MOMENTUM_IGNITION = "MomentumIgnition" # Replaces MomentumBreakout
+    SLINGSHOT = "Slingshot"     
     MEAN_REVERSION = "MeanReversion"
     VOLATILITY_MEAN_REVERSION = "VolatilityMeanReversion"
     OPENING_RANGE_BREAKOUT = "OpeningRangeBreakout"
+    TREND_PULLBACK = "TrendPullback"
+    GAMMA_BURST = "GammaBurst"
 
 
 class PositionStatus(Enum):
@@ -369,6 +433,7 @@ class Position:
     tradingsymbol: str
     token: int
     option_type: str
+    underlying_entry_price: float = 0.0
     qty: int
     initial_qty: int
     entry_price: float
@@ -435,9 +500,10 @@ class TradeSignal:
 # ==================================================================================================
 # UTILITIES & GREEK CALCULATIONS
 # ==================================================================================================
+
+
 def now_ist() -> datetime:
     return datetime.now(tz=IST)
-
 
 def send_alert(text: str, level: str = "info"):
     log_func = getattr(L, level, L.info)
@@ -449,25 +515,12 @@ def send_alert(text: str, level: str = "info"):
             requests.post(
                 f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
                 json={"chat_id": TG_CHAT_ID, "text": text[:4000]},
-                timeout=5
+                timeout=2
             )
             return
         except Exception as e:
             L.warning(f"Telegram alert failed on attempt {attempt+1}: {e}")
-            time.sleep(1)
-
-
-def _calculate_time_to_expiry(expiry_date: date, current_datetime: datetime, market_close_time: dtime) -> float:
-    """Calculates time to expiry in years based on calendar time."""
-    expiry_dt = datetime.combine(expiry_date, market_close_time, tzinfo=IST)
-    if expiry_dt < current_datetime:
-        return 1e-9
-
-    time_delta_seconds = (expiry_dt - current_datetime).total_seconds()
-    seconds_in_year = 365.25 * 24 * 60 * 60
-    T = time_delta_seconds / seconds_in_year
-    return max(1e-9, T)
-# --- ADD THIS NEW FUNCTION TO main1.py ---
+            time.sleep(0.5)
 
 def calculate_trading_time_to_expiry(
     current_datetime: datetime, 
@@ -476,147 +529,125 @@ def calculate_trading_time_to_expiry(
     market_close_time: dtime,
     nse_calendar
 ) -> float:
-    """
-    Calculates time to expiry (T) in fractional years based on TRADING time.
-    T = (Trading Days Remaining) / 252.0
-    For intraday expiry, it calculates the fraction of the trading day left.
-    """
-    
-    # --- Constants ---
-    # Total trading minutes in a standard session (e.g., 9:15 to 15:30 = 375 mins)
+    """Calculates accurate trading time to expiry using market calendar."""
     total_session_minutes = (
         (market_close_time.hour * 60 + market_close_time.minute) -
         (market_open_time.hour * 60 + market_open_time.minute)
     )
-    if total_session_minutes <= 0:
-        total_session_minutes = 375 # Failsafe
-        
+    if total_session_minutes <= 0: total_session_minutes = 375
     TRADING_DAYS_PER_YEAR = 252.0
     MINUTES_PER_TRADING_YEAR = TRADING_DAYS_PER_YEAR * total_session_minutes
-
     current_date = current_datetime.date()
     current_time = current_datetime.time()
 
-    # --- Case 1: Already Past Expiry ---
-    # If it's expiry day and past market close
     if current_date > expiry_date or (current_date == expiry_date and current_time >= market_close_time):
-        return 1e-9 # Return a tiny non-zero number to avoid division by zero
+        return 1e-9 
 
-    # --- Case 2: On Expiry Day (Intraday Calculation) ---
     if current_date == expiry_date:
-        if current_time < market_open_time:
-            # Pre-market on expiry day, counts as 1 full day
-            minutes_remaining = total_session_minutes
+        if current_time < market_open_time: minutes_remaining = total_session_minutes
         else:
-            # Mid-session on expiry day
-            minutes_remaining = (
-                (market_close_time.hour * 60 + market_close_time.minute) -
-                (current_time.hour * 60 + current_time.minute)
-            )
-        
-        # Return the fraction of the *entire trading year* that is left today
+            minutes_remaining = ((market_close_time.hour * 60 + market_close_time.minute) -
+                                 (current_time.hour * 60 + current_time.minute))
         return max(1e-9, minutes_remaining / MINUTES_PER_TRADING_YEAR)
 
-    # --- Case 3: Before Expiry Day (Interday Calculation) ---
-    # Use the market calendar to find the number of trading days
     try:
-        trading_days = nse_calendar.valid_days(
-            start_date=current_date, 
-            end_date=expiry_date
-        )
-        
-        # .size includes the start day. We need to adjust.
-        # If today is a trading day and market is open: count today + future days
-        # If today is a trading day and market is closed: count only future days
-        # If today is a holiday: count only future days
-        
+        trading_days = nse_calendar.valid_days(start_date=current_date, end_date=expiry_date)
+        trading_days_left = len(trading_days)
         is_today_trading_day = current_date in trading_days
-        
-        if is_today_trading_day and current_time < market_close_time:
-            # Market is open, or pre-market. Today counts as a full day
-            # (plus fractional part if we want to be hyper-accurate, but for
-            # interday, this is good enough)
-            trading_days_left = len(trading_days)
-        else:
-            # Market is closed, or it's a holiday. Today doesn't count.
-            trading_days_left = len(trading_days)
-            if is_today_trading_day:
-                trading_days_left -= 1 # Don't count today
-                
+        if is_today_trading_day and current_time >= market_close_time: trading_days_left -= 1
         return max(1e-9, trading_days_left / TRADING_DAYS_PER_YEAR)
-        
     except Exception as e:
-        L.warning(f"Failed to calculate trading days, falling back to calendar estimate: {e}")
-        # Fallback to a (better) calendar estimate
+        L.warning(f"Calendar calculation failed: {e}. Fallback to calendar days.")
         days_left = (expiry_date - current_date).days
         return max(1e-9, (days_left * (TRADING_DAYS_PER_YEAR / 365.25)) / TRADING_DAYS_PER_YEAR)
 
+# --- NUMBA JIT ACCELERATED MATH CORE ---
 
-def _get_d1_d2(S: float, K: float, T: float, r: float, sigma: float) -> Tuple[Optional[float], Optional[float]]:
+@jit(nopython=True, cache=True, nogil=True)
+def _numba_cdf(x):
+    """Fast approximation of Cumulative Distribution Function"""
+    return 0.5 * (1.0 + math.erf(x / 1.4142135623730951))
+
+@jit(nopython=True, cache=True, nogil=True)
+def _numba_pdf(x):
+    """Fast approximation of Probability Density Function"""
+    return 0.3989422804014327 * math.exp(-0.5 * x * x)
+
+@jit(nopython=True, cache=True, nogil=True)
+def fast_greeks_jit(S, K, T, r, sigma, is_call):
+    """
+    Calculates Price and all Greeks in a single pass using machine code.
+    Returns: (price, delta, vega, gamma, theta)
+    """
     if T <= 1e-9 or sigma <= 1e-9 or S <= 0 or K <= 0:
-        return None, None
-    try:
-        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
-        d2 = d1 - sigma * math.sqrt(T)
-        return d1, d2
-    except (ValueError, ZeroDivisionError):
-        return None, None
+        # Return intrinsics for safety
+        intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
+        d_int = 1.0 if (is_call and S > K) else -1.0 if (not is_call and S < K) else 0.0
+        return intrinsic, d_int, 0.0, 0.0, 0.0
 
+    sqrt_T = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+    d2 = d1 - sigma * sqrt_T
+    
+    cdf_d1 = _numba_cdf(d1)
+    cdf_d2 = _numba_cdf(d2)
+    pdf_d1 = _numba_pdf(d1)
+    
+    if is_call:
+        price = S * cdf_d1 - K * math.exp(-r * T) * cdf_d2
+        delta = cdf_d1
+        theta = (- (S * pdf_d1 * sigma) / (2 * sqrt_T) - r * K * math.exp(-r * T) * _numba_cdf(d2)) / 365.0
+    else:
+        cdf_neg_d1 = _numba_cdf(-d1)
+        cdf_neg_d2 = _numba_cdf(-d2)
+        price = K * math.exp(-r * T) * cdf_neg_d2 - S * cdf_neg_d1
+        delta = cdf_d1 - 1.0
+        theta = (- (S * pdf_d1 * sigma) / (2 * sqrt_T) + r * K * math.exp(-r * T) * _numba_cdf(-d2)) / 365.0
+        
+    vega = S * pdf_d1 * sqrt_T / 100.0
+    gamma = pdf_d1 / (S * sigma * sqrt_T)
+    
+    return price, delta, vega, gamma, theta
+
+@jit(nopython=True, cache=True, nogil=True)
+def implied_vol_jit(target_price, S, K, T, r, is_call):
+    """Fast Newton-Raphson IV solver."""
+    sigma = 0.5 # Initial guess
+    for i in range(20):
+        p, d, v, g, th = fast_greeks_jit(S, K, T, r, sigma, is_call)
+        diff = target_price - p
+        if abs(diff) < 1e-4:
+            return sigma
+        if v == 0:
+            break
+        sigma = sigma + diff / (v * 100.0) # Vega is scaled by 100 in fast_greeks
+    return sigma
+
+# --- WRAPPERS FOR COMPATIBILITY ---
 
 def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
-    d1, d2 = _get_d1_d2(S, K, T, r, sigma)
-    if d1 is None:
-        return max(0.0, S - K) if is_call else max(0.0, K - S)
-
-    price = S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2) if is_call else \
-            K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-    return price
-
-
-def bs_delta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
-    d1, _ = _get_d1_d2(S, K, T, r, sigma)
-    if d1 is None:
-        return (1.0 if S > K else 0.0) if is_call else (-1.0 if S < K else 0.0)
-    return norm.cdf(d1) if is_call else norm.cdf(d1) - 1.0
-
-
-def bs_vega(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    d1, _ = _get_d1_d2(S, K, T, r, sigma)
-    if d1 is None:
-        return 0.0
-    return S * norm.pdf(d1) * math.sqrt(T) / 100.0
-
-
-def bs_gamma(S: float, K: float, T: float, r: float, sigma: float) -> float:
-    d1, _ = _get_d1_d2(S, K, T, r, sigma)
-    if d1 is None or S <= 0 or sigma <= 0 or T <= 0:
-        return 0.0
-    return norm.pdf(d1) / (S * sigma * math.sqrt(T))
-
-
-def bs_theta(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> float:
-    d1, d2 = _get_d1_d2(S, K, T, r, sigma)
-    if d1 is None:
-        return 0.0
-
-    p1 = - (S * norm.pdf(d1) * sigma) / (2 * math.sqrt(T))
-    if is_call:
-        p2 = - r * K * math.exp(-r * T) * norm.cdf(d2)
-    else:  # Put
-        p2 = r * K * math.exp(-r * T) * norm.cdf(-d2)
-
-    return (p1 + p2) / 365.0
-
+    p, _, _, _, _ = fast_greeks_jit(float(S), float(K), float(T), float(r), float(sigma), is_call)
+    return p
 
 def calculate_greeks(S: float, K: float, T: float, r: float, sigma: float, is_call: bool) -> Dict[str, float]:
-    """Calculates primary greeks for a given option."""
+    """Calculates primary greeks using Numba JIT backend."""
+    _, delta, vega, gamma, theta = fast_greeks_jit(float(S), float(K), float(T), float(r), float(sigma), is_call)
     return {
-        "delta": bs_delta(S, K, T, r, sigma, is_call),
-        "vega": bs_vega(S, K, T, r, sigma),
-        "gamma": bs_gamma(S, K, T, r, sigma),
-        "theta": bs_theta(S, K, T, r, sigma, is_call)
+        "delta": delta,
+        "vega": vega,
+        "gamma": gamma,
+        "theta": theta
     }
 
+def calculate_iv(target_price: float, S: float, K: float, T: float, r: float, is_call: bool, initial_guess: float = 0.5, hv_fallback: Optional[float] = None) -> float:
+    """Calculates Implied Volatility using fast JIT solver."""
+    try:
+        iv = implied_vol_jit(float(target_price), float(S), float(K), float(T), float(r), is_call)
+        if iv <= 0 or iv > 5.0 or math.isnan(iv): # Sanity check
+             return hv_fallback or initial_guess
+        return iv
+    except:
+        return hv_fallback or initial_guess
 
 def calculate_historical_volatility(price_series: pd.Series, window: int = 20, timeframe_minutes: int = 1) -> Optional[float]:
     """Calculates annualized historical volatility from intraday data."""
@@ -634,21 +665,6 @@ def calculate_historical_volatility(price_series: pd.Series, window: int = 20, t
     annualized_vol = std_dev * annualization_factor
     return annualized_vol if not pd.isna(annualized_vol) else None
 
-
-def calculate_iv(target_price: float, S: float, K: float, T: float, r: float, is_call: bool, initial_guess: float = 0.5, hv_fallback: Optional[float] = None) -> float:
-    """Calculates Implied Volatility using Newton-Raphson method."""
-    def error_func(sigma, *args):
-        price = black_scholes_price(S, K, T, r, sigma, is_call)
-        return price - target_price
-
-    try:
-        iv = newton(error_func, initial_guess, tol=1e-5, maxiter=50)
-        return iv if iv > 0 else (hv_fallback or initial_guess)
-    except (RuntimeError, ValueError):
-        L.warning(f"IV calculation failed for S={S}, K={K}, P={target_price}. Falling back.")
-        return hv_fallback or initial_guess
-
-
 def _get_underlying(tradingsymbol: str) -> str:
     upper_symbol = tradingsymbol.upper()
     if "BANKNIFTY" in upper_symbol:
@@ -656,7 +672,6 @@ def _get_underlying(tradingsymbol: str) -> str:
     if "NIFTY" in upper_symbol:
         return "NIFTY"
     return "UNKNOWN"
-
 
 def calculate_dynamic_risk_params(
     ohlc_df_1m: pd.DataFrame,
@@ -667,14 +682,13 @@ def calculate_dynamic_risk_params(
     Calculates dynamic SL/TP multipliers based on short-term vs long-term volatility.
     """
     if len(ohlc_df_1m) < 50:
-        L.warning("Not enough 1m data for dynamic risk calculation.")
+        # L.warning("Not enough 1m data for dynamic risk calculation.")
         return 0.0, 0.0
 
     atr_short = ohlc_df_1m.ta.atr(length=5).iloc[-1]
     atr_long = ohlc_df_1m.ta.atr(length=50).iloc[-1]
 
     if atr_long == 0 or pd.isna(atr_short) or pd.isna(atr_long):
-        L.warning("Invalid ATR values for dynamic risk calculation.")
         return 0.0, 0.0
 
     vol_ratio = atr_short / atr_long
@@ -691,13 +705,11 @@ def calculate_dynamic_risk_params(
 
     current_atr = ohlc_df_1m.ta.atr(14).iloc[-1]
     if pd.isna(current_atr):
-        L.warning("Invalid 14-period ATR for dynamic risk calculation.")
         return 0.0, 0.0
 
     risk_points = current_atr * final_sl_multiplier
     reward_points = current_atr * final_tp_multiplier
     return risk_points, reward_points
-
 
 class ApiGovernor:
     """A thread-safe API rate limiter and retry wrapper."""
@@ -787,6 +799,8 @@ class Store:
     def _initialize_db(self):
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL;")   # Enable non-blocking writes
+            cursor.execute("PRAGMA synchronous=NORMAL;")
             cursor.execute("PRAGMA user_version")
             db_version = cursor.fetchone()[0]
             L.info(f"Database schema version: {db_version}")
@@ -1144,11 +1158,12 @@ class PriceBus:
         self.last = {}
         self.full_ticks = {}
         self.lock = threading.RLock()
+        self.bar_queue = queue.Queue(maxsize=10000)
 
         self.on_connect_callbacks = []
         self.connected = threading.Event()
         self.ws_thread = None
-        self.tick_queue = Queue()
+        self.tick_queue = LeakyQueue(maxsize=100)
         self.order_update_queue = Queue()
 
         self.last_tick_reception_time: Optional[datetime] = None
@@ -1168,7 +1183,18 @@ class PriceBus:
         self.last_tick_reception_time = now_ist()
         for t in ticks:
             self.last_tick_reception_time_per_token[t['instrument_token']] = self.last_tick_reception_time
-        self.tick_queue.put(ticks)
+        
+        # 1. Fast Path (Signals)
+        try:
+            self.tick_queue.put_nowait(ticks)
+        except queue.Full:
+            pass # Drop oldest (Leaky)
+
+        # 2. Reliable Path (Bars)
+        try:
+            self.bar_queue.put_nowait(ticks)
+        except queue.Full:
+            L.warning("⚠️ CRITICAL: Bar Queue FULL. Dropping market data to keep WS alive.")
 
     def _on_order_update(self, ws, order):
         L.info(f"WS Order Update Received: {order.get('tradingsymbol')} {order.get('status')} ({order.get('order_id')})")
@@ -1222,103 +1248,122 @@ class PriceBus:
 
 
 class BarStore:
+    """
+    Optimized In-Memory Store. 
+    Uses deques for O(1) writes. Builds DataFrame only on read O(N).
+    Removes the 'pd.concat' bottleneck from the hot path.
+    """
     def __init__(self, timeframes: List[int]):
-        self.lock = None
-        self.timeframes = sorted(timeframes)
-        self.data: Dict[int, Dict[int, pd.DataFrame]] = {}
         self.lock = threading.RLock()
+        self.timeframes = sorted(timeframes)
+        # Structure: {token: {tf: deque([ {'ts':..., 'open':...}, ... ]) }}
+        # Deque maxlen ensures automatic trimming of old bars
+        self.buffer: Dict[int, Dict[int, deque]] = {} 
+        # Active Bar Tracker
+        self.active_bars: Dict[int, Dict[int, Dict]] = {}
 
     def _ensure_token_data(self, token: int):
-        if token not in self.data:
-            self.data[token] = {tf: pd.DataFrame(columns=["open", "high", "low", "close", "volume"]).astype(float) for tf in self.timeframes}
-            for tf in self.timeframes:
-                self.data[token][tf].index.name = "timestamp"
+        if token not in self.buffer:
+            # Maxlen 2000 stores enough history for indicators without memory bloat
+            self.buffer[token] = {tf: deque(maxlen=2000) for tf in self.timeframes}
+            self.active_bars[token] = {tf: None for tf in self.timeframes}
 
     def prime(self, token: int, hist_df: pd.DataFrame, append: bool = False):
-        """
-        Primes the bar store with historical data.
-        If append=True, it concatenates new data with existing data,
-        overwriting any duplicate timestamps with the new data.
-        """
+        """Loads initial historical data into the deque buffers."""
         with self.lock:
-            if hist_df.empty:
-                return
-            
-            # Ensure the token entry exists in the data structure
+            if hist_df.empty: return
             self._ensure_token_data(token)
-
-            # --- Data Preparation ---
-            # Convert 'date' column to timezone-aware timestamp index
-            ts_col = pd.to_datetime(hist_df['date'])
-            if ts_col.dt.tz is None:
-                hist_df['timestamp'] = ts_col.dt.tz_localize(IST)
-            else:
-                hist_df['timestamp'] = ts_col.dt.tz_convert(IST)
             
-            hist_df = hist_df.set_index("timestamp").drop(columns=['date'])
-            base_df = hist_df.copy()
+            ts_col = pd.to_datetime(hist_df['date'])
+            hist_df['timestamp'] = ts_col.dt.tz_convert(IST) if ts_col.dt.tz else ts_col.dt.tz_localize(IST)
+            base_df = hist_df.set_index("timestamp").drop(columns=['date'], errors='ignore')
 
-            # --- Resample and Store for each Timeframe ---
             for tf in self.timeframes:
-                resampled_df = None
-                if tf == 1:
-                    resampled_df = base_df
+                # Resample historical data
+                resampled = base_df if tf == 1 else base_df.resample(f'{tf}min').agg({
+                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                }).dropna()
+                
+                if resampled.empty: continue
+                
+                # Convert to list of dicts for deque
+                # reset_index to keep timestamp as a column for the dict
+                records = resampled.reset_index().to_dict('records')
+                
+                # Rename timestamp column to 'ts' to match internal schema if needed, 
+                # or just ensure get_ohlc handles it. Let's standardize on 'ts'.
+                for r in records:
+                    r['ts'] = r.pop('timestamp')
+                
+                if append:
+                    self.buffer[token][tf].extend(records)
                 else:
-                    # Resample the 1-min base data for higher timeframes
-                    resampled_df = base_df.resample(f'{tf}min').agg({
-                        'open': 'first', 
-                        'high': 'max', 
-                        'low': 'min', 
-                        'close': 'last', 
-                        'volume': 'sum'
-                    }).dropna()
-
-                if resampled_df.empty:
-                    continue
-
-                # --- NEW: Append/Gap-Fill Logic ---
-                if append and tf in self.data[token] and not self.data[token][tf].empty:
-                    # Concatenate old data with new resampled data
-                    combined_df = pd.concat([self.data[token][tf], resampled_df])
+                    self.buffer[token][tf] = deque(records, maxlen=2000)
                     
-                    # De-duplicate index: keep='last' ensures new data overwrites old
-                    self.data[token][tf] = combined_df[~combined_df.index.duplicated(keep='last')].sort_index()
-                else:
-                    # Original behavior: complete overwrite
-                    self.data[token][tf] = resampled_df
-                # --- End NEW Logic ---
-
-            # --- Modified Log Message ---
-            L.info(f"Priming BarStore for {token} ({'APPEND' if append else 'FULL'}). {len(hist_df)} new bars. Total bars (1m): {len(self.data[token][1])}")
+            L.info(f"Primed BarStore for {token} with deque buffers.")
 
     def add_tick(self, tick: Dict) -> Optional[List[int]]:
-        token = tick['instrument_token']
-        ts = tick.get('exchange_timestamp')
-        price = tick.get('last_price')
-        qty = tick.get('last_traded_quantity')
-        if not all([isinstance(ts, datetime), isinstance(price, (float, int)), isinstance(qty, int)]):
-            return None
-        updated_timeframes = []
+        """
+        Processes a new tick. 
+        O(1) operation using deque append. Zero DataFrame allocations.
+        """
+        token, ts, price, qty = tick.get('instrument_token'), tick.get('exchange_timestamp'), tick.get('last_price'), tick.get('last_traded_quantity')
+        if not all([token, ts, price, qty is not None]): return None
+        
+        updated_tfs = []
         with self.lock:
             self._ensure_token_data(token)
             for tf in self.timeframes:
-                df = self.data[token][tf]
+                # Calculate bar start time
                 bar_ts = ts.replace(second=0, microsecond=0) - timedelta(minutes=ts.minute % tf)
-                if bar_ts not in df.index:
-                    if not df.empty:
-                        updated_timeframes.append(tf)
-                    new_row = pd.DataFrame([[price, price, price, price, float(qty)]], columns=['open', 'high', 'low', 'close', 'volume'], index=[bar_ts])
-                    self.data[token][tf] = pd.concat([df, new_row])
+                current = self.active_bars[token][tf]
+                
+                # --- Condition 1: New Bar Started ---
+                if current is None or current['ts'] != bar_ts:
+                    if current is not None:
+                        # Commit completed bar to deque (O(1))
+                        self.buffer[token][tf].append(current)
+                        updated_tfs.append(tf)
+                    
+                    # Initialize new active bar
+                    self.active_bars[token][tf] = {
+                        'ts': bar_ts, 
+                        'open': price, 'high': price, 'low': price, 'close': price, 'volume': qty
+                    }
+                
+                # --- Condition 2: Update Active Bar ---
                 else:
-                    df.loc[bar_ts, 'high'] = max(df.loc[bar_ts, 'high'], price)
-                    df.loc[bar_ts, 'low'] = min(df.loc[bar_ts, 'low'], price)
-                    df.loc[bar_ts, 'close'] = price
-                    df.loc[bar_ts, 'volume'] += qty
-        return list(set(updated_timeframes)) if updated_timeframes else None
+                    if price > current['high']: current['high'] = price
+                    elif price < current['low']: current['low'] = price
+                    current['close'] = price
+                    current['volume'] += qty
+                    
+        return updated_tfs
 
     def get_ohlc(self, token: int, timeframe: int) -> pd.DataFrame:
+        """
+        Returns DataFrame for analysis. 
+        Builds DF on-demand (O(N)). Only called by Strategy Logic, not Tick Processor.
+        """
         with self.lock:
-            return self.data.get(token, {}).get(timeframe, pd.DataFrame()).copy()
+            if token not in self.buffer or timeframe not in self.buffer[token]: 
+                return pd.DataFrame()
+            
+            # 1. Copy deque to list (Fast)
+            data = list(self.buffer[token][timeframe])
+            
+            # 2. Append active bar if exists (Real-time view)
+            active = self.active_bars.get(token, {}).get(timeframe)
+            if active:
+                data.append(active)
+                
+            if not data: return pd.DataFrame()
+            
+            # 3. Create DataFrame (The only heavy op, but decoupled from tick stream)
+            df = pd.DataFrame(data)
+            df.set_index('ts', inplace=True)
+            df.index.name = 'timestamp'
+            return df
 
 
 # ==================================================================================================
@@ -2159,40 +2204,31 @@ class Trader(AbstractTrader):
         # Caller function is responsible for upserting the position state if needed.
 
     # --- Open Position (Refactored) ---
+    # --- Open Position (Fixed: Respects FVG Limit Price) ---
     def open_position(self, trade_params: Dict) -> Optional[Position]:
-        """
-        Submits an adaptive entry order via the OrderActor and saves state via StoreActor.
-        """
-        # Define constants locally or globally
-        VARIETY_REGULAR = "regular"
-        TRANSACTION_TYPE_BUY = "BUY"
-        PRODUCT_MIS = "MIS"
-        ORDER_TYPE_LIMIT = "LIMIT"
-        
         with self.lock:
-            # --- 1. Pre-Trade Checks ---
+            opt = trade_params['opt']
+            ts = opt['tradingsymbol']
+            strategy_name = trade_params['strategy']
+            
+            # 1. Pre-Trade Checks
             open_pos_count = sum(1 for p in self.positions.values() if p.status not in [PositionStatus.CLOSED.value, PositionStatus.REJECTED.value])
-            opt, ts = trade_params['opt'], trade_params['opt']['tradingsymbol']
             lot_size = self.book.lot_size(_get_underlying(ts))
 
             if open_pos_count >= self.max_concurrent or not lot_size:
                 L.warning(f"Trade rejected: Max concurrent ({self.max_concurrent}) or no lot size.")
                 return None
 
-            lots = int(trade_params['lots'])
-            qty = int(lots * lot_size)
-            if qty <= 0:
-                L.warning(f"Trade rejected: Calculated quantity is {qty}.")
-                return None
+            qty = int(int(trade_params['lots']) * lot_size)
+            if qty <= 0: return None
 
-            # --- 2. Create Initial Position Object ---
-            temp_id = f"TEMP_{uuid.uuid4()}"
+            # 2. Create Position Object
             pos = Position(
-                id=temp_id,
+                id=f"TEMP_{uuid.uuid4()}",
                 status=PositionStatus.PENDING_SUBMISSION.value, 
                 tradingsymbol=ts, token=int(opt['instrument_token']), option_type=opt['instrument_type'],
                 qty=0, initial_qty=qty, entry_price=0, initial_sl_price=0, sl_price=0, tp_price=0,
-                opened_at=now_ist(), strategy=trade_params['strategy'], market_regime_at_entry=trade_params['regime'],
+                opened_at=now_ist(), strategy=strategy_name, market_regime_at_entry=trade_params['regime'],
                 underlying_sl_level=trade_params['underlying_sl'],
                 option_sl_points=trade_params['option_sl_points'],
                 option_tp_points=trade_params['option_tp_points'],
@@ -2200,78 +2236,101 @@ class Trader(AbstractTrader):
                 scale_out_rules=self.config['trading']['scale_out_rules'],
                 max_trade_duration_minutes=trade_params.get('max_trade_duration_minutes', 90),
                 oi_profit_target=trade_params.get('oi_profit_target'),
+                underlying_entry_price=trade_params.get('underlying_price', 0.0),
                 intended_risk_rupees=trade_params.get('total_trade_risk', 0.0),
                 last_entry_modification=now_ist()
             )
+            self.positions[pos.id] = pos
 
-            # --- 3. Save Initial State via StoreActor ---
-            self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-            self.positions[pos.id] = pos # Add to local dict immediately
-
-            # --- 4. Get Depth for Entry Price ---
-            full_tick = self.prices.get_full_tick(int(opt['instrument_token']))
-            if not full_tick or not full_tick.get('depth') or not full_tick['depth'].get('buy'):
-                L.warning(f"Cannot get depth for {ts}, cannot place adaptive entry.")
-                pos.status = PositionStatus.REJECTED.value
-                pos.exit_reason = "NO_DEPTH_FOR_ENTRY"
-                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-                self.positions.pop(pos.id, None) 
+            # --- 3. Execution Routing (The Fix) ---
+            
+            ltp = self.prices.ltp(pos.token) or 0
+            if ltp == 0: 
+                self.positions.pop(pos.id)
                 return None
+            
+            tick_size = self.book.tick_size(ts)
+            place_params = {}
 
-            bid_price = full_tick['depth']['buy'][0]['price']
+            # Check 1: FVG Sniper (Highest Priority)
+            # If Engine found a Liquidity Vacuum, we MUST use the calculated limit price.
+            if trade_params.get('is_fvg_entry', False):
+                target_limit = trade_params.get('ltp_opt', ltp)
+                limit_price = round(target_limit / tick_size) * tick_size
+                
+                place_params = {
+                    "variety": "regular", "exchange": "NFO", "tradingsymbol": ts,
+                    "transaction_type": "BUY", "quantity": qty,
+                    "product": "MIS", 
+                    "order_type": "LIMIT", "price": limit_price
+                    # Note: No IOC. We want this to sit on the book if price is slightly away.
+                }
+                L.info(f"🎯 FVG SNIPER EXECUTION: {ts} Limit @ {limit_price} (Underlying Target: {trade_params.get('underlying_price'):.2f})")
+                pos.entry_stage = 88 # Special stage to prevent adaptive logic from interfering
 
-            # --- 5. Place Order via OrderActor ---
-            place_params = {
-                "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": ts,
-                "transaction_type": TRANSACTION_TYPE_BUY, "quantity": qty,
-                "product": PRODUCT_MIS,
-                "order_type": ORDER_TYPE_LIMIT, "price": bid_price
-            }
-
-            L.info(f"Sending place order request for {ts} @ {bid_price} (Qty: {qty}) via OrderActor.")
-            reply_q = queue.Queue()
-            self.order_actor.q.put({
-                "type": "place_order",
-                "params": place_params,
-                "reply_q": reply_q
-            })
-
-            oid = None
-            try:
-                resp = reply_q.get(timeout=10.0) 
-                if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
-                    oid = resp['res']['order_id']
-                    L.info(f"OrderActor successfully placed order {oid} for {ts}.")
+            # Check 2: Hyper-Active (Momentum/Gamma Burst)
+            elif strategy_name in [StrategyName.MOMENTUM_IGNITION.value, StrategyName.SLINGSHOT.value, "GammaBurst", "GAMMA_BURST_FLASH"]:
+                # 🚀 IOC Limit @ Ask + Buffer (Pay spread for speed)
+                full_tick = self.prices.get_full_tick(pos.token)
+                if full_tick and full_tick.get('depth') and full_tick['depth'].get('sell'):
+                    ask_price = full_tick['depth']['sell'][0]['price']
                 else:
-                    raise Exception(resp.get('error', 'Unknown error from OrderActor'))
-            except queue.Empty:
-                L.error(f"Timeout waiting for place order response for {ts} from OrderActor.")
-            except Exception as e:
-                L.error(f"Adaptive Entry Stage 1 order placement failed for {ts}. Error: {e}")
+                    ask_price = ltp
 
-            # --- 6. Handle Order Placement Result ---
-            if oid is None:
-                pos.status = PositionStatus.REJECTED.value
-                pos.exit_reason = "BROKER_API_FAILURE"
-                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-                self.positions.pop(pos.id, None) 
-                return None
+                limit_price = round((ask_price * 1.005) / tick_size) * tick_size
+                
+                place_params = {
+                    "variety": "regular", "exchange": "NFO", "tradingsymbol": ts,
+                    "transaction_type": "BUY", "quantity": qty,
+                    "product": "MIS", 
+                    "order_type": "LIMIT", "price": limit_price, 
+                    
+                }
+                L.info(f"⚡ HYPER-ACTIVE ENTRY ({strategy_name}): {ts} IOC @ {limit_price}")
+                pos.entry_stage = 99 # Skip adaptive logic
+
+            # Check 3: Standard/Adaptive (Trend Pullback, Mean Rev)
             else:
-                L.info(f"Placed Adaptive Entry Stage 1 (Passive) order {oid} for {ts} @ {bid_price}")
-                self.positions.pop(temp_id, None) # Remove temp ID
-
-                pos.id = f"LIVE_{oid}"
-                pos.entry_order_id = str(oid)
-                pos.status = PositionStatus.PENDING_ENTRY.value
+                # 🐢 Passive Bid Entry
+                full_tick = self.prices.get_full_tick(pos.token)
+                bid_price = full_tick['depth']['buy'][0]['price'] if full_tick and full_tick.get('depth') else ltp
+                
+                place_params = {
+                    "variety": "regular", "exchange": "NFO", "tradingsymbol": ts,
+                    "transaction_type": "BUY", "quantity": qty,
+                    "product": "MIS", 
+                    "order_type": "LIMIT", "price": bid_price
+                }
+                L.info(f"🐢 ADAPTIVE ENTRY ({strategy_name}): {ts} @ {bid_price}")
                 pos.entry_stage = 1
-                pos.is_entry_order_open = True 
 
-                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-                self.positions[pos.id] = pos # Add back with correct ID
-                self.prices.subscribe([pos.token]) 
-                return pos
+            # 4. Submit to Actor
+            self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+            
+            reply_q = queue.Queue()
+            self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
 
-    # --- Place Brackets (Refactored) ---
+            try:
+                resp = reply_q.get(timeout=2.0)
+                if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
+                    oid = str(resp['res']['order_id'])
+                    self.positions.pop(pos.id) # Remove TEMP
+                    
+                    pos.id = f"LIVE_{oid}"
+                    pos.entry_order_id = oid
+                    pos.status = PositionStatus.PENDING_ENTRY.value
+                    
+                    self.positions[pos.id] = pos
+                    self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                    self.prices.subscribe([pos.token])
+                    return pos
+                else:
+                    raise Exception(resp.get('error'))
+            except Exception as e:
+                L.error(f"Order Placement Failed: {e}")
+                self.positions.pop(pos.id, None)
+                return None
+    
     def place_bracket_orders(self, p: Position) -> bool:
         """Places or modifies TP and SL orders via OrderActor after entry fill."""
         # Define constants locally or globally
@@ -2401,26 +2460,26 @@ class Trader(AbstractTrader):
             return False
 
     # --- Close Position (Refactored) ---
+
     def close_position(self, p: Position, reason: str) -> bool:
-        """Closes a position by cancelling brackets and placing a market order via Actors."""
-        # Define constants locally or globally
-        VARIETY_REGULAR = "regular"
-        TRANSACTION_TYPE_SELL = "SELL"
-        PRODUCT_MIS = "MIS"
-        ORDER_TYPE_MARKET = "MARKET"
-        
+        """
+        Closes position using a 'Market Protection' Limit Order.
+        Places Limit at 5% adverse excursion to ensure fill but prevent freak-trade slippage.
+        """
         with self.lock:
             if p.status in [PositionStatus.PENDING_CLOSURE.value, PositionStatus.CLOSED.value, PositionStatus.PENDING_SL_EXIT.value]:
                 L.debug(f"close_position called for {p.tradingsymbol} ({p.id}) but already closing/closed ({p.status}). Skipping.")
                 return True 
 
+            L.info(f"Closing {p.tradingsymbol} ({reason})...")
+            
+            # 1. Mark status immediately to prevent double submission
             original_status = p.status
             p.status = PositionStatus.PENDING_CLOSURE.value
             p.exit_reason = reason
-            
             self.store_actor.q.put({"type": "upsert_position", "pos": p})
-            L.info(f"Marked {p.tradingsymbol} ({p.id}) as PENDING_CLOSURE. Reason: {reason}.")
 
+            # 2. Cancel existing brackets (Atomic safety)
             self._cancel_all_open_orders_for_pos(p, cancel_entry=(original_status == PositionStatus.PENDING_ENTRY.value))
 
             if p.qty <= 0:
@@ -2431,14 +2490,33 @@ class Trader(AbstractTrader):
                 self.positions.pop(p.id, None) 
                 return True
 
-            # --- Place Market Exit Order via OrderActor ---
+            # Inside close_position...
+    # REPLACE the "Calculate Protection Limit Price" block with this:
+
+            ltp = self.prices.ltp(p.token) or p.entry_price
+            tick_size = self.book.tick_size(p.tradingsymbol)
+            
+            # CHASE LOGIC: 
+            # If buying to close (Short), Bid + 5%
+            # If selling to close (Long), Ask - 5%
+            # This guarantees a fill like a Market Order but prevents "Freak Trade" execution at zero.
+            
+            if p.qty > 0: # We are Long, need to Sell
+                # Target 5% BELOW LTP to ensure fill
+                limit_price = round((ltp * 0.95) / tick_size) * tick_size
+                transaction_type = "SELL"
+            else: # We are Short, need to Buy
+                # Target 5% ABOVE LTP
+                limit_price = round((ltp * 1.05) / tick_size) * tick_size
+                transaction_type = "BUY"
+
             place_params = {
-                "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": p.tradingsymbol, 
-                "transaction_type": TRANSACTION_TYPE_SELL, "quantity": p.qty, 
-                "product": PRODUCT_MIS, "order_type": ORDER_TYPE_MARKET
+                "variety": "regular", "exchange": "NFO", "tradingsymbol": p.tradingsymbol, 
+                "transaction_type": transaction_type, "quantity": abs(p.qty), 
+                "product": "MIS", "order_type": "LIMIT", "price": limit_price
             }
             
-            L.info(f"Sending MARKET exit order request for {p.qty} of {p.tradingsymbol} ({p.id}) via OrderActor. Reason: {reason}.")
+            L.info(f"Sending PROTECTION LIMIT exit order for {p.qty} of {p.tradingsymbol} ({p.id}) via OrderActor. Reason: {reason}.")
             reply_q = queue.Queue()
             self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
 
@@ -2447,21 +2525,20 @@ class Trader(AbstractTrader):
                 resp = reply_q.get(timeout=10.0) 
                 if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
                     oid = resp['res']['order_id']
-                    L.info(f"Market exit order {oid} placed successfully via OrderActor for {p.tradingsymbol}.")
-                else: raise Exception(resp.get('error', 'Unknown error placing market exit'))
-            except queue.Empty: L.critical(f"Timeout waiting for MARKET exit order response for {p.tradingsymbol}!")
-            except Exception as e: L.critical(f"MARKET EXIT ORDER FAILED for {p.tradingsymbol}. Error: {e}")
+                    L.info(f"Exit order {oid} placed successfully via OrderActor for {p.tradingsymbol}.")
+                else: raise Exception(resp.get('error', 'Unknown error placing exit'))
+            except queue.Empty: L.critical(f"Timeout waiting for EXIT order response for {p.tradingsymbol}!")
+            except Exception as e: L.critical(f"EXIT ORDER FAILED for {p.tradingsymbol}. Error: {e}")
 
             if oid is None:
-                send_alert(f"🔥 CRITICAL: FAILED TO PLACE MARKET EXIT for {p.tradingsymbol} ({p.id}). POSITION IS STILL OPEN. Manual intervention required!", "critical")
+                send_alert(f"🔥 CRITICAL: FAILED TO PLACE EXIT for {p.tradingsymbol} ({p.id}). POSITION IS STILL OPEN. Manual intervention required!", "critical")
                 p.exit_reason = reason + "_EXIT_API_FAIL" # Keep PENDING_CLOSURE
                 self.store_actor.q.put({"type": "upsert_position", "pos": p})
                 return False 
             else:
                 p.exit_order_id = str(oid)
-                # Status remains PENDING_CLOSURE until fill confirmation
                 self.store_actor.q.put({"type": "upsert_position", "pos": p})
-                return True 
+                return True
 
     # --- Cancel Pending Entry (Refactored) ---
     def cancel_pending_entry(self, p: Position) -> bool:
@@ -2534,75 +2611,39 @@ class Trader(AbstractTrader):
 
     # --- Modify SL (Refactored - Copied from previous correct version) ---
     def modify_sl(self, p: Position, new_trigger: float):
-        """Modifies SL using OrderActor (Cancel-Modify-Replace logic)."""
-        # Define constants locally or globally
-        VARIETY_REGULAR = "regular"
-        TRANSACTION_TYPE_SELL = "SELL"
-        PRODUCT_MIS = "MIS"
-        ORDER_TYPE_SLM = "SL-M"
-        
-        tick_size = self.book.tick_size(p.tradingsymbol)
-        new_trigger_rounded = round(new_trigger / tick_size) * tick_size
+        with self.lock:
+            if not p.slm_order_id: return
+            
+            tick_size = self.book.tick_size(p.tradingsymbol)
+            new_trigger = round(new_trigger / tick_size) * tick_size
+            
+            if new_trigger <= p.sl_price: return
 
-        if new_trigger_rounded <= p.sl_price or abs(new_trigger_rounded - p.sl_price) < tick_size:
-             return # No change or change too small
-        
-        old_sl = p.sl_price
-        old_slm_id = p.slm_order_id
-
-        # --- 1. Place new SL-M order first ---
-        L.info(f"Attempting to trail SL for {p.tradingsymbol} to {new_trigger_rounded:.2f}. Placing new order...")
-        place_params = {
-            "variety": VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": p.tradingsymbol,
-            "transaction_type": TRANSACTION_TYPE_SELL, "quantity": p.qty, 
-            "product": PRODUCT_MIS, "order_type": ORDER_TYPE_SLM, 
-            "trigger_price": new_trigger_rounded
-        }
-        
-        reply_q = queue.Queue()
-        self.order_actor.q.put({"type": "place_order", "params": place_params, "reply_q": reply_q})
-        
-        new_slm_id = None
-        try:
-            resp = reply_q.get(timeout=10.0) 
-            if resp['ok'] and resp['res'] and 'order_id' in resp['res']:
-                new_slm_id = str(resp['res']['order_id'])
-            else: raise Exception(resp.get('error', 'Unknown error'))
-        except Exception as e:
-            L.error(f"Failed to place NEW SL-M order for {p.tradingsymbol} trail. Aborting trail. Old SL {old_slm_id} active. Error: {e}")
-            return # Old SL remains active
-
-        L.info(f"Successfully placed new SL order {new_slm_id} for {p.tradingsymbol}. Cancelling old order {old_slm_id}.")
-
-        # --- 2. Cancel the old SL order ---
-        cancel_success = True
-        if old_slm_id:
-            cancel_reply_q = queue.Queue()
+            # 1. Send Request with Reply Queue
+            reply_q = queue.Queue()
+            L.info(f"⚡ Modifying SL for {p.tradingsymbol} to {new_trigger}...")
+            
             self.order_actor.q.put({
-                "type": "cancel_order",
-                "params": {"variety": VARIETY_REGULAR, "order_id": old_slm_id},
-                "reply_q": cancel_reply_q
+                "type": "modify_order",
+                "params": {
+                    "variety": "regular",
+                    "order_id": str(p.slm_order_id),
+                    "trigger_price": new_trigger
+                },
+                "reply_q": reply_q 
             })
+
+            # 2. Wait for Acknowledgement (The Pessimistic Check)
             try:
-                cancel_resp = cancel_reply_q.get(timeout=10.0)
-                if not cancel_resp['ok']: raise Exception(cancel_resp.get('error', 'Unknown error'))
-                L.info(f"Successfully cancelled old SL order {old_slm_id}.")
-            except Exception as e:
-                # --- !! CRITICAL FAILURE !! ---
-                L.critical(f"!! DOUBLE SL DANGER for {p.tradingsymbol} !! Failed to cancel old SL {old_slm_id} after placing new SL {new_slm_id}. Error: {e}")
-                send_alert(f"🔥 CRITICAL: DOUBLE SL {p.tradingsymbol}. Old SL {old_slm_id} FAILED TO CANCEL. New SL {new_slm_id} active.", "critical")
-                cancel_success = False
-
-                self.close_position(p, "SAFE_MODE_DOUBLE_SL")
-                return
-
-        # --- 3. Success (or old order cancel failed but we proceed with new SL) ---
-        if cancel_success: # Only update state if cancel succeeded or wasn't needed
-            p.sl_price = new_trigger_rounded
-            p.slm_order_id = new_slm_id
-            self.store_actor.q.put({"type": "upsert_position", "pos": p})
-            L.info(f"Trailed SL for {p.tradingsymbol} from {old_sl:.2f} to {new_trigger_rounded:.2f} (New ID: {new_slm_id})")
-
+                resp = reply_q.get(timeout=2.0) # Fast timeout
+                if resp['ok']:
+                    # ...
+                    p.sl_price = new_trigger
+                    self.store_actor.q.put({"type": "upsert_position", "pos": p})
+                else:
+                    L.error(f"❌ Broker REJECTED SL modify: {resp.get('error')}")
+            except queue.Empty:
+                L.error(f"❌ Timeout waiting for SL modify ack on {p.tradingsymbol}. Keeping old SL.")
     # --- Execute Simulated SL (No Change - Only for PaperTrader) ---
     def execute_simulated_sl(self, p: Position) -> bool:
         L.critical("execute_simulated_sl called on LIVE trader. This should not happen.")
@@ -2714,735 +2755,479 @@ class Trader(AbstractTrader):
 # ==================================================================================================
 
 class RiskManager:
-    """Handles all logic related to P&L, drawdown, position sizing, and portfolio greeks."""
-    def __init__(self,
-                 engine: 'Engine',
-                 trader: AbstractTrader,
-                 book: InstrumentBook,
-                 prices: PriceBus,
-                 store_actor: StoreActor,
-                 config: Dict):
-        self.strategy_weights: Dict[str, float] = {}
+    """Master Risk Manager: Async Checks, Circuit Breaker, Equity Curve, Calmar."""
+    def __init__(self, engine: 'Engine', trader: AbstractTrader, book: InstrumentBook, prices: PriceBus, store_actor: StoreActor, config: Dict):
         self.engine = engine
         self.trader = trader
         self.book = book
         self.prices = prices
         self.store_actor = store_actor
+        self.config = config
         self.trading_config = config["trading"]
-        self.technical_config = config["technical"]
-        self.timings_config = config["timings"]
-        self.lock = None
-        self.lock = threading.RLock()
-
-        self.portfolio_greeks: Dict[str, float] = {"net_delta": 0.0, "net_vega": 0.0, "net_gamma": 0.0, "net_theta": 0.0}
-        
-        self.consecutive_losses, self.risk_factor = 0, 1.0
-        self.dynamic_account_equity = float(os.environ.get("ACCOUNT_EQUITY", self.trading_config.get("account_equity", 100000.0)))
-        self.daily_high_water_mark = self.dynamic_account_equity
-        self.performance_score = 0
-        self.weekly_high_water_mark = self.dynamic_account_equity
-        self.in_weekly_drawdown_lock = False
-        self.last_unrealized_pnl = 0.0
-        self.max_daily_drawdown_pct = self.trading_config["max_daily_drawdown_pct"]
-        self.account_equity_base = self.dynamic_account_equity
         self.portfolio_limits = self.trading_config.get("portfolio_limits", {})
         
-        self.strategy_weights: Dict[str, float] = {} # strategy_name -> weight (e.g., 1.0)
+        self.dynamic_account_equity = self.trading_config.get("account_equity", 100000.0)
+        self.daily_high_water_mark = self.dynamic_account_equity
+        self.weekly_high_water_mark = self.dynamic_account_equity
+        self.account_equity_base = self.dynamic_account_equity
+        
+        self.performance_score = 0
+        self.consecutive_losses, self.risk_factor = 0, 1.0
+        self.portfolio_greeks: Dict[str, float] = {"net_delta": 0.0, "net_vega": 0.0, "net_gamma": 0.0, "net_theta": 0.0}
+        self.last_unrealized_pnl = 0.0
+        
+        self.last_equity_check = time.time()
+        self.last_equity_value = self.dynamic_account_equity
+        self.circuit_breaker_triggered = False
+        self.lock = threading.RLock()
+        
+        self.strategy_weights: Dict[str, float] = {}
         self.strategy_perf_lookback_days = self.trading_config.get("strategy_perf_lookback_days", 7)
         self.strategy_weight_min = self.trading_config.get("strategy_weight_min", 0.5)
         self.strategy_weight_max = self.trading_config.get("strategy_weight_max", 1.5)
+        
+        # Start Async Worker
+        threading.Thread(target=self._async_margin_worker, daemon=True, name="RiskMarginWorker").start()
 
-    def reset_daily_state(self, last_trading_day: Optional[date]):
-        L.info("RiskManager resetting daily state.")
-        now = now_ist()
-        if last_trading_day and last_trading_day.weekday() > now.date().weekday():
-            L.info("New week detected. Resetting weekly high water mark and drawdown lock.")
-            self.weekly_high_water_mark = self.dynamic_account_equity
-            self.in_weekly_drawdown_lock = False
-            
-            # --- FIXED: Use StoreActor ---
-            self.store_actor.q.put({
-                "type": "set_kv",
-                "key": "weekly_hwm",
-                "value": str(self.weekly_high_water_mark)
-            })
-            # --- END FIX ---
+    def _async_margin_worker(self):
+        while True:
+            if not self.engine or not hasattr(self.engine, 'trader') or not self.engine.trader:
+                time.sleep(1); continue
+            try:
+                reply_q = queue.Queue()
+                if self.engine.trader.order_actor:
+                    self.engine.trader.order_actor.q.put({"type": "margins", "reply_q": reply_q}, timeout=1.0)
+                    resp = reply_q.get(timeout=5.0)
+                    if resp['ok'] and resp['res'] and 'equity' in resp['res']:
+                        with self.lock: self.dynamic_account_equity = float(resp['res']['equity']['net'])
+            except Exception: pass
+            time.sleep(60)
 
-        if last_trading_day:
-            # --- FIXED: Use StoreActor ---
-            self.store_actor.q.put({
-                "type": "set_kv",
-                "key": f"daily_pnl_{last_trading_day}",
-                "value": str(self.trader.daily_realized_pnl)
-            })
-            # --- END FIX ---
-
-        self.update_dynamic_equity() # This function is now fixed to use actors
-        self.trader.daily_realized_pnl = 0.0
-
+    def check_circuit_breaker(self):
+        if self.circuit_breaker_triggered: return
         with self.lock:
-            self.portfolio_greeks = {"net_delta": 0.0, "net_vega": 0.0, "net_gamma": 0.0, "net_theta": 0.0}
+            now = time.time()
+            if now - self.last_equity_check > 10:
+                curr_eq = self.dynamic_account_equity + self.trader.unrealized_pnl()
+                pct = (curr_eq - self.last_equity_value) / self.last_equity_value if self.last_equity_value else 0
+                if pct < -0.02: 
+                    L.critical(f"⚡ CIRCUIT BREAKER: Dropped {pct*100:.2f}% in 10s.")
+                    self.trigger_panic_exit()
+                self.last_equity_value = curr_eq; self.last_equity_check = now
 
-        self.consecutive_losses = 0
-        self.risk_factor = 1.0
-        self.daily_high_water_mark = self.dynamic_account_equity
-        self.performance_score = 0
+    def trigger_panic_exit(self):
+        self.circuit_breaker_triggered = True
+        self.engine.master_halt = True
+        if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
+        self.engine.trader.order_actor.q.put({"type": "cancel_all_orders", "params": {}})
+        with self.trader.lock:
+            for p in list(self.trader.positions.values()):
+                if p.status not in ["CLOSED"]:
+                    self.engine.trader.order_actor.q.put({
+                        "type": "place_order", 
+                        "params": {"variety": "regular", "exchange": "NFO", "tradingsymbol": p.tradingsymbol, "transaction_type": "SELL" if p.qty > 0 else "BUY", "quantity": abs(p.qty), "product": "MIS", "order_type": "MARKET"}
+                    })
 
-        L.info(f"RiskManager state reset. Equity: ₹{self.dynamic_account_equity:,.2f}, Daily HWM: {self.daily_high_water_mark:,.2f}")
-
-    def load_persistent_state(self, trading_day: date):
-        # --- FIXED: Use StoreActor (Blocking Read) ---
-        weekly_hwm_str = str(self.dynamic_account_equity)
-        pnl_str = "0.0"
-        
-        try:
-            reply_q_hwm = queue.Queue()
-            self.store_actor.q.put({
-                "type": "get_kv",
-                "key": "weekly_hwm",
-                "default": str(self.dynamic_account_equity),
-                "reply_q": reply_q_hwm
-            })
-            resp_hwm = reply_q_hwm.get(timeout=10.0)
-            if resp_hwm['ok']:
-                weekly_hwm_str = resp_hwm['res']
-
-            reply_q_pnl = queue.Queue()
-            self.store_actor.q.put({
-                "type": "get_kv",
-                "key": f"daily_pnl_{trading_day}",
-                "default": "0.0",
-                "reply_q": reply_q_pnl
-            })
-            resp_pnl = reply_q_pnl.get(timeout=10.0)
-            if resp_pnl['ok']:
-                pnl_str = resp_pnl['res']
-
-        except queue.Empty:
-            L.error("Timeout loading persistent state from StoreActor.")
-        except Exception as e:
-            L.error(f"Error loading persistent state from StoreActor: {e}")
-        
-        self.weekly_high_water_mark = float(weekly_hwm_str)
-        self.trader.daily_realized_pnl = float(pnl_str)
-        # --- END FIX ---
-
-        self.daily_high_water_mark = self.dynamic_account_equity + self.trader.daily_realized_pnl
-        self.weekly_high_water_mark = max(self.weekly_high_water_mark, self.daily_high_water_mark)
-        L.info(f"RiskManager state loaded. Daily PnL: {self.trader.daily_realized_pnl}. Daily HWM: {self.daily_high_water_mark}. Weekly HWM: {self.weekly_high_water_mark}")
-        
     def _calculate_calmar_ratio(self, pnl_series: pd.Series) -> float:
-        """Helper to calculate the Calmar Ratio from a daily PnL series."""
-        if pnl_series.empty or len(pnl_series) < 2:
-            return 0.0 # Not enough data
+        if pnl_series.empty or len(pnl_series) < 2: return 0.0
+        daily_ret = pnl_series / self.account_equity_base
+        cum_ret = (1 + daily_ret).cumprod()
+        dd = (cum_ret - cum_ret.cummax()).min()
+        return ((cum_ret.iloc[-1] - 1) / abs(dd)) if dd != 0 else 0.0
 
-        # Use the account's base equity for return calculation
-        capital = self.account_equity_base 
-        if capital == 0: capital = 100000.0 # Failsafe
-            
-        daily_returns_pct = pnl_series / capital
-        
-        # Calculate cumulative return
-        cumulative_return = (1 + daily_returns_pct).cumprod()
-        
-        # Calculate total annualized return
-        total_days = (cumulative_return.index[-1] - cumulative_return.index[0]).days
-        if total_days < 1: total_days = 1
-        years = max(1.0, total_days / 365.25) # Ensure at least 1 year for non-fractional power
-            
-        total_return = (cumulative_return.iloc[-1]**(1/years)) - 1
-        
-        if total_return <= 0:
-            return 0.0 # We don't reward losing strategies
-
-        # Calculate Max Drawdown
-        peak = cumulative_return.cummax()
-        drawdown = (cumulative_return - peak) / peak
-        max_drawdown = abs(drawdown.min())
-
-        if max_drawdown == 0:
-            return 100.0 # Arbitrarily high score if positive return and no drawdown
-            
-        calmar = total_return / max_drawdown
-        
-        # Return the positive Calmar, clamped at 0
-        return max(0.0, calmar)
-        
-        
     def _update_strategy_weights(self):
-        L.info("Updating dynamic strategy weights (Risk-Adjusted)...")
-        
-        # --- 1. Get PnL data from StoreActor (No change here) ---
-        df = pd.DataFrame() # Default to empty df
         try:
             reply_q = queue.Queue()
-            self.store_actor.q.put({
-                "type": "get_strategy_performance",
-                "lookback_days": self.strategy_perf_lookback_days,
-                "reply_q": reply_q
-            })
-            resp = reply_q.get(timeout=10.0)
-            if resp['ok']:
+            self.store_actor.q.put({"type": "get_strategy_performance", "lookback_days": 15, "reply_q": reply_q})
+            resp = reply_q.get(timeout=5)
+            if resp['ok'] and not resp['res'].empty:
                 df = resp['res']
+                df['close_time'] = pd.to_datetime(df['close_time'])
+                metrics = df.set_index('close_time').groupby('strategy_name')['pnl'].resample('D').sum().groupby('strategy_name').apply(self._calculate_calmar_ratio)
+                metrics = metrics[metrics > 0]
+                if not metrics.empty:
+                    min_v, max_v = metrics.min(), metrics.max()
+                    self.strategy_weights = {k: 0.5 + ((v - min_v)/(max_v - min_v) if max_v > min_v else 1.0) for k, v in metrics.items()}
+                    L.info(f"Strategy Weights: {self.strategy_weights}")
+        except Exception: pass
+
+    def calculate_position_size(self, token: int, risk_per_lot: float, vega_per_lot: float, confidence_score: float, strategy_name: str) -> int:
+        if risk_per_lot <= 0: return 0
+        
+        now_time = datetime.now(tz=IST).time()
+        time_scalar = 1.0
+        
+        # Define Lunch Lull (10:30 AM to 12:45 PM IST)
+        kill_zone_start = dtime(10, 30)
+        kill_zone_end = dtime(12, 45)
+        
+        vix_val = self.prices.ltp(self.engine.vix_token) or 15.0
+        
+        # Logic: If in Lunch AND VIX is low (<18), reduce size by 75%. 
+        # If VIX is high (>18), market is active, reduce by 20%.
+        if kill_zone_start <= now_time <= kill_zone_end:
+            if vix_val < 18.0: 
+                time_scalar = 0.25 
+                L.debug(f"💤 Kill Zone Active (Lunch + Low VIX). Scaling down 75%.")
             else:
-                L.error(f"Failed to get strategy performance from StoreActor: {resp.get('error')}")
-        except queue.Empty:
-            L.error("Timeout getting strategy performance from StoreActor.")
-        except Exception as e:
-            L.error(f"Error getting strategy performance from StoreActor: {e}")
-
-        if df.empty:
-            L.warning("No strategy performance data found. Using default weights.")
-            all_strategy_names = [name.value for name in StrategyName]
-            self.strategy_weights = {name: 1.0 for name in all_strategy_names}
-            return
-
-        # --- 2. REFACTOR: Calculate Calmar Ratio instead of PnL Sum ---
+                time_scalar = 0.8 
         
-        # Convert to datetime and get daily PnL series for each strategy
-        df['close_time'] = pd.to_datetime(df['close_time'])
-        df = df.set_index('close_time')
-        daily_pnl = df.groupby('strategy_name')['pnl'].resample('D').sum()
-
-        # Calculate Calmar for each strategy using the new helper
-        # This returns a pd.Series: index=strategy_name, value=calmar_ratio
-        strategy_metrics = daily_pnl.groupby('strategy_name').apply(self._calculate_calmar_ratio)
+        # Equity Curve Adjustment
+        equity_curve_mult = 1.25 if self.performance_score >= 3 else 0.5 if ((self.daily_high_water_mark - self.dynamic_account_equity)/self.daily_high_water_mark) > 0.015 else 1.0
         
-        L.info(f"Calculated Strategy Risk/Return Metrics (Calmar): \n{strategy_metrics}")
+        strat_weight = self.strategy_weights.get(strategy_name, 1.0)
+        base_risk = self.dynamic_account_equity * (self.trading_config["risk_tiers"]["standard"] / 100.0)
         
-        # --- 3. REFACTOR: Normalize based on metrics, not PnL ---
-        
-        # Filter out non-performing (0 or negative) metrics
-        strategy_metrics = strategy_metrics[strategy_metrics > 0]
-        
-        if strategy_metrics.empty:
-            L.warning("All strategies have zero or negative risk-adjusted performance. Using default weights.")
-            all_strategy_names = [name.value for name in StrategyName]
-            self.strategy_weights = {name: 1.0 for name in all_strategy_names}
-            return
-
-        metrics_min = strategy_metrics.min()
-        metrics_max = strategy_metrics.max()
-        
-        if metrics_max == metrics_min:
-            # All strategies have same positive score, set all to max weight
-            weights = pd.Series(self.strategy_weight_max, index=strategy_metrics.index)
-        else:
-            # Normalize from 0 to 1
-            normalized_metrics = (strategy_metrics - metrics_min) / (metrics_max - metrics_min)
-            # Scale from min_weight to max_weight
-            weights = self.strategy_weight_min + (normalized_metrics * (self.strategy_weight_max - self.strategy_weight_min))
-
-        # Convert to dictionary
-        final_weights_dict = weights.to_dict()
-        
-        # --- 4. Add back losing strategies at minimum weight ---
-        # Ensure all known strategies are in the final map
-        all_strategy_names = [name.value for name in StrategyName]
-        for name in all_strategy_names:
-            if name not in final_weights_dict:
-                # If a strategy had 0 or negative Calmar, assign it the minimum weight
-                final_weights_dict[name] = self.strategy_weight_min
-
-        self.strategy_weights = final_weights_dict
-        L.info(f"New strategy weights (Calmar-based): {self.strategy_weights}")
-
-    def calculate_position_size(self, underlying_token: int, risk_per_lot: float, vega_per_lot: float,confidence_score: float,strategy_name: str) -> int:
-        if risk_per_lot <= 0:
-            return 0
-        risk_tiers = self.trading_config["risk_tiers"]
-
-        is_expiry_day = self.book.find_nearest_expiry_date(_get_underlying(self.book.get_symbol(underlying_token))) == date.today()
-        expiry_day_risk_factor = 1.0
-        if is_expiry_day and self.trading_config.get("expiry_day_protocol_active", True):
-            expiry_day_risk_factor = self.trading_config.get("expiry_day_risk_reduction_factor", 0.5)
-            L.warning(f"EXPIRY DAY PROTOCOL: Applying risk reduction factor of {expiry_day_risk_factor}.")
-
-        if self.in_weekly_drawdown_lock:
-            active_risk_pct = risk_tiers["defensive"]
-            L.warning("Weekly drawdown lock is active. Using DEFENSIVE risk tier.")
-        elif self.performance_score <= -2:
-            active_risk_pct = risk_tiers["defensive"]
-        elif self.performance_score >= 2:
-            active_risk_pct = risk_tiers["aggressive"]
-        else:
-            active_risk_pct = risk_tiers["standard"]
-
-        df_1m = self.engine.get_ohlc(underlying_token, 1)
-        if len(df_1m) < 21:
-            return 1
-
-        atr = df_1m.ta.atr(20).iloc[-1]
-        spot = df_1m.iloc[-1]['close']
-        vol_pct = atr / spot if spot > 0 else 0
-        base_vol = 0.005
-        vol_adjustment = min(1.5, max(0.5, base_vol / vol_pct if vol_pct > 0 else 1.0))
-
-        vix_ltp = self.prices.ltp(self.engine.vix_token)
-        vix_params = self.trading_config["vix_adjustment"]
-        vix_risk_factor = 1.0
-        if vix_ltp:
-            if vix_ltp > vix_params["high_threshold"]:
-                vix_risk_factor = vix_params["high_factor"]
-            elif vix_ltp < vix_params["low_threshold"]:
-                vix_risk_factor = vix_params["low_factor"]
-
-        time_of_day_multiplier = self._get_time_of_day_risk_multiplier()
-
-        chaos_risk_factor = 1.0
-        is_agnostic = strategy_name in [s.name.value for s in self.engine.strategies.get("AGNOSTIC", [])]
-
-        if self.engine.regime == Regime.CHAOS:
-            if not is_agnostic:
-                chaos_risk_factor = self.trading_config.get("chaos_risk_reduction_factor", 0.25)
-                L.warning(f"CHAOS regime active. Applying risk reduction factor of {chaos_risk_factor} to non-agnostic strategy.")
-            else:
-                L.info(f"Sizing: Agnostic strategy ({strategy_name}) detected. Skipping CHAOS risk penalty.")
-
-        final_risk_factor = self.risk_factor * vol_adjustment * vix_risk_factor * expiry_day_risk_factor * time_of_day_multiplier * chaos_risk_factor
-        allowed_risk = self.dynamic_account_equity * (active_risk_pct / 100.0) * final_risk_factor
-
-        slippage_factor = self.trading_config.get("sl_slippage_factor_pct", 20.0) / 100.0
-        
-        # --- NEW: Confluence Score Sizing (from config) ---
-        standard_score = self.trading_config.get("standard_trade_score", 2.0)
-        sizing_floor = self.trading_config.get("regime_confidence_sizing_floor", 0.5)
-        sizing_cap = self.trading_config.get("regime_confidence_sizing_cap", 1.5)
-        
-        # Calculate raw multiplier based on signal's confluence score
-        raw_multiplier = confidence_score / standard_score
-        
-        # Clamp the multiplier using the floor and cap from config.json
-        bet_sizing_multiplier = max(sizing_floor, min(sizing_cap, raw_multiplier))
-        
-        L.info(f"Confluence Sizing: Score={confidence_score:.2f}, Raw Multi={raw_multiplier:.2f}, "
-               f"Clamped Multi={bet_sizing_multiplier:.2f} (Floor: {sizing_floor}, Cap: {sizing_cap})")
-
-        # --- NEW: Dynamic Strategy Weighting ---
-        # (This implements Change #3)
-        strategy_weight = self.strategy_weights.get(strategy_name, 1.0) # Default to 1.0
-        L.info(f"Strategy Weighting: Name={strategy_name}, Weight={strategy_weight:.2f}")
-
-        # --- Apply new multipliers to final_risk_factor ---
-        final_risk_factor = (
-            self.risk_factor * vol_adjustment * vix_risk_factor * expiry_day_risk_factor * time_of_day_multiplier * chaos_risk_factor *
-            bet_sizing_multiplier * # <-- APPLIED
-            strategy_weight          # <-- APPLIED
-        )
-        
-        allowed_risk = self.dynamic_account_equity * (active_risk_pct / 100.0) * final_risk_factor
-        actual_expected_risk_per_lot = risk_per_lot * (1.0 + slippage_factor)
-        if actual_expected_risk_per_lot <= 0:
-            L.warning("Position Size Calc: Actual expected risk per lot is zero or negative. Aborting.")
-            return 0
-
-        calculated_lots = int(math.floor(allowed_risk / actual_expected_risk_per_lot))
-        L.info(f"Position Size Calc: PerfScore={self.performance_score}, RiskTier={active_risk_pct}%, AllowedRisk={allowed_risk:.2f}, Risk/Lot (adj): {actual_expected_risk_per_lot:.2f}, Lots={calculated_lots}")
-        return max(0, min(calculated_lots, self.trading_config['max_lots_per_trade']))
+        allowed_risk = base_risk * self.risk_factor * equity_curve_mult * strat_weight * (confidence_score / 2.0)
+        return max(0, min(int(allowed_risk / (risk_per_lot * 1.2)), self.trading_config['max_lots_per_trade']))
 
     def risk_ok(self, hypothetical_params: Dict) -> bool:
-        with self.engine.master_lock:
-            if self.engine.master_halt:
-                return False
-
-            lot_size = self.book.lot_size(_get_underlying(hypothetical_params['opt']['tradingsymbol']))
-            if not lot_size:
-                return False
-
-            with self.lock:
-                hypothetical_qty = hypothetical_params['lots'] * lot_size
-                post_trade_delta = self.portfolio_greeks["net_delta"] + (hypothetical_params['greeks']['delta'] * hypothetical_qty)
-                post_trade_vega = self.portfolio_greeks["net_vega"] + (hypothetical_params['greeks']['vega'] * hypothetical_qty)
-                max_delta = self.portfolio_limits.get("max_portfolio_net_delta")
-                max_vega = self.portfolio_limits.get("max_portfolio_net_vega")
-
-                if max_delta and abs(post_trade_delta) > max_delta:
-                    L.warning(f"Trade REJECTED: Breach max delta. Post-trade: {post_trade_delta:.0f}, Limit: {max_delta}")
-                    return False
-                if max_vega and post_trade_vega > max_vega:
-                    L.warning(f"Trade REJECTED: Breach max vega. Post-trade: {post_trade_vega:.0f}, Limit: {max_vega}")
-                    return False
-                post_trade_theta = self.portfolio_greeks["net_theta"] + (hypothetical_params['greeks']['theta'] * hypothetical_qty)
-                max_neg_theta = self.portfolio_limits.get("max_portfolio_negative_theta")
-                
-                if max_neg_theta and post_trade_theta < -max_neg_theta:
-                    L.warning(f"Trade REJECTED: Breach max negative theta. Post-trade: {post_trade_theta:.0f}, Limit: {-max_neg_theta}")
-                    return False
-
-            current_equity = self.dynamic_account_equity + self.trader.daily_realized_pnl + self.last_unrealized_pnl
-
-            # Weekly Drawdown Check
-            weekly_dd_limit_pct = self.trading_config.get("weekly_drawdown_pct_limit", 5.0)
-            weekly_dd_limit_abs = self.weekly_high_water_mark * (weekly_dd_limit_pct / 100.0)
-            weekly_floor = self.weekly_high_water_mark - weekly_dd_limit_abs
-
-            if current_equity < weekly_floor:
-                if not self.in_weekly_drawdown_lock:
-                    send_alert(f"⛔ WEEKLY DD LIMIT HIT. Peak: {self.weekly_high_water_mark:.2f}, Current: {current_equity:.2f} (Floor: {weekly_floor:.2f}). Entering DEFENSIVE mode.", "critical")
-                    self.in_weekly_drawdown_lock = True
-
-            # Daily Drawdown Check
-            realized_pnl = self.trader.daily_realized_pnl
-            profit_lock_floor = -float('inf')
-
-            profit_lock_config = self.trading_config.get('profit_lock_in', {})
-            if realized_pnl > profit_lock_config.get('min_profit_trigger', float('inf')):
-                profit_at_risk_pct = profit_lock_config.get("pct_to_risk", 40.0) / 100.0
-                profit_at_risk = realized_pnl * profit_at_risk_pct
-                profit_lock_floor = self.daily_high_water_mark - profit_at_risk
-
-            static_dd_limit = self.daily_high_water_mark * (self.max_daily_drawdown_pct / 100.0)
-            static_floor = self.daily_high_water_mark - static_dd_limit
-
-            final_floor = max(static_floor, profit_lock_floor)
-
-            daily_dd_pct = (self.daily_high_water_mark - current_equity) / self.daily_high_water_mark * 100 if self.daily_high_water_mark > 0 else 0
-            if G_DAILY_DRAWDOWN_PCT:
-                G_DAILY_DRAWDOWN_PCT.set(daily_dd_pct)
-
-            if current_equity < final_floor:
-                send_alert(f"⛔ DD LIMIT HIT. HALTING. Peak Equity: {self.daily_high_water_mark:.2f}, Current: {current_equity:.2f} (Floor: {final_floor:.2f})", "critical")
-                self.engine.master_halt = True
-                if G_HALTED_STATUS:
-                    G_HALTED_STATUS.set(1)
-
-                with self.trader.lock:
-                    positions_to_close = [p for p in list(self.trader.positions.values()) if p.status not in [PositionStatus.CLOSED.value, PositionStatus.PENDING_CLOSURE.value]]
-                for p in positions_to_close:
-                    self.trader.close_position(p, "DD_LIMIT_HIT")
-                return False
+        with self.lock:
+            if self.circuit_breaker_triggered or self.engine.master_halt: return False
+            if ((self.daily_high_water_mark - self.dynamic_account_equity)/self.daily_high_water_mark * 100) > self.trading_config["max_daily_drawdown_pct"]: return False
             return True
-
+            
     def update_performance_metrics(self, pnl: float):
         with self.engine.master_lock:
             current_equity = self.dynamic_account_equity + self.trader.daily_realized_pnl + self.last_unrealized_pnl
             self.daily_high_water_mark = max(self.daily_high_water_mark, current_equity)
             self.weekly_high_water_mark = max(self.weekly_high_water_mark, self.daily_high_water_mark)
 
-            if pnl > 0:
-                self.performance_score = min(4, self.performance_score + 1)
-            else:
-                self.performance_score = max(-4, self.performance_score - 2)
+            if pnl > 0: self.performance_score = min(4, self.performance_score + 1)
+            else: self.performance_score = max(-4, self.performance_score - 2)
 
-            if pnl < 0:
-                self.consecutive_losses += 1
-            else:
-                self.consecutive_losses = 0
+            if pnl < 0: self.consecutive_losses += 1
+            else: self.consecutive_losses = 0
 
             loss_streak_config = self.trading_config["consecutive_loss_adjustment"]
             self.risk_factor = max(loss_streak_config["min_factor"], 1.0 - loss_streak_config["reduction_per_loss"] * self.consecutive_losses)
-
-            L.info(f"PnL: {pnl:.2f}, PerfScore: {self.performance_score}, ConsecLosses: {self.consecutive_losses}, RiskFactor: {self.risk_factor:.2f}")
-            self.store_actor.q.put({
-                "type": "set_kv", 
-                "key": f"daily_pnl_{self.engine.last_trading_day}", 
-                "value": str(self.trader.daily_realized_pnl)
-            })
-            self.store_actor.q.put({
-                "type": "set_kv", 
-                "key": "weekly_hwm", 
-                "value": str(self.weekly_high_water_mark)
-            })
-
-    def update_dynamic_equity(self):
-        if PAPER_TRADING:
-            self.dynamic_account_equity = self.account_equity_base + self.trader.daily_realized_pnl
-            L.info(f"Paper equity updated to: {self.dynamic_account_equity:,.2f}")
-            return
-        
-        # --- FIXED: Use OrderActor (Blocking Read) ---
-        try:
-            reply_q = queue.Queue()
-            # We access the order_actor via engine.trader
-            self.engine.trader.order_actor.q.put({
-                "type": "margins",
-                "reply_q": reply_q
-            })
             
-            margins = None
-            resp = reply_q.get(timeout=10.0)
-            if resp['ok']:
-                margins = resp['res']
-            else:
-                L.error(f"Failed to get margins from OrderActor: {resp.get('error')}")
+            self.store_actor.q.put({"type": "set_kv", "key": f"daily_pnl_{self.engine.last_trading_day}", "value": str(self.trader.daily_realized_pnl)})
+            self.store_actor.q.put({"type": "set_kv", "key": "weekly_hwm", "value": str(self.weekly_high_water_mark)})
 
-            if margins and 'equity' in margins and margins['equity'].get('net'):
-                self.dynamic_account_equity = float(margins['equity']['net'])
-                L.info(f"Dynamic account equity updated to: {self.dynamic_account_equity:,.2f}")
-        
-        except queue.Empty:
-            L.warning("Timeout updating dynamic account equity.")
-        except Exception as e:
-            L.warning(f"Could not update dynamic account equity: {e}")
-        # --- END FIX ---
+    # In class RiskManager, update reconcile_broker_pnl
 
     def reconcile_broker_pnl(self):
-        if PAPER_TRADING:
-            return
+        if PAPER_TRADING: return
         
-        # --- FIXED: Use OrderActor (Blocking Read) ---
+        # Cost adjustment: Assume a conservative ₹50/lot round-trip fee
+        COST_PER_LOT = self.trading_config.get("commission_per_lot", 50) 
+
         try:
+            # 1. Fetch Broker Position PnL (Blocking call)
             reply_q = queue.Queue()
-            self.engine.trader.order_actor.q.put({
-                "type": "positions",
-                "reply_q": reply_q
-            })
-
-            broker_positions = None
-            resp = reply_q.get(timeout=10.0)
-            if resp['ok']:
-                broker_positions = resp['res']
-            else:
-                L.error(f"Failed to get positions from OrderActor: {resp.get('error')}")
+            self.engine.trader.order_actor.q.put({"type": "positions", "reply_q": reply_q}, timeout=10.0)
+            
+            try:
+                resp = reply_q.get(timeout=10.0)
+            except queue.Empty:
+                L.warning("Reconcile: Timeout getting broker positions.")
                 return
 
-            if not broker_positions or 'net' not in broker_positions:
-                return
+            if not resp['ok'] or 'net' not in resp['res']: return
 
-            broker_unrealized_pnl = sum(pos.get('unrealised', 0) for pos in broker_positions['net'] if pos.get('product') == 'MIS')
+            broker_unrealized_pnl = sum(pos.get('unrealised', 0) for pos in resp['res']['net'] if pos.get('product') == 'MIS')
+            
+            # 2. Adjust Bot PnL (Thread-Safe Calculation)
             bot_unrealized_pnl = self.trader.unrealized_pnl()
-
-            discrepancy = abs(broker_unrealized_pnl - bot_unrealized_pnl)
-            threshold = self.trading_config.get('pnl_discrepancy_alert_threshold_rupees', 250.0)
+            
+            # Inside reconcile_broker_pnl
+            with self.trader.lock:
+                open_lots = 0
+                for p in self.trader.positions.values():
+                    if p.status == PositionStatus.ACTIVE.value:
+                        ls = self.book.lot_size(_get_underlying(p.tradingsymbol)) or 1 # Default to 1 if None
+                        open_lots += abs(p.qty / ls)
+            
+            # Calculate Net PnL
+            estimated_fees = open_lots * COST_PER_LOT * 2 
+            bot_net_pnl_adjusted = bot_unrealized_pnl - estimated_fees
+            
+            # 3. Compare
+            discrepancy = abs(broker_unrealized_pnl - bot_net_pnl_adjusted)
             critical_threshold = self.trading_config.get('pnl_discrepancy_critical_threshold', 1000.0)
 
-            
             if discrepancy > critical_threshold:
-                send_alert(f"🔥🔥 FATAL P&L DISCREPANCY: ₹{discrepancy:.2f}. Halting bot.", "critical")
-                self.engine.fatal_error_event.set() # Trigger engine shutdown
-            elif discrepancy > threshold:
-                send_alert(
-                    f"⚠️ P&L DISCREPANCY DETECTED! "
-                    f"Broker Unrealized: ₹{broker_unrealized_pnl:.2f}, "
-                    f"Bot Unrealized: ₹{bot_unrealized_pnl:.2f}, "
-                    f"Difference: ₹{discrepancy:.2f}",
-                    "warning"
-                )
-        except queue.Empty:
-            L.warning("Timeout reconciling broker P&L.") 
+                send_alert(f"🔥🔥 FATAL P&L DISCREPANCY: Bot: {bot_net_pnl_adjusted:.2f} vs Broker: {broker_unrealized_pnl:.2f}. Halting.", "critical")
+                self.engine.fatal_error_event.set() 
+
         except Exception as e:
-            L.warning(f"Could not reconcile broker P&L: {e}")
+            L.warning(f"Could not reconcile broker P&L: {e}", exc_info=True)
 
     def update_pnl_metrics(self):
         self.last_unrealized_pnl = self.trader.unrealized_pnl()
-
+        
     def initialize_position_greeks(self, p: Position):
         with self.lock:
-            if not p.greeks:
-                L.warning(f"Could not find pre-calculated greeks for {p.tradingsymbol}. This should not happen.")
-                return
-
-            self.portfolio_greeks["net_delta"] += p.greeks.get("delta", 0.0) * p.initial_qty
-            self.portfolio_greeks["net_vega"] += p.greeks.get("vega", 0.0) * p.initial_qty
-            self.portfolio_greeks["net_gamma"] += p.greeks.get("gamma", 0.0) * p.initial_qty
-            self.portfolio_greeks["net_theta"] += p.greeks.get("theta", 0.0) * p.initial_qty
-            L.info(f"Initialized greeks for {p.tradingsymbol}: {p.greeks}. Portfolio totals: {self.portfolio_greeks}")
+            if p.greeks:
+                self.portfolio_greeks["net_delta"] += p.greeks.get("delta", 0.0) * p.initial_qty
+                self.portfolio_greeks["net_vega"] += p.greeks.get("vega", 0.0) * p.initial_qty
+                self.portfolio_greeks["net_gamma"] += p.greeks.get("gamma", 0.0) * p.initial_qty
+                self.portfolio_greeks["net_theta"] += p.greeks.get("theta", 0.0) * p.initial_qty
 
     def update_position_greeks(self, p: Position, ltp: float):
         with self.lock:
             old_greeks = p.greeks.copy()
-
             underlying_name = _get_underlying(p.tradingsymbol)
             underlying_token = self.engine.bn_token if "BANKNIFTY" in underlying_name else self.engine.nifty_token
             spot = self.prices.ltp(underlying_token)
-            if not spot:
-                return
+            if not spot: return
 
             opt_details = self.book.df_by_token.loc[p.token]
-            T = _calculate_time_to_expiry(opt_details['expiry'].date(), now_ist(), self.timings_config["market_close"])
-
+            T = calculate_trading_time_to_expiry(datetime.combine(opt_details['expiry'].date(), self.engine.timings_config["market_close"]), now_ist(), self.engine.timings_config["market_open"], self.engine.timings_config["market_close"], self.engine.nse_calendar)
+            
             hv = calculate_historical_volatility(self.engine.get_ohlc(underlying_token, 1)['close'])
-            cached_iv = self.engine.atm_iv_cache.get(underlying_name, p.greeks.get('iv', 0.5))
-            if not cached_iv:
-                cached_iv = hv or 0.5 # Use HV or default if cache is still empty
-                
-            is_call = (p.option_type == 'CE') # Add this line
-            iv = calculate_iv(ltp, spot, opt_details['strike'], T, 0.05, is_call, initial_guess=cached_iv, hv_fallback=hv)
-            p.greeks = calculate_greeks(spot, opt_details['strike'], T, 0.05, iv, is_call)
-            p.greeks['iv'] = iv  # Store calculated IV for next iteration's guess
-
+            iv = calculate_iv(ltp, spot, opt_details['strike'], T, 0.05, p.option_type == 'CE', hv_fallback=hv)
+            p.greeks = calculate_greeks(spot, opt_details['strike'], T, 0.05, iv, p.option_type == 'CE')
+            p.greeks['iv'] = iv
+            
             for key in ["delta", "vega", "gamma", "theta"]:
                 change = p.greeks.get(key, 0.0) - old_greeks.get(key, 0.0)
                 self.portfolio_greeks[f"net_{key}"] += change * p.qty
 
     def verify_position_risk(self, p: Position):
-        L.info(f"Post-fill verification for {p.tradingsymbol}...")
-
         underlying_name = _get_underlying(p.tradingsymbol)
         underlying_token = self.engine.bn_token if "BANKNIFTY" in underlying_name else self.engine.nifty_token
         spot = self.prices.ltp(underlying_token)
-        if not spot:
-            return
-
-        opt_details = self.book.df_by_token.loc[p.token]
-        T = _calculate_time_to_expiry(opt_details['expiry'].date(), now_ist(), self.timings_config["market_close"])
-        hv = calculate_historical_volatility(self.engine.get_ohlc(underlying_token, 1)['close'])
-        iv = calculate_iv(p.entry_price, spot, opt_details['strike'], T, 0.05, p.option_type == 'CE', hv_fallback=hv)
-        greeks = calculate_greeks(spot, opt_details['strike'], T, 0.05, iv, p.option_type == 'CE')
-
+        if not spot: return
+        
         actual_risk_rupees = p.option_sl_points * p.initial_qty
-        risk_tolerance_factor = 1.4
-
-        if actual_risk_rupees > (p.intended_risk_rupees * risk_tolerance_factor):
-            L.critical(f"RISK BREACH POST-FILL on {p.tradingsymbol}! "
-                       f"Intended Risk: ₹{p.intended_risk_rupees:.2f}, "
-                       f"Actual Risk: ₹{actual_risk_rupees:.2f}. EXITING POSITION.")
-            send_alert(f"🔥 RISK BREACH POST-FILL: {p.tradingsymbol}. Exiting immediately.", "critical")
+        if actual_risk_rupees > (p.intended_risk_rupees * 1.4):
+            L.critical(f"RISK BREACH POST-FILL on {p.tradingsymbol}. Exiting.")
             self.trader.close_position(p, "POST_FILL_RISK_BREACH")
 
-    def _get_time_of_day_risk_multiplier(self) -> float:
-        now_time = now_ist().time()
-        time_config = self.trading_config.get("time_of_day_risk", {})
+    def update_dynamic_equity(self):
+         # Logic handled by _async_margin_worker now, but we can force a refresh
+         pass
 
-        open_start, open_end = dtime.fromisoformat(time_config.get("opening_range", "09:15:00")), dtime.fromisoformat(time_config.get("opening_end", "10:30:00"))
-        midday_start, midday_end = dtime.fromisoformat(time_config.get("midday_range", "11:30:00")), dtime.fromisoformat(time_config.get("midday_end", "13:30:00"))
+    def reset_daily_state(self, last_trading_day: Optional[date]):
+        now = now_ist()
+        if last_trading_day and last_trading_day.weekday() > now.date().weekday():
+            self.weekly_high_water_mark = self.dynamic_account_equity
+            self.in_weekly_drawdown_lock = False
+            self.store_actor.q.put({"type": "set_kv", "key": "weekly_hwm", "value": str(self.weekly_high_water_mark)})
 
-        if open_start <= now_time < open_end:
-            return time_config.get("opening_multiplier", 1.25)
-        elif midday_start <= now_time < midday_end:
-            return time_config.get("midday_multiplier", 0.5)
-        else:
-            return time_config.get("default_multiplier", 1.0)
+        if last_trading_day:
+            self.store_actor.q.put({"type": "set_kv", "key": f"daily_pnl_{last_trading_day}", "value": str(self.trader.daily_realized_pnl)})
 
+        self.trader.daily_realized_pnl = 0.0
+        with self.lock: self.portfolio_greeks = {"net_delta": 0.0, "net_vega": 0.0, "net_gamma": 0.0, "net_theta": 0.0}
+        self.consecutive_losses = 0
+        self.risk_factor = 1.0
+        self.daily_high_water_mark = self.dynamic_account_equity
+        self.performance_score = 0
+        self.circuit_breaker_triggered = False
+
+    def load_persistent_state(self, trading_day: date):
+        weekly_hwm_str = str(self.dynamic_account_equity)
+        pnl_str = "0.0"
+        try:
+            reply_q_hwm = queue.Queue()
+            self.store_actor.q.put({"type": "get_kv", "key": "weekly_hwm", "default": str(self.dynamic_account_equity), "reply_q": reply_q_hwm})
+            resp_hwm = reply_q_hwm.get(timeout=5.0)
+            if resp_hwm['ok']: weekly_hwm_str = resp_hwm['res']
+
+            reply_q_pnl = queue.Queue()
+            self.store_actor.q.put({"type": "get_kv", "key": f"daily_pnl_{trading_day}", "default": "0.0", "reply_q": reply_q_pnl})
+            resp_pnl = reply_q_pnl.get(timeout=5.0)
+            if resp_pnl['ok']: pnl_str = resp_pnl['res']
+        except: pass
+        
+        self.weekly_high_water_mark = float(weekly_hwm_str)
+        self.trader.daily_realized_pnl = float(pnl_str)
+        self.daily_high_water_mark = self.dynamic_account_equity + self.trader.daily_realized_pnl
+        self.weekly_high_water_mark = max(self.weekly_high_water_mark, self.daily_high_water_mark)
+        
+class ConstituentRadar:
+    """Tracks real-time momentum of Nifty/BankNifty heavyweights (Kingmaker Filter)."""
+    def __init__(self, book: InstrumentBook, prices: PriceBus):
+        self.book = book
+        self.prices = prices
+        self.lock = threading.RLock()
+        self.nifty_weights = {"HDFCBANK": 13.0, "RELIANCE": 10.0, "ICICIBANK": 8.0, "INFY": 6.0, "ITC": 3.5}
+        self.bn_weights = {"HDFCBANK": 29.0, "ICICIBANK": 23.0, "SBIN": 11.0, "AXISBANK": 9.0, "KOTAKBANK": 9.0}
+        self.tokens_map = {}
+        self._init_tokens()
+
+    def _init_tokens(self):
+        all_symbols = set(list(self.nifty_weights.keys()) + list(self.bn_weights.keys()))
+        tokens_to_sub = []
+        for sym in all_symbols:
+            token = self.book.get_token(sym) 
+            if token:
+                self.tokens_map[token] = sym
+                tokens_to_sub.append(token)
+        if tokens_to_sub:
+            self.prices.subscribe(tokens_to_sub)
+            L.info(f"ConstituentRadar watching {len(tokens_to_sub)} heavyweights.")
+
+    def get_weighted_momentum(self, index_name: str) -> float:
+        weights = self.bn_weights if "BANK" in index_name else self.nifty_weights
+        total_score, total_weight = 0.0, 0.0
+        with self.lock:
+            for sym, w in weights.items():
+                token = self.book.get_token(sym)
+                if not token: continue
+                tick = self.prices.get_full_tick(token)
+                if not tick or not tick.get('last_price') or not tick.get('ohlc'): continue
+                pct_change = ((tick['last_price'] - tick['ohlc']['open']) / tick['ohlc']['open']) * 100
+                score = 1 if pct_change > 0.15 else -1 if pct_change < -0.15 else 0
+                total_score += (score * w)
+                total_weight += w
+        return (total_score / total_weight) * 100.0 if total_weight > 0 else 0.0
 
 class MicrostructureMonitor:
-    """Handles TFI, OBI, and other order book/tick-level analysis."""
+    """
+    SUPREME EDITION v3: TFI (Soft Split), Drift Reset, and Velocity Tracking.
+    Optimized for Retail Data Fidelity (Kite Snapshots).
+    """
     def __init__(self, prices: PriceBus, config: Dict):
         self.prices = prices
-        self.technical_config = config["technical"]
-        self.micro_config = config["technical"].get("microstructure", {})
-        self.lock = None
         self.lock = threading.RLock()
+        
+        # --- CVD & Delta Streams ---
+        # Raw stream of signed volume (Buy Vol - Sell Vol) for Delta-RSI
+        self.delta_stream: Dict[int, List[float]] = {} 
+        self.cvd: Dict[int, float] = {} 
+        self.last_cvd_reset: Dict[int, int] = {} # Tracks minute of last reset to fix drift
+        
+        # --- Pivot Tracking (For Divergence) ---
+        # Stores tuples of (Price, CVD) to detect absorption/exhaustion
+        self.pivots: Dict[int, deque] = {} 
+        
+        # --- Velocity Tracking (For Adaptive Entry) ---
+        self.tick_times: Dict[int, deque] = {} # Timestamps of recent ticks
+        
+        # --- Data Smoother ---
+        self.last_tick_prices: Dict[int, float] = {}
 
-        self.tfi_window = self.technical_config.get("tfi_window", 50)
-        self.persistence_window = self.micro_config.get("persistence_window", 5)
-
-        self.recent_trades: Dict[int, deque] = {}
-        self.tfi_scores: Dict[int, float] = {}
-        self.tfi_score_history: Dict[int, deque] = {}
-        self.obi_ratio_history: Dict[int, deque] = {}
-
-    def update_tfi_score(self, tick: dict):
+    def update_tfi_score(self, tick: dict) -> Optional[Dict]:
+        """
+        Updates Microstructure state using 'Soft Split' logic to handle snapshot data.
+        Returns None (Flash Signals are disabled per Phase 1 Purge).
+        """
         token = tick.get('instrument_token')
         price = tick.get('last_price')
-        qty = tick.get('last_traded_quantity')
-        depth = tick.get('depth')
+        qty = tick.get('last_traded_quantity', 0)
+        
+        if not all([token, price, qty is not None]): return None
+        
+        now = datetime.now(tz=IST)
+        
+        with self.lock:
+            # 1. Velocity Tracking (Stores last 50 tick timestamps)
+            if token not in self.tick_times: self.tick_times[token] = deque(maxlen=50)
+            self.tick_times[token].append(now)
 
-        if not all([token, price, qty, depth]):
-            return
-        if not depth.get('buy') or not depth.get('sell'):
-            return
+            # 2. Initialize Streams if new token
+            if token not in self.delta_stream:
+                self.delta_stream[token] = []
+                self.cvd[token] = 0.0
+                self.last_cvd_reset[token] = now.minute
+                self.pivots[token] = deque(maxlen=50)
+                self.last_tick_prices[token] = price
+                return None # Need history to calc delta
 
-        if token not in self.recent_trades:
-            self.recent_trades[token] = deque(maxlen=self.tfi_window)
-            self.tfi_scores[token] = 0.0
-            self.tfi_score_history[token] = deque(maxlen=self.persistence_window)
+            # 3. Soft Split CVD Logic (The "Drift Fix")
+            # Standard Bid/Ask logic fails on snapshots. We use Price Change Probability.
+            prev_price = self.last_tick_prices[token]
+            price_change = price - prev_price
+            self.last_tick_prices[token] = price # Update for next cycle
 
-        bid_price = depth['buy'][0]['price']
-        ask_price = depth['sell'][0]['price']
-        trade_value = 0
+            buy_vol = 0.0
+            
+            if qty > 0:
+                if price_change > 0:
+                    buy_vol = qty * 0.9  # Strong Up Tick: 90% Buy Volume
+                elif price_change < 0:
+                    buy_vol = qty * 0.1  # Strong Down Tick: 10% Buy Volume (90% Sell)
+                else:
+                    buy_vol = qty * 0.5  # Neutral Tick: 50/50 Split
+                
+                sell_vol = qty - buy_vol
+                delta_val = buy_vol - sell_vol
+                
+                # Update Accumulators
+                self.cvd[token] += delta_val
+                self.delta_stream[token].append(delta_val)
+                
+                # Trim Delta Stream for RSI calc
+                if len(self.delta_stream[token]) > 100: 
+                    self.delta_stream[token].pop(0)
 
-        if price >= ask_price:
-            trade_value = qty
-        elif price <= bid_price:
-            trade_value = -qty
+                # Pivot Detection (For Divergence)
+                # We only record a "Pivot" if price moves > 0.05% to filter noise
+                last_pivot = self.pivots[token][-1] if self.pivots[token] else (0,0)
+                if abs(price - last_pivot[0]) > (price * 0.0005): 
+                    self.pivots[token].append((price, self.cvd[token]))
 
-        if trade_value != 0:
-            self.recent_trades[token].append(trade_value)
-            self.tfi_scores[token] = sum(self.recent_trades[token])
-            self.tfi_score_history[token].append(self.tfi_scores[token])
+            # 4. The Hard Reset (The "Drift Killer")
+            # Every 30 minutes (at :00 and :30), reset CVD to 0.
+            # This prevents the "Soft Split" estimation errors from accumulating to infinity.
+            if now.minute % 30 == 0 and self.last_cvd_reset[token] != now.minute:
+                 # L.info(f"🧹 CVD Hard Reset for {token} to clear accumulated drift.")
+                 self.cvd[token] = 0.0
+                 self.last_cvd_reset[token] = now.minute
 
-    def check_tfi(self, token: int, side: OrderSide) -> int:
-        """Checks for persistent TFI pressure.
-        Returns: 1 (Confirm), 0 (Neutral), -1 (Conflict)
+            return None # Returns None because we killed Flash Signals (Phase 1)
+
+    def get_tick_velocity(self, token: int) -> float:
         """
-        history = self.tfi_score_history.get(token)
-
-        if not history or len(history) < self.persistence_window:
-            return 0  # Not enough data for a persistent signal
-
-        mean_score = np.mean(list(history))
-        is_increasing = history[-1] >= history[0]  # Pressure is stable or increasing
-
-        threshold = self.micro_config.get("tfi_persistence_mean_threshold", 400)
-
-        if side == OrderSide.BUY:
-            if mean_score > threshold and is_increasing:
-                L.info(f"Persistent TFI confirmed BUY for {token}. Mean Score: {mean_score:.0f}")
-                return 1
-            if mean_score < -threshold:
-                L.warning(f"Persistent TFI CONFLICTS (SELL) for {token} on BUY signal.")
-                return -1
-
-        if side == OrderSide.SELL:
-            if mean_score < -threshold and is_increasing:
-                L.info(f"Persistent TFI confirmed SELL for {token}. Mean Score: {mean_score:.0f}")
-                return 1
-            if mean_score > threshold:
-                L.warning(f"Persistent TFI CONFLICTS (BUY) for {token} on SELL signal.")
-                return -1
-
-        return 0  # Neutral
-
-    def check_order_book_imbalance(self, token: int, side: OrderSide) -> int:
-        """Checks for persistent Order Book Imbalance.
-        Returns: 1 (Confirm), 0 (Neutral), -1 (Conflict)
+        Returns ticks per second over the last 10 seconds.
+        Used by PositionManager to set Adaptive Entry Timeouts.
         """
-        full_tick = self.prices.get_full_tick(token)
-        if not full_tick or not full_tick.get('depth'):
-            return 0  # Neutral
+        with self.lock:
+            times = self.tick_times.get(token)
+            if not times or len(times) < 2: return 0.0
+            
+            now = datetime.now(tz=IST)
+            # Filter for timestamps within last 10 seconds
+            recent = [t for t in times if (now - t).total_seconds() <= 10.0]
+            
+            if len(recent) < 2: return 0.0
+            return len(recent) / 10.0
 
-        depth = full_tick['depth']
-        bids = depth.get('buy', [])
-        asks = depth.get('sell', [])
+    def get_delta_rsi(self, token: int, period: int = 14) -> float:
+        """Returns RSI of the Order Flow Delta (Exhaustion Indicator)."""
+        with self.lock:
+            if token not in self.delta_stream or len(self.delta_stream[token]) < period + 1:
+                return 50.0
+            
+            # Convert to Pandas Series for efficient Calc
+            deltas = pd.Series(self.delta_stream[token])
+            rsi_val = ta.rsi(deltas, length=period)
+            return rsi_val.iloc[-1] if not rsi_val.empty else 50.0
 
-        if not bids or not asks:
-            return 0  # Neutral
-
-        total_bid_qty = sum(item['quantity'] for item in bids[:20])
-        total_ask_qty = sum(item['quantity'] for item in asks[:20])
-
-        if (total_bid_qty + total_ask_qty) == 0:
-            return 0  # Neutral
-
-        obi_ratio = total_bid_qty / (total_bid_qty + total_ask_qty)
-
-        if token not in self.obi_ratio_history:
-            self.obi_ratio_history[token] = deque(maxlen=self.persistence_window)
-        self.obi_ratio_history[token].append(obi_ratio)
-
-        history = self.obi_ratio_history.get(token)
-        if not history or len(history) < self.persistence_window:
-            return 0  # Neutral
-
-        mean_ratio = np.mean(list(history))
-        is_increasing = history[-1] >= history[0]
-
-        threshold = self.micro_config.get("obi_persistence_threshold_pct", 65.0) / 100.0
-
-        if side == OrderSide.BUY:
-            if mean_ratio > threshold and is_increasing:
-                L.info(f"Persistent OBI confirmed BUY for {token}. Mean Ratio: {mean_ratio:.2f}")
-                return 1
-            if (1 - mean_ratio) > threshold:
-                L.warning(f"Persistent OBI CONFLICTS (SELL) for {token} on BUY signal.")
-                return -1
-
-        if side == OrderSide.SELL:
-            if (1 - mean_ratio) > threshold and is_increasing:
-                L.info(f"Persistent OBI confirmed SELL for {token}. (Ask dominance: {1-mean_ratio:.2f})")
-                return 1
-            if mean_ratio > threshold:
-                L.warning(f"Persistent OBI CONFLICTS (BUY) for {token} on SELL signal.")
-                return -1
-
-        return 0  # Neutral
-
-
-import queue # <--- MAKE SURE THIS IMPORT IS AT THE TOP OF YOUR FILE
-
-# ... (other classes) ...
-
+    def check_cvd_divergence(self, token: int, side: OrderSide) -> bool:
+        """
+        The "Lie Detector".
+        Returns True if Price and Order Flow disagree (Absorption/Exhaustion).
+        """
+        with self.lock:
+            history = self.pivots.get(token)
+            if not history or len(history) < 5: return False
+            
+            # Compare Current Pivot vs Previous Pivot (Lookback 2 points)
+            curr_p, curr_cvd = history[-1]
+            prev_p, prev_cvd = history[-3] 
+            
+            if side == OrderSide.BUY:
+                # BULLISH ABSORPTION (Buy Signal)
+                # Price made Lower Low (or Equal), but CVD made Higher Low
+                # Meaning: Sellers hit bid, but price refused to drop -> Limit Buyers Absorb.
+                if curr_p <= prev_p and curr_cvd > prev_cvd:
+                    return True 
+                    
+            elif side == OrderSide.SELL:
+                # BEARISH EXHAUSTION (Sell Signal)
+                # Price made Higher High (or Equal), but CVD made Lower High
+                # Meaning: Buyers hit ask, but price refused to rise -> Limit Sellers Absorb.
+                if curr_p >= prev_p and curr_cvd < prev_cvd:
+                    return True
+            
+            return False
+            
+    
 class PositionManager:
     """Handles the high-frequency loop for managing all active positions."""
     def __init__(self,
@@ -3450,376 +3235,413 @@ class PositionManager:
                  trader: AbstractTrader,
                  book: InstrumentBook,
                  prices: PriceBus,
-                 store_actor: StoreActor, # Now correctly injected
+                 store_actor: StoreActor,
                  risk_manager: RiskManager,
                  config: Dict):
         self.engine = engine
         self.trader = trader
         self.book = book
         self.prices = prices
-        self.store_actor = store_actor # Store the actor
+        self.store_actor = store_actor 
         self.risk_manager = risk_manager
         self.trading_config = config["trading"]
         self.timings_config = config["timings"]
-        self.lock = None
         self.lock = threading.RLock()
 
         self.position_price_history: Dict[str, deque] = {}
+        underlying_entry_price: Optional[float] = None
         self.last_greeks_update_per_pos: Dict[str, datetime] = {}
         self.trailing_sl_config = self.trading_config.get("trailing_sl", {})
         self.trade_mgmt_config = self.trading_config.get("trade_management", {})
 
+    def _check_microstructure_exit(self, p: Position, now: datetime) -> bool:
+        """
+        Checks if Order Flow has turned toxic (Microstructure Ejector).
+        Returns True if position should be closed immediately.
+        """
+        # Give trade 30 seconds to breathe before checking flow
+        if (now - p.opened_at).total_seconds() < 30: return False
+        
+        # Ensure Monitor is active
+        if not self.engine.micro_monitor: return False
+
+        # Logic: We are always LONG the Option (Call or Put).
+        # We want buying pressure on the Option.
+        # If there is Aggressive SELLING (TFI returns 1 for SELL), we must exit.
+        
+        # Check TFI (Trade Flow Imbalance) for Sell Pressure
+        tfi_sell_pressure = self.engine.micro_monitor.check_tfi(p.token, OrderSide.SELL)
+        
+        if tfi_sell_pressure == 1:
+            # Confirm with OBI (Order Book Imbalance) for safety
+            # Check if the Book is also dominated by Sellers (Asks)
+            obi_sell_dominance = self.engine.micro_monitor.check_order_book_imbalance(p.token, OrderSide.SELL)
+            
+            if obi_sell_dominance == 1:
+                L.warning(f"🚀 EJECTOR: Toxic Sell Flow on {p.tradingsymbol}. TFI & OBI confirm reversal.")
+                return True
+                
+        return False
+    
+    def _check_relative_strength_failure(self, p: Position, ltp: float, now: datetime) -> bool:
+        # Give trade 60 seconds to stabilize
+        if (now - p.opened_at).total_seconds() < 60: return False
+        
+        # Get Underlying Price
+        u_name = _get_underlying(p.tradingsymbol)
+        u_token = self.engine.bn_token if "BANKNIFTY" in u_name else self.engine.nifty_token
+        u_ltp = self.prices.ltp(u_token)
+        if not u_ltp: return False
+        
+        # Calculate Change since Entry
+        u_change_pct = ((u_ltp - p.underlying_entry_price) / p.underlying_entry_price) * 100
+        opt_change_pct = ((ltp - p.entry_price) / p.entry_price) * 100
+        
+        # LOGIC: If Underlying is moving favorably (> 0.15%), but Option is NEGATIVE
+        if p.option_type == "CE":
+            if u_change_pct > 0.15 and opt_change_pct < 0.0:
+                L.warning(f"📉 RS FAIL on {p.tradingsymbol}: Nifty +{u_change_pct:.2f}% but Option {opt_change_pct:.2f}%. EJECTING.")
+                return True
+        elif p.option_type == "PE":
+            if u_change_pct < -0.15 and opt_change_pct < 0.0:
+                L.warning(f"📉 RS FAIL on {p.tradingsymbol}: Nifty {u_change_pct:.2f}% but Option {opt_change_pct:.2f}%. EJECTING.")
+                return True
+                
+        return False
+    
+    def _check_rs_failure(self, p: Position, ltp: float, now: datetime) -> bool:
+        """Returns True if Underlying moves in favor but Option fails to follow."""
+        # 1. Grace Period: Give trade 45 seconds to stabilize/fill
+        if (now - p.opened_at).total_seconds() < 45: return False
+        
+        # 2. Get Underlying Price
+        u_name = _get_underlying(p.tradingsymbol)
+        u_token = self.engine.bn_token if "BANKNIFTY" in u_name else self.engine.nifty_token
+        u_ltp = self.prices.ltp(u_token)
+        
+        if not u_ltp or p.underlying_entry_price <= 0: return False
+        
+        # 3. Calculate Performance
+        u_change_pct = ((u_ltp - p.underlying_entry_price) / p.underlying_entry_price) * 100
+        opt_change_pct = ((ltp - p.entry_price) / p.entry_price) * 100
+        
+        # 4. The "Sucker" Check
+        # If Nifty moved > +0.15% in favor, but Option is negative -> EJECT
+        if p.option_type == "CE":
+            if u_change_pct > 0.15 and opt_change_pct < 0.0:
+                L.warning(f"📉 RS EJECT {p.tradingsymbol}: Spot +{u_change_pct:.2f}% but Opt {opt_change_pct:.2f}%")
+                return True
+        elif p.option_type == "PE":
+            if u_change_pct < -0.15 and opt_change_pct < 0.0:
+                L.warning(f"📉 RS EJECT {p.tradingsymbol}: Spot {u_change_pct:.2f}% but Opt {opt_change_pct:.2f}%")
+                return True
+                
+        return False
+
     def manage_positions(self):
+        """
+        High-Frequency Position Management Loop.
+        Handles Entry Logic, Risk Ejection, Trailing, and Scale-Outs.
+        """
         with self.trader.lock:
-            # Create a copy to avoid modification during iteration issues
             active_positions = list(self.trader.positions.values())
 
         now = now_ist()
+        
+        # Manage simulated fills for paper trading
         if PAPER_TRADING:
-            # PaperTrader._manage_pending_entries is safe, uses store_actor
             self.trader._manage_pending_entries(now)
 
-        # ----------------------------------------------------------------------
-        #  CRITICAL FIX: ALL LOGIC BELOW THIS LINE MUST BE INDENTED
-        #  INSIDE THIS 'for p in active_positions:' LOOP
-        # ----------------------------------------------------------------------
         for p in active_positions:
-            # --- Check if position still exists locally (might be closed by another thread) ---
             with self.trader.lock:
-                if p.id not in self.trader.positions:
-                    L.debug(f"Position {p.id} ({p.tradingsymbol}) no longer in active list, skipping management.")
-                    continue
+                if p.id not in self.trader.positions: continue
 
-            # --- Handle Pending Entry ---
+            # --- 1. Handle Pending Entry (Adaptive Logic) ---
             if p.status == PositionStatus.PENDING_ENTRY.value:
-                # --- REFACTOR: Spawn in new thread to prevent blocking the main 1s loop ---
-                # Check if enough time has passed to even bother spawning a thread
                 if not p.last_entry_modification or (now - p.last_entry_modification).total_seconds() > 1.0:
-                    # This call is now non-blocking
+                    # Spawn thread to handle price chasing logic
                     threading.Thread(target=self._manage_adaptive_entry, args=(p, now), daemon=True).start()
-                continue # Move to next position
+                continue 
 
-            # --- Handle Placing Brackets ---
+            # --- 2. Handle Placing Brackets (After Fill) ---
             if p.status == PositionStatus.OPEN_AWAITING_BRACKETS.value:
-                # This call is blocking, but it's a one-time event per trade
-                # and MUST be completed before the position can become ACTIVE.
-                # This is an acceptable blocking call.
                 if not self.trader.place_bracket_orders(p):
-                    send_alert(f"CRITICAL: FAILED to place brackets for {p.tradingsymbol}. Closing position.", "critical")
-                    # trader.close_position is already refactored
-                    if not self.trader.close_position(p, "BRACKET_PLACEMENT_FAILURE"):
-                        send_alert(f"🔥 FATAL: UNABLE TO CLOSE {p.tradingsymbol}. HALTING ALL TRADING.", "critical")
-                        self.engine.fatal_error_event.set()
-                continue # Move to next position
+                    send_alert(f"CRITICAL: FAILED to place brackets for {p.tradingsymbol}. Closing.", "critical")
+                    self.trader.close_position(p, "BRACKET_PLACEMENT_FAILURE")
+                continue
 
-            # --- Handle Pending SL-L Fallback ---
+            # --- 3. Handle Pending SL-L Fallback ---
             if p.status == PositionStatus.PENDING_SL_EXIT.value:
                 ltp = self.prices.ltp(p.token)
                 if ltp and ltp < (p.sl_price * 0.99):
-                    L.warning(f"SL-L for {p.tradingsymbol} likely missed (LTP: {ltp}, SL:{p.sl_price}). Firing MARKET order.")
-                    # trader.close_position is already refactored
-                    self.trader.close_position(p, "SL_L_MISSED_MK_FALLBACK")
-                continue # Move to next position
+                     self.trader.close_position(p, "SL_L_MISSED_MK_FALLBACK")
+                continue
 
-            # --- Skip non-active positions ---
+            # --- Skip non-active ---
             if p.status not in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value]:
                 continue
 
-            # --- Main Active Position Management ---
+            # =========================================================
+            # ACTIVE MANAGEMENT LOOP (The "Ejector Seat")
+            # =========================================================
             ltp = self.prices.ltp(p.token)
-            if not ltp:
-                continue # Skip if no LTP available
+            if not ltp: continue 
+            
+            # --- A. UPGRADE: STAGNATION KILL-SWITCH ---
+            # If trade is flat/weak after 5 minutes, kill it to save Theta.
+            time_in_trade_mins = (now - p.opened_at).total_seconds() / 60
+            if 5.0 <= time_in_trade_mins <= 6.0:
+                profit_pct = (ltp - p.entry_price) / p.entry_price
+                # Need > 2% profit by minute 5 to justify holding
+                if profit_pct < 0.02:
+                    L.warning(f"💀 Stagnation Kill: {p.tradingsymbol} (+{profit_pct:.2%}) stalled. Ejecting.")
+                    self.trader.close_position(p, "STAGNATION_KILL")
+                    continue
 
-            # Throttled Greek Update (safe, no I/O)
-            GREEKS_UPDATE_INTERVAL_SECONDS = 10
-            last_update = self.last_greeks_update_per_pos.get(p.id)
-            if not last_update or (now - last_update).total_seconds() > GREEKS_UPDATE_INTERVAL_SECONDS:
-                L.debug(f"Updating greeks for {p.tradingsymbol}")
-                # risk_manager.update_position_greeks is safe, uses prices/book/engine.get_ohlc
-                self.risk_manager.update_position_greeks(p, ltp)
-                self.last_greeks_update_per_pos[p.id] = now
+            # --- B. UPGRADE: BREAKEVEN RATCHET ---
+            # "Free Ride" Protocol: If +0.5R, move SL to Entry.
+            if not p.trailing_sl_armed and p.sl_price < p.entry_price:
+                current_r = (ltp - p.entry_price) / p.initial_risk_points if p.initial_risk_points > 0 else 0
+                if current_r >= 0.5:
+                    tick_sz = self.book.tick_size(p.tradingsymbol)
+                    new_sl = p.entry_price + (tick_sz * 2) # Entry + Buffer
+                    
+                    if new_sl < ltp:
+                        L.info(f"🛡️ Ratchet Triggered: {p.tradingsymbol} (+{current_r:.2f}R). SL -> Breakeven.")
+                        p.sl_price = new_sl
+                        p.trailing_sl_armed = True # Prevents re-firing
+                        threading.Thread(target=self.trader.modify_sl, args=(p, new_sl), daemon=True).start()
+                        self.store_actor.q.put({"type": "upsert_position", "pos": p})
 
-            # Price History for Velocity (safe, no I/O)
+            # --- C. EXISTING EJECTORS ---
+            
+            # 1. Relative Strength (Nifty moves, Option doesn't)
+            if self._check_rs_failure(p, ltp, now):
+                self.trader.close_position(p, "RS_FAILURE_EJECT")
+                continue
+
+            # 2. Microstructure (Toxic Flow Reversal)
+            if self._check_microstructure_exit(p, now):
+                self.trader.close_position(p, "MICRO_EJECT")
+                continue 
+            
+            # 3. Velocity Trigger (Crash Protection)
             if p.id not in self.position_price_history:
                 self.position_price_history[p.id] = deque(maxlen=20)
             self.position_price_history[p.id].append((now, ltp))
-
-            # Velocity Trigger Check (safe, no I/O)
+            
             if self._check_velocity_trigger(p, now):
-                send_alert(f"⛔ VELOCITY TRIGGER on {p.tradingsymbol}! Pre-emptive exit.", "warning")
-                # trader.close_position is already refactored
-                self.trader.close_position(p, "VELOCITY_TRIGGER_EXIT")
-                continue # Move to next position
+                self.trader.close_position(p, "VELOCITY_EJECT")
+                continue
 
-            # Time Stop Check (safe, no I/O)
-            if (now - p.opened_at).total_seconds() / 60 > p.max_trade_duration_minutes:
-                L.info(f"Position {p.tradingsymbol} hit time-stop of {p.max_trade_duration_minutes} mins. Closing.")
-                # trader.close_position is already refactored
-                self.trader.close_position(p, "TIME_STOP_EXIT")
-                continue # Move to next position
+            # 4. Time Stop (Hard Limit)
+            if time_in_trade_mins > p.max_trade_duration_minutes:
+                self.trader.close_position(p, "TIME_STOP")
+                continue
 
-            # Underlying SL Check (safe, uses prices)
+            # 5. Underlying SL Check
             underlying_name = _get_underlying(p.tradingsymbol)
-            underlying_token = self.engine.bn_token if "BANKNIFTY" in underlying_name else self.engine.nifty_token
-            underlying_price = self.prices.ltp(underlying_token)
-            if underlying_price and p.underlying_sl_level:
-                if (p.option_type == 'CE' and underlying_price <= p.underlying_sl_level) or \
-                   (p.option_type == 'PE' and underlying_price >= p.underlying_sl_level):
-                    L.warning(f"UNDERLYING SL HIT for {p.tradingsymbol}. Underlying: {underlying_price:.2f}, SL: {p.underlying_sl_level:.2f}. Closing.")
-                    # trader.close_position is already refactored
-                    self.trader.close_position(p, "UNDERLYING_SL_HIT")
-                    continue # Move to next position
+            u_token = self.engine.bn_token if "BANKNIFTY" in underlying_name else self.engine.nifty_token
+            u_price = self.prices.ltp(u_token)
+            
+            if u_price and p.underlying_sl_level:
+                hit_sl = (p.option_type == 'CE' and u_price <= p.underlying_sl_level) or \
+                         (p.option_type == 'PE' and u_price >= p.underlying_sl_level)
+                if hit_sl:
+                    self.trader.close_position(p, "UNDERLYING_SL")
+                    continue
 
-            # Option Price SL Check (local backup)
-            if ltp <= p.sl_price:
-                if PAPER_TRADING:
-                    # trader.execute_simulated_sl uses close_position which uses actors
-                    self.trader.execute_simulated_sl(p)
-                else:
-                    L.warning(f"OPTION PRICE SL HIT for {p.tradingsymbol} (LTP: {ltp}, SL: {p.sl_price}). "
-                              f"Broker SL-M {p.slm_order_id} should execute.")
-                continue # Move to next position
+            # --- D. Routine Updates ---
+            
+            # Greeks Update (Throttled 10s)
+            if not self.last_greeks_update_per_pos.get(p.id) or (now - self.last_greeks_update_per_pos.get(p.id, datetime.min.replace(tzinfo=IST))).total_seconds() > 10:
+                self.risk_manager.update_position_greeks(p, ltp)
+                self.last_greeks_update_per_pos[p.id] = now
 
-            # Update High Water Mark (safe, local state)
-            with self.trader.lock:
-                 # Need lock here if trader might modify pos outside this loop
-                 p.high_price_since_entry = max(p.high_price_since_entry, ltp)
-
-            # Scale Out Logic (safe, trader.scale_out is refactored)
+            # --- E. Scale Out & Trailing ---
             profit_points = ltp - p.entry_price
-            scaled_out_this_cycle = False
-            with self.trader.lock: # Lock needed if trader might modify pos outside this loop
+            
+            # Scale Out Logic
+            scaled = False
+            with self.trader.lock:
                 for rule in p.scale_out_rules:
                     target = rule['rr_target']
                     if target not in p.triggered_scale_out_targets and profit_points >= p.initial_risk_points * target:
-                        qty_to_close = int(p.initial_qty * (rule['pct_to_close'] / 100.0))
-                        
-                        # --- REFACTOR: Spawn scale_out in a new thread to prevent blocking ---
-                        L.info(f"[PositionManager] Spawning scale-out thread for {p.tradingsymbol} ({qty_to_close} qty)")
-                        p.triggered_scale_out_targets.append(target) # Optimistic update to prevent re-trigger
-                        threading.Thread(target=self.trader.scale_out, args=(p, qty_to_close), daemon=True).start()
-                        
-                        scaled_out_this_cycle = True
-                        break # Only one scale-out per cycle
+                        qty_out = int(p.initial_qty * (rule['pct_to_close'] / 100.0))
+                        p.triggered_scale_out_targets.append(target)
+                        threading.Thread(target=self.trader.scale_out, args=(p, qty_out), daemon=True).start()
+                        scaled = True
+                        break
+            if scaled: continue
 
-            if scaled_out_this_cycle:
-                continue # Let next cycle handle TSL after scale-out state settles
-
-            # Trailing Stop Loss Logic (safe, trader.modify_sl is refactored)
-            with self.trader.lock: # Lock needed if trader might modify pos outside this loop
+            # Trailing SL Logic
+            with self.trader.lock:
                 current_rr = profit_points / p.initial_risk_points if p.initial_risk_points > 0 else 0
-                highest_sl_floor = p.initial_sl_price # Start with initial SL
+                new_sl = p.initial_sl_price
 
-                # --- Static RR-based Trailing ---
-                trailing_stages = self.trade_mgmt_config.get("trailing_stop_stages", [])
-                for stage in trailing_stages:
+                # 1. Static RR Trail
+                for stage in self.trade_mgmt_config.get("trailing_stop_stages", []):
                     if current_rr >= stage['rr_target']:
                         new_floor = p.entry_price + (p.initial_risk_points * stage['trail_behind_rr'])
-                        highest_sl_floor = max(highest_sl_floor, new_floor)
+                        new_sl = max(new_sl, new_floor)
 
-                final_new_sl = highest_sl_floor
-
-                # --- Dynamic Chandelier Trailing ---
-                # Check if TSL is armed
+                # 2. Chandelier Trail
                 if not p.trailing_sl_armed and profit_points >= p.initial_risk_points * self.trading_config['trailing_sl_activation_rr']:
                     p.trailing_sl_armed = True
-                    L.info(f"Chandelier Trailing SL armed for {p.tradingsymbol} after reaching {self.trading_config['trailing_sl_activation_rr']}R.")
+                    # L.info(f"Chandelier Trailing SL armed for {p.tradingsymbol}.")
 
-                # Calculate Chandelier SL if armed
                 if p.trailing_sl_armed:
-                    # _calculate_trailing_stop is safe, uses engine.get_ohlc
-                    if calculated_chandelier_sl := self._calculate_trailing_stop(p):
-                        final_new_sl = max(final_new_sl, calculated_chandelier_sl) # Take the higher of static or dynamic
+                    if c_sl := self._calculate_trailing_stop(p):
+                        new_sl = max(new_sl, c_sl)
 
-                # --- Apply the Trail ---
-                if final_new_sl > p.sl_price:
-                    is_now_risk_free = final_new_sl >= p.entry_price
+                # 3. Apply Trail
+                if new_sl > p.sl_price:
+                    is_risk_free = new_sl >= p.entry_price
+                    # If risk-free, cancel static TP to let runners run (Optional optimization)
+                    if is_risk_free and p.tp_order_id and not PAPER_TRADING:
+                        self.engine.trader.order_actor.q.put({"type": "cancel_order", "params": {"variety": "regular", "order_id": str(p.tp_order_id)}, "reply_q": None})
+                        p.tp_order_id = None
+                    
+                    p.sl_price = new_sl
+                    threading.Thread(target=self.trader.modify_sl, args=(p, new_sl), daemon=True).start()
 
-                    # Cancel static TP if TSL becomes profitable (uses actor)
-                    if is_now_risk_free and p.tp_order_id and not PAPER_TRADING:
-                        L.info(f"TSL for {p.tradingsymbol} is now profitable. Cancelling static TP {p.tp_order_id}.")
-                        # --- FIXED: Use OrderActor (Non-blocking) ---
-                        # Use engine.trader to access the actor
-                        self.engine.trader.order_actor.q.put({
-                            "type": "cancel_order",
-                            "params": {"variety": "regular", "order_id": str(p.tp_order_id)},
-                            "reply_q": None # Fire-and-forget
-                        })
-                        p.tp_order_id = None # Clear local ID immediately
-                        # --- END FIX ---
-
-                    # --- REFACTOR: Spawn in new thread to prevent blocking the main 1s loop ---
-                    L.info(f"[PositionManager] Spawning SL modification thread for {p.tradingsymbol} to {final_new_sl:.2f}")
-                    p.sl_price = final_new_sl # Optimistic update to prevent re-triggering
-                    threading.Thread(target=self.trader.modify_sl, args=(p, final_new_sl), daemon=True).start()
-
-            # --- Final DB Update ---
-            # Update position in DB via actor (non-blocking)
+            # Final DB Update
             self.store_actor.q.put({"type": "upsert_position", "pos": p})
 
     def _calculate_trailing_stop(self, p: Position) -> Optional[float]:
-        # This function is safe. Uses engine.get_ohlc which reads from memory.
         try:
-            trail_params = self.trailing_sl_config
-            trail_tf = trail_params["timeframe_scaled_out"] if p.triggered_scale_out_targets else trail_params["timeframe"]
-            df = self.engine.get_ohlc(p.token, trail_tf)
-
-            period = trail_params["chandelier_period"]
-            if len(df) < period:
-                return None
-
-            atr = df.ta.atr(length=period).iloc[-1]
-            if pd.isna(atr):
-                return None
-
-            multiplier = trail_params["chandelier_multiplier_scaled_out"] if p.triggered_scale_out_targets else trail_params["chandelier_multiplier"]
-
-            high_over_period = df['high'].rolling(period).max().iloc[-1]
-            new_sl_price = high_over_period - atr * multiplier
-
-            return new_sl_price
-        except Exception as e:
-            L.warning(f"Could not calculate trailing stop for {p.tradingsymbol}: {e}")
-            return None
-
-    def _manage_adaptive_entry(self, p: Position, now: datetime):
-        # This function needs fixing as it uses self.trader.k and self.store
-        if not p.last_entry_modification:
-            return
-
-        time_since_mod = (now - p.last_entry_modification).total_seconds()
-
-        full_tick = self.prices.get_full_tick(p.token)
-        if not full_tick or not full_tick.get('depth'):
-            return
-
-        depth = full_tick['depth']
-        if not depth.get('buy') or not depth.get('sell'):
-            return
-
-        bid_price = depth['buy'][0]['price']
-        ask_price = depth['sell'][0]['price']
-        mid_price = (bid_price + ask_price) / 2.0
-        tick_size = self.book.tick_size(p.tradingsymbol)
-        mid_price = round(mid_price / tick_size) * tick_size
-
-        new_price = -1.0
-        target_stage = p.entry_stage # Track target stage
-
-        # Determine if stage needs to change
-        if p.entry_stage == 1 and time_since_mod > self.trading_config['adaptive_entry_stage2_ms'] / 1000.0:
-            L.info(f"Adaptive Entry Stage 2 (Neutral) for {p.tradingsymbol}")
-            new_price = mid_price
-            target_stage = 2
-        elif p.entry_stage == 2 and time_since_mod > self.trading_config['adaptive_entry_stage3_ms'] / 1000.0:
-            L.info(f"Adaptive Entry Stage 3 (Aggressive) for {p.tradingsymbol}")
-            new_price = ask_price
-            target_stage = 3
-
-        # Check for timeout ONLY in the final stage
-        elif p.entry_stage == 3:
-             entry_timeout_config = (self.trading_config['adaptive_entry_stage2_ms'] +
-                                     self.trading_config['adaptive_entry_stage3_ms'] +
-                                     3000) # Total time + buffer in ms
-             entry_timeout_sec = entry_timeout_config / 1000.0
-             time_since_open = (now - p.opened_at).total_seconds() # Time since SUBMISSION
-
-             if time_since_open > entry_timeout_sec:
-                 L.warning(f"Adaptive Entry TIMEOUT for {p.entry_order_id} ({p.tradingsymbol}) after {time_since_open:.1f}s. Cancelling.")
-                 # trader.cancel_pending_entry uses actors
-                 self.trader.cancel_pending_entry(p)
-                 return # Stop processing this position
-
-        # If a stage change requires a modification
-        if new_price > 0:
-            # --- FIXED: Use OrderActor (Blocking Modify) ---
-            modify_params = {
-                "variety": "regular", # Assuming regular variety
-                "order_id": str(p.entry_order_id),
-                "price": new_price
-            }
-            reply_q = queue.Queue()
-            # Use engine.trader to access actor
-            self.engine.trader.order_actor.q.put({
-                "type": "modify_order",
-                "params": modify_params,
-                "reply_q": reply_q
-            })
-
-            modify_success = False
-            try:
-                resp = reply_q.get(timeout=10.0)
-                if resp['ok']:
-                    modify_success = True
-                else:
-                    L.error(f"Failed to modify entry order {p.entry_order_id}: {resp.get('error')}")
-            except queue.Empty:
-                L.error(f"Timeout modifying entry order {p.entry_order_id}.")
-            # --- END FIX ---
-
-            if modify_success:
-                p.last_entry_modification = now
-                p.entry_stage = target_stage # Update stage only on success
-                # --- FIXED: Use StoreActor (Non-blocking Update) ---
-                self.store_actor.q.put({"type": "upsert_position", "pos": p})
-                # --- END FIX ---
-                L.info(f"Successfully modified entry order {p.entry_order_id} to price {new_price} (Stage {p.entry_stage})")
-            else:
-                L.error(f"Failed to modify entry order {p.entry_order_id} for adaptive entry. Order may be stuck.")
-                # Consider if you need error handling here, e.g., cancelling the order
+            cfg = self.trailing_sl_config
+            tf = cfg["timeframe_scaled_out"] if p.triggered_scale_out_targets else cfg["timeframe"]
+            df = self.engine.get_ohlc(p.token, tf)
+            if len(df) < cfg["chandelier_period"]: return None
+            
+            atr = df.ta.atr(length=cfg["chandelier_period"]).iloc[-1]
+            if pd.isna(atr): return None
+            
+            mult = cfg["chandelier_multiplier_scaled_out"] if p.triggered_scale_out_targets else cfg["chandelier_multiplier"]
+            high = df['high'].rolling(cfg["chandelier_period"]).max().iloc[-1]
+            return high - (atr * mult)
+        except: return None
 
     def _check_velocity_trigger(self, p: Position, now: datetime) -> bool:
-        # This function is safe. Reads from memory. No I/O.
         history = self.position_price_history.get(p.id)
-        velo_cfg = self.trade_mgmt_config.get("velocity_trigger", {})
-        lookback_seconds = velo_cfg.get("lookback_seconds", 5)
+        if not history or len(history) < 3: return False
+        
+        cfg = self.trade_mgmt_config.get("velocity_trigger", {})
+        lookback = cfg.get("lookback_seconds", 5)
+        
+        old = next((x for x in history if (now - x[0]).total_seconds() <= lookback), None)
+        if not old: return False
+        
+        t_delta = (history[-1][0] - old[0]).total_seconds()
+        if t_delta < 1: return False
+        
+        p_delta = history[-1][1] - old[1]
+        velo = p_delta / t_delta
+        
+        if velo >= 0: return False 
+        
+        dist = history[-1][1] - p.sl_price
+        if dist <= 0: return False 
+        
+        tti = dist / abs(velo)
+        return tti < cfg.get("time_to_sl_threshold_seconds", 2.0)
 
-        if not history or len(history) < 3:
-            return False
+    def _manage_adaptive_entry(self, p, now):
+        """
+        Adaptive Execution Engine.
+        - Uses Market Velocity to dynamically set timeouts.
+        - Enforces 'No Chase' policy (Kills trade if Mid-Price doesn't fill).
+        """
+        if not p.last_entry_modification: return
 
-        oldest_point = None
-        for point in history:
-            if (now - point[0]).total_seconds() <= lookback_seconds:
-                oldest_point = point
-                break
+        # 1. Calculate Time & Velocity
+        time_since_mod = (now - p.last_entry_modification).total_seconds()
+        
+        velocity = 0.0
+        if self.engine.micro_monitor:
+            velocity = self.engine.micro_monitor.get_tick_velocity(p.token)
+            
+        # Default Config
+        base_timeout = self.trading_config.get('adaptive_entry_stage2_ms', 800) / 1000.0
+        
+        # Dynamic Timeout Adjustment
+        if velocity > 5.0:
+            stage2_timeout = 0.5  # Fast Market: Hurry up (0.5s)
+        elif velocity < 1.0:
+            stage2_timeout = 5.0  # Slow Market: Be patient (5.0s)
+        else:
+            stage2_timeout = base_timeout
 
-        if oldest_point is None:
-            return False
+        # 2. Get Current Market Data
+        full_tick = self.prices.get_full_tick(p.token)
+        if not full_tick or not full_tick.get('depth'): return
 
-        current_time, current_price = history[-1]
-        oldest_time, oldest_price = oldest_point
+        depth = full_tick['depth']
+        bid_price = depth['buy'][0]['price']
+        ask_price = depth['sell'][0]['price']
+        tick_size = self.book.tick_size(p.tradingsymbol)
+        
+        # Target: Mid-Price (Aggressive but not crossing spread)
+        mid_price = round(((bid_price + ask_price) / 2.0) / tick_size) * tick_size
+        
+        new_price = -1.0
+        target_stage = p.entry_stage
+        
+        # 3. Gamma Burst Acceleration
+        # If Gamma Burst, skip Stage 1 (Bid) and go straight to Stage 2 (Mid).
+        # But do NOT skip logic to check if we need to modify.
+        is_gamma_burst = p.strategy == "GammaBurst" or p.strategy == "GAMMA_BURST_FLASH"
+        if is_gamma_burst and p.entry_stage == 1:
+             L.info(f"🚀 Gamma Burst Acceleration: Skipping Bid, moving to Mid for {p.tradingsymbol}")
+             # Force immediate transition logic below
+             time_since_mod += 10.0 
 
-        time_delta = (current_time - oldest_time).total_seconds()
-        if time_delta < 1:
-            return False
+        # 4. State Machine Logic
+        if p.entry_stage == 1:
+            # Stage 1: Sitting at BID.
+            if time_since_mod > stage2_timeout:
+                L.info(f"Adaptive Entry Stage 2 (Mid) for {p.tradingsymbol}. Velo={velocity:.1f}")
+                new_price = mid_price
+                target_stage = 2
+                
+        elif p.entry_stage == 2:
+            # Stage 2: Sitting at MID.
+            # UPGRADE: KILL STAGE 3 (NO CHASE POLICY)
+            # If we are at Mid-Price and don't get filled within 2x timeout, the move is gone.
+            # We do NOT cross the spread to the Ask. We Cancel.
+            wait_limit = stage2_timeout * 2.0
+            
+            if time_since_mod > wait_limit:
+                L.warning(f"🚫 Entry Timeout at Mid-Price for {p.tradingsymbol}. Cancelling (No Chase).")
+                self.trader.cancel_pending_entry(p)
+                return
 
-        price_delta = current_price - oldest_price
-        velocity_points_per_sec = price_delta / time_delta
-
-        if velocity_points_per_sec >= 0:
-            return False
-
-        distance_to_sl = current_price - p.sl_price
-        if distance_to_sl <= 0:
-            return False
-
-        try:
-            time_to_sl_hit = distance_to_sl / abs(velocity_points_per_sec)
-        except ZeroDivisionError:
-            return False
-
-        threshold = velo_cfg.get("time_to_sl_threshold_seconds", 2.0)
-
-        if time_to_sl_hit < threshold:
-            L.warning(f"VELOCITY TRIGGER: Price moving towards SL on {p.tradingsymbol} at {abs(velocity_points_per_sec):.2f} pts/sec. "
-                      f"Est. time to impact: {time_to_sl_hit:.2f}s (Threshold: {threshold}s).")
-            return True
-
-        return False
+        # 5. Execute Modification
+        if new_price > 0:
+            modify_params = {
+                "variety": "regular", 
+                "order_id": str(p.entry_order_id), 
+                "price": new_price
+            }
+            # Fire-and-forget modify request
+            self.engine.trader.order_actor.q.put({
+                "type": "modify_order", 
+                "params": modify_params, 
+                "reply_q": None 
+            })
+            
+            # Update State
+            p.last_entry_modification = now
+            p.entry_stage = target_stage
+            self.store_actor.q.put({"type": "upsert_position", "pos": p})
 
 
 # ==================================================================================================
 # STRATEGY DEFINITIONS
+# ==================================================================================================
+# ==================================================================================================
+# STRATEGY DEFINITIONS (MICROSTRUCTURE UPGRADED)
 # ==================================================================================================
 class BaseStrategy(ABC):
     def __init__(self, name: StrategyName, engine: 'Engine', params: Dict):
@@ -3842,282 +3664,590 @@ class BaseStrategy(ABC):
             if risk_points > 0 and reward_points > 0:
                 return TradeSignal(self.name, side, risk_points, reward_points)
         return None
-# Add this class definition to main1.py with the other strategy classes
+
+
+class MomentumIgnitionStrategy(BaseStrategy):
+    """
+    SUPREME EDITION: Uses Adaptive Z-Scores + VPIN + OI Walls.
+    """
+    def _check_stop_run(self, df: pd.DataFrame) -> bool:
+        """
+        Detects 'The Soup': A sweep of liquidity below a swing low followed by a reclaim.
+        """
+        try:
+            # Find recent swing low (min of lows in last 20 candles, excluding current)
+            scan_window = 20
+            if len(df) < scan_window + 2: return False
+            
+            swing_low = df['low'].iloc[-scan_window:-1].min()
+            curr_low = df.iloc[-1]['low']
+            curr_close = df.iloc[-1]['close']
+            
+            # Logic: We broke the low, but closed back above it (Liquidity Grab)
+            if curr_low < swing_low and curr_close > swing_low:
+                # Volume Confirmation: Volume > 1.5x Average
+                avg_vol = df['volume'].iloc[-scan_window:-1].mean()
+                if df.iloc[-1]['volume'] > avg_vol * 1.5:
+                    return True
+            return False
+        except Exception:
+            return False
+        
+    def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
+        if regime not in [Regime.COMPRESSION, Regime.TRENDING_UP, Regime.TRENDING_DOWN]: return None
+
+        df = self.engine.get_ohlc(token, 5)
+        if len(df) < 22: return None
+        
+        # 1. Technicals (Bollinger Bands)
+        df.ta.bbands(length=20, std=2.0, append=True)
+        upper = df['BBU_20_2.0'].iloc[-1]
+        lower = df['BBL_20_2.0'].iloc[-1]
+        close = df['close'].iloc[-1]
+
+        # 2. Determine Potential Direction (Breakout Logic)
+        potential_side = None
+        if close > upper: potential_side = OrderSide.BUY
+        elif close < lower: potential_side = OrderSide.SELL
+
+        # --- UPGRADE #3: STOP-RUN REVERSAL ("The Soup") ---
+        # If no standard breakout is happening, check for a "Liquidity Sweep" Reversal
+        if not potential_side:
+            swing_low = df['low'].rolling(20).min().iloc[-2]
+            curr_low = df.iloc[-1]['low']
+            # If we swept the low but closed back higher (Hammer/Rejection)
+            if curr_low < swing_low and close > swing_low:
+                 # Confirm with Volume Spike (Stops triggering)
+                 avg_vol = df['volume'].rolling(20).mean().iloc[-1]
+                 if df.iloc[-1]['volume'] > avg_vol * 1.5:
+                      L.info(f"🥣 SOUP REVERSAL BUY on {token}: Swept Low {swing_low:.2f}, Closed {close:.2f}")
+                      return OrderSide.BUY
+            # (Can add inverse logic for Sell Soup here)
+
+        # If we still have no signal, exit
+        if not potential_side: return None
+
+        # --- UPGRADE #6: CVD DIVERGENCE TRAP FILTER ---
+        # If Price breaks out but Order Flow (CVD) does not confirm -> TRAP
+        if self.engine.micro_monitor.check_cvd_divergence(token, potential_side):
+            L.warning(f"🛑 Trade Blocked: CVD Divergence detected on {token} during {potential_side.name} breakout.")
+            return None
+
+        # --- UPGRADE #4: DELTA-RSI EXHAUSTION FILTER ---
+        # If Aggressive Flow is already maxed out, who is left to buy?
+        drsi = self.engine.micro_monitor.get_delta_rsi(token)
+        if potential_side == OrderSide.BUY and drsi > 80:
+            L.warning(f"🛑 Trade Blocked: Buyer Exhaustion (Delta RSI {drsi:.0f})")
+            return None
+        if potential_side == OrderSide.SELL and drsi < 20:
+            L.warning(f"🛑 Trade Blocked: Seller Exhaustion (Delta RSI {drsi:.0f})")
+            return None
+
+        # 3. Existing Flow Triggers
+        z_score = self.engine.micro_monitor.get_tfi_zscore(token)
+        is_toxic = self.engine.vpin_monitor.is_toxic(token) if hasattr(self.engine, 'vpin_monitor') else False
+        
+        # 4. Predictive Alpha (Lead-Lag)
+        pred_signal = self.engine.lead_lag.get_prediction_signal(token)
+        
+        # 5. Structural Alpha (GEX)
+        is_accelerating = self.engine.gex_matrix.is_accelerating(token)
+
+        # 6. Wall Checks
+        dist_wall_buy = self.engine.get_distance_to_oi_wall(token, OrderSide.BUY)
+        dist_wall_sell = self.engine.get_distance_to_oi_wall(token, OrderSide.SELL)
+
+        skew = self.engine.get_skew_index(token)
+        # If Price is breaking UP but Skew is High (> 2.0) or Rising, it's a Trap.
+        if potential_side == OrderSide.BUY and skew > 3.0:
+             L.warning(f"Trade Blocked: Skew Divergence (Skew: {skew:.2f}) on {token}")
+             return None
+        
+        # BUY Logic
+        if potential_side == OrderSide.BUY:
+            # "God Mode" requires:
+            # 1. Strong Z-Score (>2.0) OR
+            # 2. Moderate Z-Score (>1.5) PLUS (Prediction OR Acceleration)
+            strong_context = pred_signal > 3.0 or (is_accelerating and is_toxic)
+            
+            if (z_score > 2.0) or (z_score > 1.5 and strong_context):
+                if dist_wall_buy > 0.0015: # Room to run
+                    L.info(f"⚛️ GOD-MODE BUY {token}: Z={z_score:.1f}, Pred={pred_signal:.1f}, GEX={is_accelerating}, dRSI={drsi:.0f}")
+                    return OrderSide.BUY
+
+        # SELL Logic
+        if potential_side == OrderSide.SELL:
+            strong_context = pred_signal < -3.0 or (is_accelerating and is_toxic)
+            
+            if (z_score < -2.0) or (z_score < -1.5 and strong_context):
+                if dist_wall_sell > 0.0015: # Room to run
+                    L.info(f"⚛️ GOD-MODE SELL {token}: Z={z_score:.1f}, Pred={pred_signal:.1f}, GEX={is_accelerating}, dRSI={drsi:.0f}")
+                    return OrderSide.SELL
+
+        return None
+
+    def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
+        df_1m = self.engine.get_ohlc(token, 1)
+        atr = df_1m.ta.atr(14).iloc[-1]
+        return atr * 0.7, atr * 4.0
+
+
+class SlingshotStrategy(BaseStrategy):
+    """
+    SUPREME EDITION: Uses CVD Divergence (The Lie Detector).
+    """
+    def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
+        if regime not in [Regime.CHOP, Regime.TRENDING_UP, Regime.TRENDING_DOWN]: return None
+
+        df = self.engine.get_ohlc(token, 5)
+        if len(df) < 22: return None
+
+        swing_high = df['high'].rolling(20).max().shift(1).iloc[-1]
+        swing_low = df['low'].rolling(20).min().shift(1).iloc[-1]
+        current = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # 2. CVD Divergence Check
+        has_bull_div = self.engine.micro_monitor.check_cvd_divergence(token, OrderSide.BUY)
+        has_bear_div = self.engine.micro_monitor.check_cvd_divergence(token, OrderSide.SELL)
+
+        # 3. Bullish Slingshot (Price reclaimed low + CVD Bullish Divergence)
+        if prev['low'] < swing_low and current['close'] > swing_low:
+            if has_bull_div: 
+                L.info(f"🪝 CVD SLINGSHOT BUY {token}: Trap Reclaimed + Bullish CVD Divergence")
+                return OrderSide.BUY
+
+        # 4. Bearish Slingshot (Price failed high + CVD Bearish Divergence)
+        if prev['high'] > swing_high and current['close'] < swing_high:
+            if has_bear_div: 
+                L.info(f"🪝 CVD SLINGSHOT SELL {token}: Trap Failed + Bearish CVD Divergence")
+                return OrderSide.SELL
+
+        return None
+
+    def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
+        df_1m = self.engine.get_ohlc(token, 1)
+        atr = df_1m.ta.atr(14).iloc[-1]
+        return atr * 1.0, atr * 3.0
+
+
 class OpeningRangeBreakout(BaseStrategy):
     def __init__(self, name: StrategyName, engine: 'Engine', params: Dict):
         super().__init__(name, engine, params)
         self.orb_high = None
         self.orb_low = None
+        self.is_agnostic = True 
         try:
-            # Load times from config, ensuring they are time objects
             self.orb_set_time = dtime.fromisoformat(self.params["orb_set_time"])
             self.entry_window_end = dtime.fromisoformat(self.params["entry_window_end"])
-        except (KeyError, ValueError) as e:
-            L.critical(f"FATAL: Invalid ORB time parameters in config for {name.value}: {e}")
-            raise SystemExit(f"FATAL: {name.value} strategy config error.")
-
-        self.trades_taken_today = set() # Stores tuples: (token, OrderSide)
-        self._orb_set_date = None # Track the date range was set for
+        except (KeyError, ValueError):
+            self.orb_set_time = dtime(9, 30)
+            self.entry_window_end = dtime(9, 45)
+        self.trades_taken_today = set()
+        self._orb_set_date = None
 
     def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
         now_time = current_time.time()
         today = current_time.date()
-
-        # Reset daily state if market is closed or before settling time
-        # Or if the date changed since last check (covers overnight reset)
-        if (now_time > self.engine.timings_config["market_close"] or
-                now_time < self.engine.timings_config["market_settling_time"] or
-                (self.orb_high is not None and self._orb_set_date != today)):
-
-            if self.orb_high is not None or self.trades_taken_today: # Only log reset if needed
-                L.info(f"ORB: Resetting daily state for {self.engine.book.get_symbol(token)}.")
+        if self._orb_set_date != today:
             self.orb_high = None
             self.orb_low = None
             self.trades_taken_today.clear()
-            self._orb_set_date = None # Clear the date tracker
-            return None
+            self._orb_set_date = today
 
-        # Don't check before range is set
-        if now_time < self.orb_set_time:
-            return None
+        if now_time < self.orb_set_time: return None
 
         df_1m = self.engine.get_ohlc(token, 1)
-        # Ensure we have today's data and it's not empty
-        if df_1m.empty or df_1m.index[-1].date() != today:
-            L.warning(f"ORB: No valid 1m data for token {token} at {current_time}")
-            return None
-
-        # Set the ORB range exactly once per day
         if self.orb_high is None:
-            try:
-                # Use pandas `between_time` which handles tz-aware index correctly
-                # include_end=False ensures the setting candle itself isn't part of the range
-                orb_range_df = df_1m.between_time(self.engine.timings_config["market_open"], self.orb_set_time, include_end=False)
+            market_open = self.engine.timings_config["market_open"]
+            relevant_bars = df_1m.between_time(market_open, self.orb_set_time)
+            if not relevant_bars.empty:
+                self.orb_high = relevant_bars['high'].max()
+                self.orb_low = relevant_bars['low'].min()
+                L.info(f"ORB Set for {token}: {self.orb_high}-{self.orb_low}")
+            else: return None
 
-                # Check if the range actually contains today's data and is not empty
-                if orb_range_df.empty or orb_range_df.index[-1].date() != today:
-                    L.warning(f"ORB: 1m data empty or stale for range {self.engine.timings_config['market_open']} - {self.orb_set_time} on {today} for token {token}. Cannot set ORB.")
-                    # Don't try setting again today if data is bad
-                    self._orb_set_date = today # Mark as checked for today
-                    return None
-                self.orb_high = orb_range_df['high'].max()
-                self.orb_low = orb_range_df['low'].min()
-                self._orb_set_date = today # Mark the date range was set
-                L.info(f"ORB Set for {self.engine.book.get_symbol(token)}: H={self.orb_high:.2f}, L={self.orb_low:.2f}")
-            except Exception as e:
-                L.error(f"ORB: Error setting range for token {token}: {e}")
-                self._orb_set_date = today # Prevent retrying if error occurs
-                return None
+        if now_time > self.entry_window_end: return None
 
-        # Check if ORB range failed to set or is invalid (e.g., high <= low)
-        if self.orb_high is None or self.orb_low is None or self.orb_high <= self.orb_low:
-             if self.orb_high is not None: # Only log if it was set then became invalid
-                 L.warning(f"ORB: Invalid range calculated H={self.orb_high}, L={self.orb_low}. Skipping checks for {token} today.")
-             # Mark as checked to prevent repeated invalid calculations
-             self._orb_set_date = today
-             self.orb_high = None # Ensure it stays None
-             self.orb_low = None
-             return None
+        last_close = df_1m.iloc[-1]['close']
+        last_vol = df_1m.iloc[-1]['volume']
+        avg_vol = df_1m['volume'].rolling(10).mean().iloc[-1]
+        
+        if last_vol < avg_vol * 1.0: return None 
 
-        # Check if outside entry window
-        if now_time >= self.entry_window_end:
-            return None
-
-        # Check for breakout only if range is valid and within window
-        # Access last close safely
-        try:
-            last_close = df_1m.iloc[-1]['close']
-        except IndexError:
-             L.warning(f"ORB: Could not get last close for {token}.")
-             return None
-
-        # Check BUY signal (only once per day per token per side)
         if last_close > self.orb_high and (token, OrderSide.BUY) not in self.trades_taken_today:
-            L.info(f"ORB BUY signal for {self.engine.book.get_symbol(token)} at {last_close:.2f} (ORB High: {self.orb_high:.2f})")
             self.trades_taken_today.add((token, OrderSide.BUY))
             return OrderSide.BUY
-
-        # Check SELL signal (only once per day per token per side)
+            
         if last_close < self.orb_low and (token, OrderSide.SELL) not in self.trades_taken_today:
-            L.info(f"ORB SELL signal for {self.engine.book.get_symbol(token)} at {last_close:.2f} (ORB Low: {self.orb_low:.2f})")
             self.trades_taken_today.add((token, OrderSide.SELL))
             return OrderSide.SELL
-
-        return None # No breakout or already traded this side
-
-    def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
-        if self.orb_high is None or self.orb_low is None:
-            L.error(f"ORB: get_risk_params called for {self.engine.book.get_symbol(token)} but ORB range not set or invalid.")
-            return 0.0, 0.0
-
-        risk_points = self.orb_high - self.orb_low
-        # Ensure risk is positive (should be caught earlier, but double-check)
-        if risk_points <= 0:
-            L.warning(f"ORB: Calculated 0 or negative risk points: {risk_points} for {self.engine.book.get_symbol(token)}. Returning 0.")
-            return 0.0, 0.0
-
-        reward_points = risk_points * self.params.get("rr_multiplier", 1.5)
-        return risk_points, reward_points
-
-
-class MomentumBreakoutStrategy(BaseStrategy):
-    def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
-        df = self.engine.get_ohlc(token, self.params["resample_minutes"])
-        if len(df) < self.params["squeeze_period"]:
-            return None
-
-        df.ta.bbands(length=self.params["bb_period"], append=True)
-        df.ta.adx(length=14, append=True)
-        df['bbw'] = (df[f'BBU_{self.params["bb_period"]}_2.0'] - df[f'BBL_{self.params["bb_period"]}_2.0']) / df[f'BBM_{self.params["bb_period"]}_2.0']
-        df['vol_ma'] = df['volume'].rolling(self.params["bb_period"]).mean()
-        last = df.iloc[-2]
-        is_in_squeeze = last['bbw'] < df['bbw'].rolling(self.params["squeeze_period"]).mean().iloc[-2] * self.params["squeeze_factor"]
-        adx_was_low = (df['ADX_14'].iloc[-10:-2] < 20).any()
-        adx_is_rising = df['ADX_14'].iloc[-1] > df['ADX_14'].iloc[-2]
-        if is_in_squeeze and adx_was_low and adx_is_rising and last['volume'] > self.params["volume_factor"] * last['vol_ma']:
-            if df.iloc[-1]['close'] > last[f'BBU_{self.params["bb_period"]}_2.0']:
-                return OrderSide.BUY
-            if df.iloc[-1]['close'] < last[f'BBL_{self.params["bb_period"]}_2.0']:
-                return OrderSide.SELL
         return None
 
     def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
-        df_1m = self.engine.get_ohlc(token, 1)
-        return calculate_dynamic_risk_params(
-            df_1m,
-            self.params["atr_sl_multiplier"],
-            self.params["atr_tp_multiplier"]
-        )
+        if not self.orb_high or not self.orb_low: return 0.0, 0.0
+        range_size = self.orb_high - self.orb_low
+        risk = range_size * 0.5
+        reward = risk * self.params.get("rr_multiplier", 1.5)
+        return risk, reward
 
 
 class TrendPullbackStrategy(BaseStrategy):
+    # Inside TrendPullbackStrategy class in main1.py
+
     def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
-        side = OrderSide.BUY if regime == Regime.TRENDING_UP else OrderSide.SELL
-        df_primary = self.engine.get_ohlc(token, self.params["primary_tf"])
-        df_confirm = self.engine.get_ohlc(token, self.params["confirm_tf"])
-        if len(df_primary) < self.params["ema_period"] + 2 or len(df_confirm) < 21:
-            return None
-        df_confirm['ema_slow'] = df_confirm.ta.ema(length=21)
-        is_htf_bullish = df_confirm['close'].iloc[-1] > df_confirm['ema_slow'].iloc[-1]
-        is_htf_bearish = df_confirm['close'].iloc[-1] < df_confirm['ema_slow'].iloc[-1]
-        df_primary['ema'] = df_primary.ta.ema(length=self.params["ema_period"])
-        last, current = df_primary.iloc[-2], df_primary.iloc[-1]
-        if side == OrderSide.BUY and is_htf_bullish and last['low'] <= last['ema'] and current['close'] > last['ema']:
-            candle_range = current['high'] - current['low']
-            if candle_range > 0 and (current['close'] - current['low']) / candle_range >= 0.75:
-                return OrderSide.BUY
-        if side == OrderSide.SELL and is_htf_bearish and last['high'] >= last['ema'] and current['close'] < last['ema']:
-            candle_range = current['high'] - current['low']
-            if candle_range > 0 and (current['high'] - current['close']) / candle_range >= 0.75:
-                return OrderSide.SELL
-        return None
+        # ... existing trend checks ...
 
-    def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
-        df_1m = self.engine.get_ohlc(token, 1)
-        return calculate_dynamic_risk_params(
-            df_1m,
-            self.params["atr_sl_multiplier"],
-            self.params["atr_tp_multiplier"]
-        )
-
-
-class MeanReversionStrategy(BaseStrategy):
-    def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
-        df = self.engine.get_ohlc(token, self.params["resample_minutes"])
-        if len(df) < self.params["bb_period"] + 2:
-            return None
-
-        df.ta.bbands(length=self.params["bb_period"], append=True)
-        last_bar, current_bar = df.iloc[-2], df.iloc[-1]
-
-        upper_band_col = f'BBU_{self.params["bb_period"]}_2.0'
-        lower_band_col = f'BBL_{self.params["bb_period"]}_2.0'
-
-        last_upper_band = df[upper_band_col].iloc[-2]
-        last_lower_band = df[lower_band_col].iloc[-2]
-        current_upper_band = df[upper_band_col].iloc[-1]
-        current_lower_band = df[lower_band_col].iloc[-1]
-
-        if last_bar['close'] > last_upper_band and current_bar['close'] < current_upper_band:
-            return OrderSide.SELL
-        if last_bar['close'] < last_lower_band and current_bar['close'] > current_lower_band:
-            return OrderSide.BUY
+        # --- NEW: VWAP Grind Logic ---
+        # If strong trend checks fail, check for "Slow Grind" on 5-min chart
+        df = self.engine.get_ohlc(token, 5)
+        if len(df) < 20: return None
+        
+        df.ta.vwap(append=True) # Ensure pandas_ta calculates VWAP
+        
+        current_close = df['close'].iloc[-1]
+        vwap = df['VWAP_D'].iloc[-1]
+        
+        # Check if price is "riding" the VWAP (within 0.15% range)
+        dist_to_vwap = abs(current_close - vwap) / vwap
+        
+        if dist_to_vwap < 0.0015: # Very close to VWAP
+            # Check Trend Direction using Radar (Constituents)
+            radar_score = self.engine.radar.get_weighted_momentum("NIFTY" if token == self.engine.nifty_token else "BANKNIFTY")
+            
+            if radar_score > 10 and current_close > vwap:
+                return OrderSide.BUY # Buy the dip in a slow uptrend
+                
+            if radar_score < -10 and current_close < vwap:
+                return OrderSide.SELL # Sell the rally in a slow downtrend
 
         return None
 
     def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
         df_1m = self.engine.get_ohlc(token, 1)
-        if df_1m.empty:
-            return 0.0, 0.0
-        atr = df_1m.ta.atr(length=14).iloc[-1]
-        if pd.isna(atr):
-            return 0.0, 0.0
-        risk = atr * self.params["atr_sl_multiplier"]
-
-        df_resampled = self.engine.get_ohlc(token, self.params["resample_minutes"])
-        if df_resampled.empty:
-            return 0.0, 0.0
-        df_resampled.ta.bbands(length=self.params["bb_period"], append=True)
-        if df_resampled.empty:
-            return 0.0, 0.0
-
-        middle_band = df_resampled[f'BBM_{self.params["bb_period"]}_2.0'].iloc[-1]
-        current_price = df_resampled['close'].iloc[-1]
-
-        reward = abs(current_price - middle_band)
-        return (risk, reward) if reward > 0 else (risk, risk * 1.5)
+        return calculate_dynamic_risk_params(df_1m, self.params.get("atr_sl_multiplier", 1.2), self.params.get("atr_tp_multiplier", 2.0))
 
 
 class VolatilityMeanReversionStrategy(BaseStrategy):
-    """A strategy for the CHAOS regime, looking for extreme moves to fade."""
     def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
-        if regime != Regime.CHAOS:
-            return None
-
+        if regime != Regime.CHAOS: return None
         df = self.engine.get_ohlc(token, self.params["resample_minutes"])
-        if len(df) < self.params["ema_period"]:
-            return None
-
+        if len(df) < 20: return None
         df['ema'] = df.ta.ema(length=self.params["ema_period"])
         last_close = df['close'].iloc[-1]
         last_ema = df['ema'].iloc[-1]
-        deviation_pct = ((last_close - last_ema) / last_ema) * 100
-
-        trigger_pct = self.params["deviation_pct_trigger"]
-
-        if deviation_pct > trigger_pct:
-            return OrderSide.SELL
-
-        if deviation_pct < -trigger_pct:
-            return OrderSide.BUY
-
+        dev_pct = ((last_close - last_ema) / last_ema) * 100
+        trigger = self.params.get("deviation_pct_trigger", 0.5)
+        if dev_pct > trigger: return OrderSide.SELL
+        if dev_pct < -trigger: return OrderSide.BUY
         return None
 
     def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
-        df = self.engine.get_ohlc(token, self.params["resample_minutes"])
-        if len(df) < 14:
-            return 0.0, 0.0
+        df_1m = self.engine.get_ohlc(token, 1)
+        return calculate_dynamic_risk_params(df_1m, 1.5, 1.5)
 
-        atr = df.ta.atr(length=14).iloc[-1]
-        if pd.isna(atr):
-            return 0.0, 0.0
+class GammaBurstStrategy(BaseStrategy):
+    """
+    The 'Nuclear' Option: Low IV + High VPIN + Breakout = Gamma Burst.
+    Only trades when options are cheap enough to afford 10x returns.
+    """
+    def check_signal(self, token: int, regime: Regime, current_time: datetime) -> Optional[OrderSide]:
+        # 1. IV Check: Only active if IV Rank is low (Options are cheap)
+        iv_rank = self.engine._get_iv_rank()
+        max_iv = self.params.get("max_iv_percentile", 30.0)
+        if iv_rank is None or iv_rank > max_iv: 
+            return None # Too expensive to burst
 
-        risk_points = atr * self.params["atr_sl_multiplier"]
-        reward_points = atr * self.params["atr_tp_multiplier"]
+        # 2. VPIN Toxic Flow Check (The "Smart Money" Trigger)
+        # Note: Ensure engine has vpin_monitor initialized for this token
+        if not self.engine.vpin_monitor.is_toxic(token):
+            return None 
 
-        return risk_points, reward_points
+        # 3. Momentum Trigger (Breakout)
+        df = self.engine.get_ohlc(token, 5) # 5-min timeframe
+        if len(df) < 20: return None
+        
+        close = df['close'].iloc[-1]
+        high_20 = df['high'].rolling(20).max().iloc[-2]
+        low_20 = df['low'].rolling(20).min().iloc[-2]
+        
+        # Breakout of 20-candle High/Low
+        if close > high_20: return OrderSide.BUY
+        if close < low_20: return OrderSide.SELL
+        
+        return None
+
+    def get_risk_params(self, token: int, side: OrderSide, current_time: datetime) -> Tuple[float, float]:
+        # Very tight initial risk, massive reward target
+        df_1m = self.engine.get_ohlc(token, 1)
+        atr = df_1m.ta.atr(14).iloc[-1] if not df_1m.empty else 0
+        if atr == 0: return 0.0, 0.0
+        
+        # Risk 0.5 ATR (Tight), Target 5.0 ATR (Home Run)
+        return atr * 0.5, atr * 5.0
+    
+class VPINMonitor:
+    """
+    Volume-Synchronized Probability of Informed Trading (VPIN).
+    Uses Bulk Volume Classification (BVC) to detect 'Toxic Flow'.
+    """
+    def __init__(self, volume_bucket_size: int = 5000, window_size: int = 50):
+        self.bucket_size = volume_bucket_size
+        self.window_size = window_size
+        self.current_bucket_vol = 0
+        self.buy_vol = 0
+        self.sell_vol = 0
+        self.buckets = deque(maxlen=window_size) # Stores (buy_vol, sell_vol)
+        self.vpin_history = deque(maxlen=200)
+        self.last_price = 0.0
+
+    def update(self, tick: dict):
+        """
+        Updates volume buckets using BVC (price change heuristic).
+        """
+        price = tick.get('last_price')
+        qty = tick.get('last_traded_quantity', 0)
+        
+        if not price or qty == 0: return
+        
+        # 1. Bulk Volume Classification (BVC)
+        # If price rose, volume is aggressive buy. If fell, aggressive sell.
+        # If neutral, split 50-50 (simplified for speed).
+        buy_ratio = 0.5
+        if self.last_price > 0:
+            if price > self.last_price: buy_ratio = 1.0
+            elif price < self.last_price: buy_ratio = 0.0
+        
+        self.last_price = price # Update for next tick
+        
+        v_buy = qty * buy_ratio
+        v_sell = qty * (1 - buy_ratio)
+
+        self.buy_vol += v_buy
+        self.sell_vol += v_sell
+        self.current_bucket_vol += qty
+
+        # 2. Bucket Completion Check
+        if self.current_bucket_vol >= self.bucket_size:
+            # Store completed bucket
+            self.buckets.append((self.buy_vol, self.sell_vol))
+            self._calculate_vpin()
+            
+            # Reset accumulators
+            self.current_bucket_vol = 0
+            self.buy_vol = 0
+            self.sell_vol = 0
+
+    def _calculate_vpin(self):
+        if len(self.buckets) < 10: return 0.0 # Need min data
+
+        # VPIN = Sum(|Buy - Sell|) / Total Volume over window
+        numerator = sum(abs(b[0] - b[1]) for b in self.buckets)
+        denominator = sum(b[0] + b[1] for b in self.buckets)
+        
+        vpin = (numerator / denominator) if denominator > 0 else 0
+        self.vpin_history.append(vpin)
+        return vpin
+
+    def is_toxic(self) -> bool:
+        """Returns True if VPIN is in the top 10% of recent history (Toxic Flow)."""
+        if len(self.vpin_history) < 20: return False
+        # Dynamic threshold: 90th percentile of recent history
+        threshold = np.percentile(list(self.vpin_history), 90)
+        return self.vpin_history[-1] > threshold
+    
+class DealerGammaMatrix:
+    """
+    Calculates the 'Invisible Hand' of the market.
+    Tracks Dealer Gamma Exposure (GEX) to predict Volatility Acceleration.
+    """
+    def __init__(self, book: InstrumentBook, prices: PriceBus, engine: 'Engine'):
+        self.book = book
+        self.prices = prices
+        self.engine = engine
+        self.lock = threading.RLock()
+        self.gamma_profile: Dict[str, Dict] = {} # {Symbol: {'gex': float, 'timestamp': datetime}}
+
+    def calculate_gex(self, token: int):
+        try:
+            u_sym = self.book.get_symbol(token)
+            u_name = _get_underlying(u_sym)
+            spot = self.prices.ltp(token)
+            if not spot: return
+
+            expiry = self.book.find_nearest_expiry_date(u_name)
+            chain = self.book.get_option_chain(u_name, expiry)
+            
+            # --- OPTIMIZATION: KEY STRIKE FILTER ---
+            # Only calculate Gamma for ATM +/- 10 strikes. Save CPU.
+            step = self.book.step_size(u_name)
+            atm_strike = round(spot / step) * step
+            lower_bound = atm_strike - (10 * step)
+            upper_bound = atm_strike + (10 * step)
+            
+            core_chain = chain[(chain['strike'] >= lower_bound) & (chain['strike'] <= upper_bound)]
+            
+            total_gamma = 0.0
+            now = now_ist()
+            close_time = self.engine.timings_config["market_close"]
+            T = calculate_trading_time_to_expiry(now, expiry, self.engine.timings_config["market_open"], close_time, self.engine.nse_calendar)
+            iv = 0.15 
+
+            for _, row in core_chain.iterrows():
+                d1, _ = _get_d1_d2(spot, row['strike'], T, 0.05, iv)
+                if d1 is None: continue
+                
+                # Fallback Gamma Calc
+                gamma = (norm.pdf(d1) / (spot * iv * math.sqrt(T)))
+                gex_val = (gamma * row['open_interest'] * spot * 100)
+                
+                if row['instrument_type'] == 'CE': total_gamma += gex_val
+                else: total_gamma -= gex_val
+
+            with self.lock:
+                self.gamma_profile[u_name] = {
+                    'net_gex': total_gamma,
+                    'timestamp': now,
+                    'is_accelerating': total_gamma < 0, 
+                    'is_suppressing': total_gamma > 0
+                }
+        except Exception as e:
+            L.error(f"GEX Calc Error: {e}")
+
+    def is_accelerating(self, token: int) -> bool:
+        u_sym = self.book.get_symbol(token)
+        if not u_sym: return False
+        u_name = _get_underlying(u_sym)
+        with self.lock:
+            data = self.gamma_profile.get(u_name)
+            if not data: return False 
+            # If Net GEX is Negative, Dealers are hedging WITH the trend -> Acceleration
+            return data['net_gex'] < 0 
 
 
+class LeadLagPredictor:
+    """
+    Predicts Index movement based on Constituent Latency Arbitrage.
+    Weights are dynamic and loaded from config to prevent 'False Positives' from stale weighting.
+    """
+    def __init__(self, book: InstrumentBook, prices: PriceBus, engine: 'Engine'):
+        self.book = book
+        self.prices = prices
+        self.engine = engine
+        self.lock = threading.RLock()
+        
+        # Initialize containers
+        self.nifty_constituents: Dict[str, float] = {}
+        self.bn_constituents: Dict[str, float] = {}
+        
+        # Initial Load
+        self._load_weights()
+
+    def _load_weights(self):
+        """Loads weights from config, defaulting to hardcoded values if missing (Safety Net)."""
+        with self.lock:
+            try:
+                tech_config = self.engine.config.get('technical', {})
+                weights_cfg = tech_config.get('constituent_weights', {})
+                
+                # Load NIFTY
+                if 'NIFTY' in weights_cfg:
+                    self.nifty_constituents = weights_cfg['NIFTY']
+                else:
+                    L.warning("LeadLag: NIFTY weights missing in config. Using Fallback.")
+                    self.nifty_constituents = {
+                        "HDFCBANK": 0.135, "RELIANCE": 0.095, "ICICIBANK": 0.075, "INFY": 0.058, "ITC": 0.035
+                    }
+
+                # Load BANKNIFTY
+                if 'BANKNIFTY' in weights_cfg:
+                    self.bn_constituents = weights_cfg['BANKNIFTY']
+                else:
+                    L.warning("LeadLag: BANKNIFTY weights missing in config. Using Fallback.")
+                    self.bn_constituents = {
+                        "HDFCBANK": 0.29, "ICICIBANK": 0.19, "SBIN": 0.10, "AXISBANK": 0.09, "KOTAKBANK": 0.08
+                    }
+                
+                L.info(f"LeadLagPredictor: Weights Loaded. Nifty ({len(self.nifty_constituents)}), BN ({len(self.bn_constituents)})")
+                
+            except Exception as e:
+                L.error(f"LeadLagPredictor Weight Load Error: {e}")
+
+    def get_prediction_signal(self, index_token: int) -> float:
+        """
+        Trend Filter: Returns correlation score based on smoothed constituent momentum.
+        Replaces Latency Arbitrage with VIX-Adaptive Trend Following.
+        
+        Returns:
+            Positive Float (> 0.5): Constituents are trending UP (Bullish Confluence).
+            Negative Float (< -0.5): Constituents are trending DOWN (Bearish Confluence).
+        """
+        is_nifty = index_token == self.engine.nifty_token
+        weights = self.nifty_constituents if is_nifty else self.bn_constituents
+        
+        # --- UPGRADE: REGIME-ADAPTIVE LOOKBACK ---
+        # Adjust "memory" based on Market Speed (VIX).
+        # High VIX = Fast moves = Short memory. Low VIX = Noise = Long memory.
+        vix = self.prices.ltp(self.engine.vix_token) or 15.0
+        
+        if vix > 20.0:
+            lookback_sec = 30   # Fast market -> Short memory (30s)
+        elif vix < 12.0:
+            lookback_sec = 180  # Slow market -> Long memory (3m)
+        else:
+            lookback_sec = 60   # Standard (1m)
+            
+        weighted_momentum = 0.0
+        total_weight = 0.0
+        
+        for sym, w in weights.items():
+            token = self.book.get_token(sym)
+            if not token: continue
+            
+            # 1. Get Current Price (Real-time)
+            ltp = self.prices.ltp(token)
+            if not ltp: continue
+            
+            # 2. Get Historical Reference Price (from BarStore)
+            # We access the 1-minute OHLC data to find the start of our trend window.
+            df = self.engine.get_ohlc(token, 1)
+            if df.empty: continue
+            
+            # Calculate how many 1-min bars back we need to look
+            bars_back = max(1, int(lookback_sec / 60))
+            
+            if len(df) == 0: continue
+            
+            # Safety check for data length
+            if len(df) <= bars_back:
+                ref_price = df.iloc[0]['open'] # Not enough data, use oldest open
+            else:
+                ref_price = df.iloc[-bars_back]['close'] # Use Close of the N-th bar back
+            
+            if ref_price == 0: continue
+            
+            # 3. Calculate Trend Contribution
+            pct_change = (ltp - ref_price) / ref_price
+            weighted_momentum += (pct_change * w)
+            total_weight += w
+            
+        if total_weight == 0: return 0.0
+        
+        # 4. Normalize and Scale
+        # Result is Weighted % Change * 1000
+        # Example: If weighted avg change is +0.1% (0.001), Score = 1.0
+        return (weighted_momentum / total_weight) * 1000
+    
 # ==================================================================================================
 # MAIN TRADING ENGINE
 # ==================================================================================================
+
 class Engine:
     def __init__(self,
                  store_actor: StoreActor,
                  book: InstrumentBook,
                  prices: PriceBus,
                  config: Dict):
-        # self.k = kite  <--- DELETED
         self.store_actor = store_actor
         self.book = book
         self.prices = prices
@@ -4129,19 +4259,29 @@ class Engine:
         self.nifty_50_tokens = []
 
         self.trader: Optional[AbstractTrader] = None
+        self.vpin_monitor = VPINMonitor()
         self.risk_manager: Optional[RiskManager] = None
         self.micro_monitor: Optional[MicrostructureMonitor] = None
         self.pos_manager: Optional[PositionManager] = None
+        self.radar: Optional[ConstituentRadar] = None # Kingmaker Filter
         
         self.tick_thread: Optional[threading.Thread] = None
         self.order_thread: Optional[threading.Thread] = None
         self.trade_executor_thread: Optional[threading.Thread] = None
         self.scheduler_threads: Dict[str, threading.Thread] = {}
+        
+        self.heartbeats = {
+        "SignalWorker": time.time(),
+        "BarWorker": time.time(),
+        "TickProcessor": time.time(),
+        "OrderProcessor": time.time(),
+        "TradeExecutor": time.time()
+    }
 
         self.master_lock = threading.RLock()
         self.bars = BarStore(timeframes=[1, 3, 5, 15])
         
-        self.atm_iv_cache = {} # Key: "NIFTY"/"BANKNIFTY", Value: float
+        self.atm_iv_cache = {} 
         self.nifty_token = self.book.special_tokens.get("NIFTY")
         self.bn_token = self.book.special_tokens.get("BANKNIFTY")
         self.vix_token = self.book.special_tokens.get("INDIA VIX")
@@ -4168,7 +4308,6 @@ class Engine:
         self.classifier = RegimeClassifier(self, self.nifty_token, self.bn_token, self.vix_token, self.config["strategies"]["regime_classifier"])
         self.strategies: Dict[Regime, List[BaseStrategy]] = self._load_strategies()
         
-
         self.last_known_prices: Dict[int, float] = {}
         self.sanity_check_pct = self.technical_config.get("insane_tick_pct", 5.0) / 100.0
 
@@ -4178,1436 +4317,1057 @@ class Engine:
 
         self.nse_calendar = mcal.get_calendar('NSE')
         self.vix_long_history_df = pd.DataFrame()
-        self.scheduler = self._setup_scheduler()
-
         self.historical_avg_iv: Dict[int, pd.Series] = {}
+        
+        # --- HOT CHAMBER (Pre-computed Targets for Zero Latency) ---
+        self.hot_chamber: Dict[str, Dict] = {
+            "NIFTY_CE": None, "NIFTY_PE": None,
+            "BANKNIFTY_CE": None, "BANKNIFTY_PE": None
+        }
+        self.hot_chamber_lock = threading.RLock()
+        
+        self.scheduler = self._setup_scheduler() 
+        
+        self.gex_matrix = DealerGammaMatrix(book, prices, self)
+        self.lead_lag = LeadLagPredictor(book, prices, self)
+        
+        self.scheduler = self._setup_scheduler()
+        
+        # Add GEX calculation to scheduler manually or update _setup_scheduler
+        # For simplicity, we append it here:
+        self.scheduler["gex_calc"] = (self._update_gex, 60)
 
-    def set_dependencies(self, trader: AbstractTrader, risk_manager: RiskManager, micro_monitor: MicrostructureMonitor, pos_manager: PositionManager):
+    def set_dependencies(self, trader: AbstractTrader, risk_manager: RiskManager, micro_monitor: MicrostructureMonitor, pos_manager: PositionManager, radar: ConstituentRadar):
         self.trader = trader
         self.risk_manager = risk_manager
         self.micro_monitor = micro_monitor
         self.pos_manager = pos_manager
-        
-        
+        self.radar = radar
         if not PAPER_TRADING:
             self.prices.on_connect_callbacks.append(self.reconcile)
         L.info("All dependencies injected into Engine.")
 
     def get_ohlc(self, token: int, timeframe: int) -> pd.DataFrame:
         return self.bars.get_ohlc(token, timeframe)
+    
+    def get_skew_index(self, token: int) -> float:
+        """
+        Upgrade #1: Skew-Delta Divergence (The "Fear" Index).
+        Calculates the difference between 25-Delta OTM Put IV and 25-Delta OTM Call IV.
+        
+        Formula: Skew = IV(Put_25d) - IV(Call_25d)
+        
+        Interpretation:
+        - High Positive Skew: Puts are expensive (Fear of crash).
+        - Rising Price + Rising Skew = TRAP (Market Makers selling calls but hedging with puts).
+        """
+        try:
+            # 1. Basic Setup
+            u_sym = self.book.get_symbol(token)
+            if not u_sym: return 0.0
+            u_name = _get_underlying(u_sym)
+            
+            spot = self.prices.ltp(token)
+            if not spot: return 0.0
+            
+            # 2. Get Chain for Nearest Expiry
+            expiry = self.book.find_nearest_expiry_date(u_name)
+            if not expiry: return 0.0
+            
+            # Get Time to Expiry (T)
+            now = now_ist()
+            T = calculate_trading_time_to_expiry(now, expiry, self.timings_config["market_open"], self.timings_config["market_close"], self.nse_calendar)
+            
+            # Get Historical Volatility (HV) as fallback for IV calc
+            # Using barstore directly is faster than self.get_ohlc copy
+            bars = self.bars.data.get(token, {}).get(1)
+            hv = calculate_historical_volatility(bars['close']) if bars is not None and not bars.empty else 0.3
+
+            chain = self.book.get_option_chain(u_name, expiry)
+            if chain.empty: return 0.0
+
+            # 3. Find 25-Delta Options
+            # We scan OTM strikes: Calls > Spot, Puts < Spot
+            
+            target_delta = 0.25
+            best_call_iv = None
+            best_put_iv = None
+            min_call_diff = 1.0
+            min_put_diff = 1.0
+
+            # Scan Loop
+            for _, row in chain.iterrows():
+                strike = row['strike']
+                otype = row['instrument_type']
+                
+                # Optimization: Only check strikes within 10% of spot to save CPU
+                if abs(strike - spot) / spot > 0.10: continue
+                
+                # Get Tick Data (Price is needed for IV)
+                tick = self.prices.get_full_tick(int(row['instrument_token']))
+                if not tick: continue
+                ltp = tick.get('last_price', 0)
+                if ltp <= 0: continue
+
+                # Calculate IV & Greeks (JIT Accelerated)
+                is_call = (otype == "CE")
+                iv = implied_vol_jit(ltp, spot, strike, T, 0.05, is_call)
+                
+                # Filter bad IVs
+                if iv <= 0.01 or iv > 5.0: iv = hv
+                
+                # Get Delta
+                _, delta, _, _, _ = fast_greeks_jit(spot, strike, T, 0.05, iv, is_call)
+                
+                # Find match for 25 Delta
+                # We want OTM 25 Delta. 
+                # Call Delta is roughly 0.25. Put Delta is roughly -0.25.
+                
+                if is_call and strike > spot: # OTM Call
+                    diff = abs(delta - target_delta)
+                    if diff < min_call_diff:
+                        min_call_diff = diff
+                        best_call_iv = iv
+                        
+                elif not is_call and strike < spot: # OTM Put
+                    diff = abs(abs(delta) - target_delta)
+                    if diff < min_put_diff:
+                        min_put_diff = diff
+                        best_put_iv = iv
+
+            # 4. Calculate Skew
+            if best_call_iv is not None and best_put_iv is not None:
+                # Typical Skew: Puts (Downside) are usually more expensive than Calls (Upside).
+                # Result is usually Positive.
+                skew = best_put_iv - best_call_iv
+                
+                # L.debug(f"Skew Calc for {u_name}: PutIV({best_put_iv:.2f}) - CallIV({best_call_iv:.2f}) = {skew:.4f}")
+                return skew
+                
+            return 0.0
+
+        except Exception as e:
+            L.warning(f"Error calculating Skew Index for {token}: {e}")
+            return 0.0
+        
+    def _bar_worker(self):
+        while self.running.is_set():
+            self.heartbeats["BarWorker"] = time.time()
+            try:
+                ticks = self.prices.bar_queue.get(timeout=1)
+                # ONLY update bars
+                for t in ticks: self.bars.add_tick(t)
+            except: pass
        
     def _update_market_breadth(self):
-        """Scheduled task to calculate and update Nifty 50 Advance/Decline breadth."""
-        if not self.nifty_50_tokens:
-            return
+        if not self.nifty_50_tokens: return
         try:
-            # --- FIXED: Use OrderActor ---
-            L.debug("Requesting Nifty 50 quotes via OrderActor...")
             reply_q = queue.Queue()
             self.trader.order_actor.q.put({
                 "type": "quote",
                 "params": {"instrument_tokens": self.nifty_50_tokens},
                 "reply_q": reply_q
             })
-            
             quotes = None
             try:
                 resp = reply_q.get(timeout=10.0)
-                if resp['ok']:
-                    quotes = resp['res']
-                else:
-                    raise Exception(resp.get('error', 'Failed to get quotes from OrderActor'))
+                if resp['ok']: quotes = resp['res']
+                else: raise Exception(resp.get('error'))
             except queue.Empty:
-                L.error("Timeout waiting for OrderActor quote reply for market breadth.")
-                return
-            # --- END FIX ---
-
-            if not quotes:
-                L.warning("Market breadth quote fetch returned no data.")
+                L.error("Timeout waiting for OrderActor quote reply.")
                 return
 
-            advances = 0
-            declines = 0
-            for token_str, data in quotes.items():
-                # Use ohlc.close (previous day's close) for change
+            if not quotes: return
+
+            advances, declines = 0, 0
+            for _, data in quotes.items():
                 prev_close = data.get('ohlc', {}).get('close', 0)
                 ltp = data.get('last_price')
-
                 if ltp and prev_close > 0:
-                    if ltp > prev_close:
-                        advances += 1
-                    elif ltp < prev_close:
-                        declines += 1
+                    if ltp > prev_close: advances += 1
+                    elif ltp < prev_close: declines += 1
 
             self.market_breadth = advances - declines
             L.info(f"Market breadth updated: A={advances}, D={declines}, Net={self.market_breadth}")
-
         except Exception as e:
-            L.error(f"Failed to update market breadth: {e}", exc_info=True)
+            L.error(f"Failed to update market breadth: {e}")
 
     def _is_tick_sane(self, tick: Dict) -> bool:
         now_time = now_ist().time()
-        if now_time < self.timings_config["market_settling_time"]:
-            return True
-
-        token = tick["instrument_token"]
-        price = tick.get("last_price")
-        if price is None or price <= 0:
-            return False
+        if now_time < self.timings_config["market_settling_time"]: return True
+        token, price = tick["instrument_token"], tick.get("last_price")
+        if not price or price <= 0: return False
+        
         last_price = self.last_known_prices.get(token)
         if last_price is None:
             self.last_known_prices[token] = price
             return True
-        price_change_pct = abs(price - last_price) / last_price
-        if price_change_pct > self.sanity_check_pct:
-            L.warning(f"INSANE TICK DETECTED for token {token}. New: {price}, Old: {last_price}. Discarding.")
+        
+        if abs(price - last_price) / last_price > self.sanity_check_pct:
+            L.warning(f"INSANE TICK: {token}. New: {price}, Old: {last_price}. Discarding.")
             return False
+            
         self.last_known_prices[token] = price
         return True
     
+    def get_distance_to_oi_wall(self, token: int, side: OrderSide) -> float:
+        """Returns percentage distance to the nearest major OI Wall."""
+        try:
+            u_sym = self.book.get_symbol(token)
+            u_name = _get_underlying(u_sym)
+            spot = self.prices.ltp(token)
+            if not spot: return 999.0
+            
+            expiry = self.book.find_nearest_expiry_date(u_name)
+            chain = self.book.get_option_chain(u_name, expiry)
+            if chain.empty: return 999.0
+            
+            if side == OrderSide.BUY: # Look for Call Resistance (CE OI)
+                ce_chain = chain[chain['instrument_type'] == 'CE']
+                upper_chain = ce_chain[ce_chain['strike'] > spot]
+                if upper_chain.empty: return 999.0
+                # Find strike with Max OI
+                wall_strike = upper_chain.loc[upper_chain['open_interest'].idxmax()]['strike']
+                return (wall_strike - spot) / spot
+                
+            else: # Look for Put Support (PE OI)
+                pe_chain = chain[chain['instrument_type'] == 'PE']
+                lower_chain = pe_chain[pe_chain['strike'] < spot]
+                if lower_chain.empty: return 999.0
+                wall_strike = lower_chain.loc[lower_chain['open_interest'].idxmax()]['strike']
+                return (spot - wall_strike) / spot
+        except:
+            return 999.0
+    
     def _calculate_atm_iv(self, underlying_token: int, spot: float, expiry: date, T: float, hv: float) -> Optional[float]:
-        """Helper to calculate ATM IV for a given underlying."""
         underlying_name = _get_underlying(self.book.get_symbol(underlying_token))
         tep = self.book.step_size(underlying_name)
         atm_strike = round(spot / tep) * tep
 
-        atm_call = self.book.find_option(underlying_name, expiry, atm_strike, "CE")
-        atm_put = self.book.find_option(underlying_name, expiry, atm_strike, "PE")
-
         ivs = []
-        for opt in [atm_call, atm_put]:
-            if not opt:
-                continue
+        for otype in ["CE", "PE"]:
+            opt = self.book.find_option(underlying_name, expiry, atm_strike, otype)
+            if not opt: continue
             tick = self.prices.get_full_tick(int(opt['instrument_token']))
             if tick and tick.get('last_price'):
-                iv = calculate_iv(tick['last_price'], spot, atm_strike, T, 0.05, opt['instrument_type'] == 'CE', hv_fallback=hv)
+                iv = calculate_iv(tick['last_price'], spot, atm_strike, T, 0.05, otype == "CE", hv_fallback=hv)
                 ivs.append(iv)
-
-        if ivs:
-            return sum(ivs) / len(ivs)
-        return None
-    
+        
+        return sum(ivs) / len(ivs) if ivs else None
     
     def _update_atm_iv_cache(self):
-        """Scheduled task to update the ATM IV cache."""
-        now = now_ist()
-        market_close_time = self.timings_config["market_close"]
-
+        now, close_time = now_ist(), self.timings_config["market_close"]
         for token in [self.nifty_token, self.bn_token]:
-            if not token:
-                continue
+            if not token: continue
             spot = self.prices.ltp(token)
-            if not spot:
-                continue
+            if not spot: continue
+            
+            name = _get_underlying(self.book.get_symbol(token))
+            expiry = self.book.find_nearest_expiry_date(name)
+            if not expiry: continue
+            
+            T = calculate_trading_time_to_expiry(now, expiry, self.timings_config["market_open"], close_time, self.nse_calendar)
+            hv = calculate_historical_volatility(self.get_ohlc(token, 1)['close']) or 0.3
+            
+            if atm_iv := self._calculate_atm_iv(token, spot, expiry, T, hv):
+                self.atm_iv_cache[name] = atm_iv
 
-            underlying_name = _get_underlying(self.book.get_symbol(token))
-            expiry = self.book.find_nearest_expiry_date(underlying_name)
-            if not expiry:
-                continue
-
-            T = _calculate_time_to_expiry(expiry, now, market_close_time)
-            hv = calculate_historical_volatility(self.get_ohlc(token, 1)['close'])
-            if not hv:
-                hv = 0.3 # Default fallback
-
-            atm_iv = self._calculate_atm_iv(token, spot, expiry, T, hv)
-            if atm_iv:
-                L.debug(f"Updating ATM IV cache for {underlying_name}: {atm_iv:.4f}")
-                self.atm_iv_cache[underlying_name] = atm_iv
+    def _update_hot_chamber(self):
+        """Pre-selects best options for Flash Execution."""
+        try:
+            for token in [self.nifty_token, self.bn_token]:
+                if not token: continue
+                name = _get_underlying(self.book.get_symbol(token))
+                expiry = self.book.find_nearest_expiry_date(name)
                 
+                ce = self._find_best_option_contract(token, expiry, OptionType.CE, StrategyName.MOMENTUM_BREAKOUT.value, self.regime, skip_filters=True)
+                pe = self._find_best_option_contract(token, expiry, OptionType.PE, StrategyName.MOMENTUM_BREAKOUT.value, self.regime, skip_filters=True)
                 
-    def _tick_processor_worker(self):
-        L.info("Tick processor worker started.")
+                with self.hot_chamber_lock:
+                    if ce: self.hot_chamber[f"{name}_CE"] = ce
+                    if pe: self.hot_chamber[f"{name}_PE"] = pe
+        except Exception: pass
+
+    def _signal_worker(self):
+        L.info("Signal Worker started.")
         while self.running.is_set():
             try:
+                self.heartbeats["SignalWorker"] = time.time()
                 ticks = self.prices.tick_queue.get(timeout=1)
-                sane_ticks = [t for t in ticks if self._is_tick_sane(t)]
-                if not sane_ticks:
-                    continue
-
-                with self.prices.lock:
-                    for t in sane_ticks:
-                        self.prices.last[t["instrument_token"]] = t.get("last_price")
-                        self.prices.full_ticks[t["instrument_token"]] = t
-                        self.micro_monitor.update_tfi_score(t)
-
-                self.process_ticks(sane_ticks)
-            except Empty:
-                continue
-            except Exception as e:
-                L.error(f"FATAL Error in tick processor worker: {e}", exc_info=True)
-
-
-    # Inside Engine class
-    def _score_and_size_trade(self, signal: TradeSignal, token: int) -> Optional[Dict]:
-        """
-        Scores a signal based on multiple confluence factors and returns a package
-        containing the score and PRELIMINARY trade parameters (for option selection).
-        FINAL sizing is done later in the planner.
-
-        Returns:
-             Dict: {"score": float, "params": Dict, "is_agnostic": bool} if score meets threshold, else None.
-                   'params' here contains option details but NOT the final calculated lot size.
-        """
-        score = 1.0 # Base score for a valid signal trigger
-        score_log = [f"Base Signal ({signal.strategy_name.value}): {score:.1f}"]
-        is_agnostic_signal = False
-
-        # --- 1. Regime Confluence & Agnostic Check ---
-        current_regime = self.regime
-        strategy_name = signal.strategy_name
-        # Check if the strategy exists in the "AGNOSTIC" list
-        if "AGNOSTIC" in self.strategies and strategy_name in [s.name for s in self.strategies.get("AGNOSTIC", [])]:
-             is_agnostic_signal = True
-             score_log.append("Regime Agnostic: ±0.0")
-             # Optional penalty if regime is clear and confident
-             if self.regime != Regime.UNCLEAR and self.regime_confidence > 0.7:
-                 score -= 0.2
-                 score_log.append(f"Clear Regime Penalty: -0.2")
-        else:
-             # Apply standard regime confluence scoring for non-agnostic strategies
-             good_combos = {
-                 Regime.TRENDING_UP: [StrategyName.TREND_PULLBACK],
-                 Regime.TRENDING_DOWN: [StrategyName.TREND_PULLBACK],
-                 Regime.COMPRESSION: [StrategyName.MOMENTUM_BREAKOUT],
-                 # MeanReversion might work in CHOP, but we penalize below, so don't list here
-                 # Regime.CHOP: [StrategyName.MEAN_REVERSION],
-                 Regime.CHAOS: [StrategyName.VOLATILITY_MEAN_REVERSION]
-             }
-             bad_combos = {
-                 Regime.CHOP: [StrategyName.TREND_PULLBACK, StrategyName.MOMENTUM_BREAKOUT],
-                 Regime.TRENDING_UP: [StrategyName.MEAN_REVERSION],
-                 Regime.TRENDING_DOWN: [StrategyName.MEAN_REVERSION]
-             }
-             if strategy_name in good_combos.get(current_regime, []):
-                 score += 1.0
-                 score_log.append(f"Regime Confluence ({current_regime.name}): +1.0")
-             elif strategy_name in bad_combos.get(current_regime, []):
-                 score -= 1.0
-                 score_log.append(f"Regime Conflict ({current_regime.name}): -1.0")
-
-        # --- 2. Specific Strategy Penalties (MeanReversion in CHOP) ---
-        if current_regime == Regime.CHOP and strategy_name == StrategyName.MEAN_REVERSION:
-            iv_rank = self._get_iv_rank()
-            # Use the same threshold as the Theta Filter for consistency
-            low_iv_rank_threshold = self.trading_config.get("theta_filter_iv_rank_threshold", 25.0)
-            if iv_rank is not None and iv_rank < low_iv_rank_threshold:
-                 # Heavy penalty for buying options in low IV chop
-                 score -= 1.5
-                 score_log.append(f"Penalty: MeanReversion in Low IV CHOP ({iv_rank:.1f}%): -1.5")
-            else:
-                 # Smaller penalty if IV Rank is higher but still CHOP
-                 score -= 0.5
-                 score_log.append(f"Penalty: MeanReversion in CHOP: -0.5")
-
-        # --- 3. Preliminary Parameter Check (Finds Option, Uses Dummy Size) ---
-        # This call is crucial to get the 'opt' details for subsequent checks
-        prelim_params = self.get_trade_params(
-            token=token, side=signal.side,
-            risk_points_on_underlying=signal.risk_points,
-            reward_points_on_underlying=signal.reward_points,
-            strategy=signal.strategy_name.value, regime=self.regime,
-            confidence_score=1.0 # DUMMY score - size calculated here is ignored
-        )
-        # If no valid option contract is found based on filters, drop the signal
-        if not prelim_params:
-            L.debug(f"Signal dropped: No valid option contract found for {signal.strategy_name.value} on {self.book.get_symbol(token)}.")
-            return None
-        option_symbol = prelim_params['opt']['tradingsymbol'] # Get for logging
-
-        # --- 4. Microstructure Score (TFI/OBI on the specific option) ---
-        option_token = prelim_params['opt']['instrument_token']
-        obi_score = self.micro_monitor.check_order_book_imbalance(option_token, signal.side)
-        tfi_score = self.micro_monitor.check_tfi(option_token, signal.side)
-        if obi_score == 1: score += 0.5; score_log.append("OBI Confirm: +0.5")
-        if tfi_score == 1: score += 0.5; score_log.append("TFI Confirm: +0.5")
-        if obi_score == -1: score -= 1.0; score_log.append("OBI Conflict: -1.0") # Increased penalty
-        if tfi_score == -1: score -= 1.0; score_log.append("TFI Conflict: -1.0") # Increased penalty
-        
-        # --- NEW: 5. StatArb Relative Value Score ---
-        if self.nifty_bn_zscore is not None:
-            zscore = self.nifty_bn_zscore
-            z_threshold = 1.5 # How many std devs to consider "expensive" or "cheap"
-
-            if token == self.nifty_token: # We are trading NIFTY
-                if signal.side == OrderSide.BUY:
-                    if zscore < -z_threshold: # Nifty is "cheap"
-                        score += 1.0; score_log.append(f"StatArb Confirm (Nifty Cheap): +1.0")
-                    elif zscore > z_threshold: # Nifty is "expensive"
-                        score -= 1.0; score_log.append(f"StatArb Conflict (Nifty Expensive): -1.0")
+                sane = [t for t in ticks if self._is_tick_sane(t)]
                 
-                elif signal.side == OrderSide.SELL:
-                    if zscore > z_threshold: # Nifty is "expensive"
-                        score += 1.0; score_log.append(f"StatArb Confirm (Nifty Expensive): +1.0")
-                    elif zscore < -z_threshold: # Nifty is "cheap"
-                        score -= 1.0; score_log.append(f"StatArb Conflict (Nifty Cheap): -1.0")
+                # Update VPIN (moved from TickProcessor)
+                for t in sane:
+                    self.vpin_monitor.update(t)
 
-            elif token == self.bn_token: # We are trading BANKNIFTY (logic is inverted)
-                if signal.side == OrderSide.BUY:
-                    if zscore > z_threshold: # Nifty is "expensive" -> BN is "cheap"
-                        score += 1.0; score_log.append(f"StatArb Confirm (BN Cheap): +1.0")
-                    elif zscore < -z_threshold: # Nifty is "cheap" -> BN is "expensive"
-                        score -= 1.0; score_log.append(f"StatArb Conflict (BN Expensive): -1.0")
-                
-                elif signal.side == OrderSide.SELL:
-                    if zscore < -z_threshold: # Nifty is "cheap" -> BN is "expensive"
-                        score += 1.0; score_log.append(f"StatArb Confirm (BN Expensive): +1.0")
-                    elif zscore > z_threshold: # Nifty is "expensive" -> BN is "cheap"
-                        score -= 1.0; score_log.append(f"StatArb Conflict (BN Cheap): -1.0")
-
-        # --- 6. Market Breadth Score ---
-        if self.market_breadth != 0:
-            breadth_threshold = self.technical_config.get("breadth_score_threshold", 10)
-            if (signal.side == OrderSide.BUY and self.market_breadth > breadth_threshold) or \
-               (signal.side == OrderSide.SELL and self.market_breadth < -breadth_threshold):
-                 score += 1.0; score_log.append(f"Breadth Confirm (Net {self.market_breadth}): +1.0")
-            elif (signal.side == OrderSide.BUY and self.market_breadth < -breadth_threshold) or \
-                 (signal.side == OrderSide.SELL and self.market_breadth > breadth_threshold):
-                 score -= 1.0; score_log.append(f"Breadth Conflict (Net {self.market_breadth}): -1.0")
-
-        # --- 7. Volatility Structure Score (IV vs HV) ---
-        vol_config = self.technical_config.get("volatility_filter", {})
-        hv_period = vol_config.get("hv_period", 20)
-        underlying_ohlc = self.get_ohlc(token, 1)
-        if not underlying_ohlc.empty:
-            hv = calculate_historical_volatility(underlying_ohlc['close'], window=hv_period)
-            underlying_name = _get_underlying(self.book.get_symbol(token))
-            atm_iv = self.atm_iv_cache.get(underlying_name)
-            if hv and atm_iv:
-                vol_spread = atm_iv - hv
-                spread_threshold_low = vol_config.get("iv_hv_spread_threshold_low", -0.05)
-                spread_threshold_high = vol_config.get("iv_hv_spread_threshold_high", 0.10)
-                if vol_spread < spread_threshold_low:
-                     score += 1.0; score_log.append(f"Vol 'Coiled Spring' (Spread {vol_spread:.3f}): +1.0")
-                elif vol_spread > spread_threshold_high:
-                     if signal.side == OrderSide.BUY: # Penalize buying expensive premium
-                         score -= 0.5; score_log.append(f"Vol 'Expensive Premium' (Spread {vol_spread:.3f}): -0.5")
-
-        # NOTE: Regime Confidence multiplier is NOT applied to the score itself.
-        # It affects the final *sizing* in the planner via RiskManager.
-
-        # --- 8. Final Score Calculation & Minimum Threshold Check ---
-        final_score = max(0, score) # Clamp score at 0 minimum
-
-        # Log BEFORE threshold check for debugging visibility
-        # L.info(f"Preliminary Score for {option_symbol}: {final_score:.1f}. Log: {', '.join(score_log)}") # Moved logging to planner
-
-        min_score = self.trading_config.get("min_trade_score", 1.0)
-        if final_score < min_score:
-            # L.debug(f"Signal score {final_score:.1f} < min threshold {min_score} for {option_symbol}. Dropped.") # Moved logging
-            return None
-
-        # --- 9. Return Package with Score and Preliminary Params ---
-        # The 'params' dict still holds the option details ('opt') and greeks,
-        # but the 'lots' and 'total_trade_risk' are based on the dummy score=1.0 and will be recalculated.
-        return {
-            "score": final_score,
-            "params": prelim_params,
-            "is_agnostic": is_agnostic_signal
-        }
-        
-    def _order_processor_worker(self):
-        L.info("Order processor worker started.")
-        while self.running.is_set():
-            try:
-                order = self.prices.order_update_queue.get(timeout=1)
-                self._handle_order_update_from_queue(order)
-            except Empty:
-                continue
-            except Exception as e:
-                L.error(f"Error in order processor worker: {e}", exc_info=True)
-
-    def start(self):
-        if not all([self.trader, self.risk_manager, self.micro_monitor, self.pos_manager]):
-            raise SystemExit("FATAL: Dependencies not set. Call engine.set_dependencies() before start().")
-
-        self.warm_up() # This is now fixed to use actors
-        self.prices.start()
-        if not self.prices.connected.wait(10):
-            raise SystemExit("FATAL: PriceBus WebSocket could not connect.")
-
-        tokens_to_subscribe = [self.nifty_token, self.bn_token]
-        if self.vix_token:
-            tokens_to_subscribe.append(self.vix_token)
-
-        self.prices.subscribe(tokens_to_subscribe)
-
-        self.running.set()
-
-        L.info("Starting TickProcessor thread...")
-        self.tick_thread = threading.Thread(target=self._tick_processor_worker, name="TickProcessor", daemon=True)
-        self.tick_thread.start()
-
-        L.info("Starting OrderProcessor thread...")
-        self.order_thread = threading.Thread(target=self._order_processor_worker, name="OrderProcessor", daemon=True)
-        self.order_thread.start()
-
-        L.info("Starting TradeExecutor thread...")
-        self.trade_executor_thread = threading.Thread(target=self._trade_executor_worker, name="TradeExecutor", daemon=True)
-        self.trade_executor_thread.start()
-
-        L.info("Starting scheduler threads...")
-        for name, (func, interval) in self.scheduler.items():
-            thread = threading.Thread(target=self._run_task_in_loop, args=(func, interval, name), name=name, daemon=True)
-            thread.start()
-            self.scheduler_threads[name] = thread 
-            L.info(f"Started scheduler thread for '{name}' with {interval}s interval.")
-
-        self.loop() # Start the main loop
-
-    def _run_task_in_loop(self, func: Callable, interval: int, name: str):
-        while self.running.is_set():
-            try:
-                is_halted_check = False
-                if name in ["strategic_planner"]:
-                    with self.master_lock:
-                        is_halted_check = self.master_halt
-
-                if not is_halted_check:
-                    func()
-
-            except Exception as e:
-                L.error(f"Error in scheduled task '{name}': {e}", exc_info=True)
-            time.sleep(interval)
-
-    
-    def _send_eod_report(self):
-        now_time = now_ist().time()
-        if now_time > self.timings_config["market_close"] and not self.eod_report_sent:
-            L.info("Sending End-of-Day report...")
-            
-            # --- FIXED: Use StoreActor ---
-            L.debug("Requesting EOD stats from StoreActor...")
-            reply_q = queue.Queue()
-            self.store_actor.q.put({
-                "type": "get_todays_trades_stats",
-                "reply_q": reply_q
-            })
-            
-            wins, losses = 0, 0
-            try:
-                resp = reply_q.get(timeout=10.0)
-                if resp['ok']:
-                    wins, losses = resp['res']
-                else:
-                    L.error(f"Could not get EOD stats from StoreActor: {resp.get('error')}")
-            except queue.Empty:
-                L.error("Timeout getting EOD stats from StoreActor")
-            # --- END FIX ---
-                
-            total_trades = wins + losses
-            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-            report = (f"📊 **--- End of Day Report ---** 📊\n\n"
-                      f"**Net Realized PnL:** ₹{self.trader.daily_realized_pnl:,.2f}\n\n"
-                      f"**Total Trades:** {total_trades}\n"
-                      f"**Winning Trades:** {wins}\n"
-                      f"**Losing Trades:** {losses}\n"
-                      f"**Win Rate:** {win_rate:.2f}%\n")
-            send_alert(report)
-            self.eod_report_sent = True
-
-    def loop(self):
-        send_alert("🛡️ SENTINEL PRIME PROTOCOL ENGAGED. Awaiting market open...")
-        while now_ist().time() < self.timings_config["market_open"] and self.running.is_set():
-            L.info(f"Pre-Market state. Waiting for market open at {self.timings_config['market_open']}...")
-            time.sleep(60)
-        if not self.running.is_set():
-            self.stop()
-            return
-
-        send_alert("🔔 Market is OPEN. Trading logic is now active.")
-        L.info("Market Open state. Trading logic is active.")
-        try:
-            while self.running.is_set():
-                now = now_ist()
-                now_time = now.time()
-                if now_time >= self.timings_config["market_close"]:
-                    L.info("Market is now CLOSED. Transitioning to post-market state.")
-                    break
-
-                if self.fatal_error_event.is_set():
-                    send_alert("🔥 FATAL ERROR EVENT RECEIVED. HALTING ALL TRADING.", "critical")
-                    with self.master_lock:
-                        self.master_halt = True
-                    self.fatal_error_event.clear()
-
-                with self.master_lock:
-                    if os.path.exists(KILL_SWITCH_FILE):
-                        if not self.master_halt:
-                            send_alert("⛔ KILL SWITCH DETECTED. HALTING ALL NEW TRADES. ⛔", "critical")
-                            self.master_halt = True
-                            if G_HALTED_STATUS:
-                                G_HALTED_STATUS.set(1)
-
-                    if not self.eod_flatten_triggered and now_time >= self.timings_config["eod_flatten_time"]:
-                        L.warning("EOD flatten time reached. Halting new trades and closing all positions.")
-                        self.master_halt = True
-                        if G_HALTED_STATUS:
-                            G_HALTED_STATUS.set(1)
-                        self.eod_flatten_triggered = True
-
-                        with self.trader.lock:
-                            positions_to_close = [p for p in self.trader.positions.values() if p.status not in [PositionStatus.CLOSED.value, PositionStatus.PENDING_CLOSURE.value]]
-
-                        if not positions_to_close:
-                            L.info("EOD flatten: No open positions to close.")
-                        else:
-                            for p in positions_to_close:
-                                self.trader.close_position(p, "EOD_FLATTEN")
-                time.sleep(10)
-        except KeyboardInterrupt:
-            L.warning("KeyboardInterrupt detected in main loop.")
-            self.stop()
-            return
-
-        L.info("Post-Market state. Running final tasks for the day.")
-        if not self.eod_report_sent:
-            self._send_eod_report()
-            
-        # --- FIXED: Use StoreActor ---
-        if self.last_trading_day:
-            L.debug("Sending final daily PnL to StoreActor...")
-            self.store_actor.q.put({
-                "type": "set_kv",
-                "key": f"daily_pnl_{self.last_trading_day}",
-                "value": str(self.trader.daily_realized_pnl)
-            })
-        # --- END FIX ---
-            
-        send_alert(f"💤 Sentinel shutting down for the day. Final Realized PnL: ₹{self.trader.daily_realized_pnl:,.2f}")
-        L.info("Daily tasks complete. Bot will now stop.")
-        self.stop()
-
-    # Inside Engine class
-    # [Location: main1.py -> class Engine]
-
-    def _load_strategies(self) -> Dict[Union[Regime, str], List[BaseStrategy]]: # Allow str key for agnostic
-        strategies: Dict[Union[Regime, str], List[BaseStrategy]] = {
-            # --- Regime Specific ---
-            Regime.COMPRESSION: [],
-            Regime.TRENDING_UP: [],
-            Regime.TRENDING_DOWN: [],
-            Regime.CHOP: [],
-            Regime.CHAOS: [],
-            # --- Always Run (or under specific conditions like UNCLEAR) ---
-            "AGNOSTIC": []
-        }
-
-        # Load strategies based on config, appending to the correct list
-        if "MomentumBreakout" in self.config["strategies"]:
-            strategies[Regime.COMPRESSION].append(
-                MomentumBreakoutStrategy(StrategyName.MOMENTUM_BREAKOUT, self, self.config['strategies']['MomentumBreakout'])
-            )
-
-        if "TrendPullback" in self.config["strategies"]:
-            tp_params = self.config['strategies']['TrendPullback']
-            strategies[Regime.TRENDING_UP].append(TrendPullbackStrategy(StrategyName.TREND_PULLBACK, self, tp_params))
-            strategies[Regime.TRENDING_DOWN].append(TrendPullbackStrategy(StrategyName.TREND_PULLBACK, self, tp_params))
-            
-        if "MeanReversion" in self.config["strategies"]:
-            strategies[Regime.CHOP].append(
-                MeanReversionStrategy(StrategyName.MEAN_REVERSION, self, self.config['strategies']['MeanReversion'])
-            )
-            
-        if "VolatilityMeanReversion" in self.config["strategies"]:
-             strategies[Regime.CHAOS].append(
-                 VolatilityMeanReversionStrategy(StrategyName.VOLATILITY_MEAN_REVERSION, self, self.config['strategies']['VolatilityMeanReversion'])
-             )
-
-        # Load Agnostic strategies
-        if "OpeningRangeBreakout" in self.config["strategies"]:
-         orb_params = self.config['strategies']['OpeningRangeBreakout']
-         if hasattr(StrategyName, 'OPENING_RANGE_BREAKOUT'):
-             orb_strategy = OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, orb_params)
-             orb_strategy.is_agnostic = True  # <-- VITAL FIX
-             strategies["AGNOSTIC"].append(orb_strategy) # <-- VITAL FIX
-             L.info("Loaded OpeningRangeBreakout strategy (Regime: AGNOSTIC)")
-         else:
-              L.error("OpeningRangeBreakout strategy configured but Enum not updated!")
-
-        # Log loaded strategies
-        for key, strat_list in strategies.items():
-            if strat_list:
-                key_name = key.name if isinstance(key, Regime) else key
-                strat_names = [s.name.value for s in strat_list]
-                L.info(f"Strategies loaded for {key_name}: {', '.join(strat_names)}")
-
-        return strategies
-
-    # Inside Engine class
-    def _setup_scheduler(self) -> Dict[str, Tuple[Callable, int]]:
-        tasks = {
-            "strategic_planner": (self._run_strategic_planner, 2), # Correctly set to 2 seconds
-            "position_management": (self.pos_manager.manage_positions, 1),
-            "pnl_updater": (self.risk_manager.update_pnl_metrics, 2),
-            "reconciliation": (self.reconcile, 300),
-            "health_check": (self.health_check, 60),
-            "strategy_weighting": (self.risk_manager._update_strategy_weights, 3600), # 1 hour
-            "eod_report": (self._send_eod_report, 300), # 5 mins (runs near EOD)
-            "equity_update": (self.risk_manager.update_dynamic_equity, 120), # 2 mins
-            "data_persistence": (self._persist_bar_data, 3600), # 1 hour
-            "bar_reconciliation": (self._reconcile_bars, 900), # 15 mins
-            "pnl_reconciliation": (self.risk_manager.reconcile_broker_pnl, 900), # 15 mins
-            "atm_iv_cache": (self._update_atm_iv_cache, 10), # 10 seconds
-            "market_breadth": (self._update_market_breadth, 300) # 5 mins
-        }
-        if METRICS_APP:
-            tasks["prometheus_metrics"] = (self._update_prometheus_metrics, 15) # 15 seconds
-        return tasks
-
-    def _reset_daily_state(self):
-        L.info("Resetting daily state for new trading day.")
-        # This now uses store_actor internally
-        self.risk_manager.reset_daily_state(self.last_trading_day) 
-
-        with self.master_lock:
-            self.master_halt = False
-            self.regime_halt = False
-            if os.path.exists(KILL_SWITCH_FILE):
-                try:
-                    os.remove(KILL_SWITCH_FILE)
-                    L.warning("Kill switch file removed for the new trading day.")
-                except OSError as e:
-                    L.error(f"Could not remove kill switch file: {e}")
-
-            if G_HALTED_STATUS:
-                G_HALTED_STATUS.set(0)
-            self.last_trade_timestamp = None
-
-        self.eod_flatten_triggered = False
-        self.eod_report_sent = False
-        self.last_trading_day = now_ist().date()
-        send_alert(f"☀️ New Trading Day: {self.last_trading_day}. Equity: ₹{self.risk_manager.dynamic_account_equity:,.2f}")
-
-    def warm_up(self):
-        L.info("Warming up... Priming historical data.")
-        self.last_trading_day = now_ist().date()
-        # This now uses store_actor internally
-        self.risk_manager.load_persistent_state(self.last_trading_day) 
-
-        to_date, from_date = self.last_trading_day, self.last_trading_day - timedelta(days=self.technical_config["warmup_days"])
-
-        tokens_to_prime = [self.nifty_token, self.bn_token]
-        
-        try:
-            token_file_path = self.technical_config.get("nifty_50_constituents_file")
-            if token_file_path and os.path.exists(token_file_path):
-                with open(token_file_path, 'r') as f:
-                    self.nifty_50_tokens = json.load(f)
-                    L.info(f"Loaded {len(self.nifty_50_tokens)} Nifty 50 constituent tokens.")
-            else:
-                L.error("Nifty 50 constituents file not found or not configured. Market Breadth filter disabled.")
-        except Exception as e:
-            L.error(f"Failed to load Nifty 50 constituents: {e}")
-
-        for token in tokens_to_prime:
-            if token is None:
-                continue
-            symbol = self.book.get_symbol(token) or f"Token {token}"
-            L.info(f"Priming historical data for: {symbol}")
-            
-            # --- FIXED: Use OrderActor ---
-            hist = None
-            L.debug(f"Requesting hist data for {symbol} via OrderActor...")
-            reply_q = queue.Queue()
-            params = {
-                "instrument_token": token,
-                "from_date": from_date,
-                "to_date": to_date,
-                "interval": "minute"
-            }
-            self.trader.order_actor.q.put({
-                "type": "historical_data",
-                "params": params,
-                "reply_q": reply_q
-            })
-            try:
-                resp = reply_q.get(timeout=30.0) # Longer timeout for historical
-                if resp['ok']:
-                    hist = resp['res']
-                else:
-                    L.error(f"Failed to get hist data from OrderActor: {resp.get('error')}")
-            except queue.Empty:
-                L.error(f"Timeout getting hist data for {symbol} from OrderActor")
-            # --- END FIX ---
-
-            if hist:
-                df_hist=pd.DataFrame(hist)
-                self.bars.prime(token, df_hist, append=False)
-                L.info(f"Successfully primed {len(hist)} bars for {symbol}.")
-                try:
-                    last_bar_ts = pd.to_datetime(df_hist['date'].iloc[-1]).tz_localize(IST)
-                    now = now_ist()
-                    gap_minutes = (now - last_bar_ts).total_seconds() / 60.0
-                    
-                    if gap_minutes > 2 and gap_minutes < 375: # Gap is > 2 mins but < 1 day
-                        L.warning(f"Detected {gap_minutes:.0f} min data gap for {symbol}. Backfilling...")
-                        
-                        # --- FIXED: Use OrderActor ---
-                        gap_data = None
-                        gap_params = {
-                            "instrument_token": token,
-                            "from_date": last_bar_ts + timedelta(minutes=1),
-                            "to_date": now,
-                            "interval": "minute"
-                        }
-                        gap_reply_q = queue.Queue()
-                        self.trader.order_actor.q.put({
-                            "type": "historical_data",
-                            "params": gap_params,
-                            "reply_q": gap_reply_q
-                        })
+                # Update Microstructure
+                if self.micro_monitor:
+                    for t in sane: 
                         try:
-                            gap_resp = gap_reply_q.get(timeout=30.0)
-                            if gap_resp['ok']:
-                                gap_data = gap_resp['res']
-                            else:
-                                L.error(f"Gap-fill failed: {gap_resp.get('error')}")
-                        except queue.Empty:
-                            L.error("Timeout on gap-fill request")
-                        # --- END FIX ---
-                        
-                        if gap_data:
-                            self.bars.prime(token, pd.DataFrame(gap_data), append=True)
-                            L.info(f"Successfully backfilled {len(gap_data)} bars for {symbol}.")
-                except Exception as e:
-                    L.error(f"Error during gap-fill for {symbol}: {e}")
-            else:
-                L.error(f"Failed to prime history for {symbol} after retries.")
-
-        if self.vix_token:
-            L.info("Priming long-term VIX history for IV Rank calculation...")
-            vix_from_date = self.last_trading_day - timedelta(days=365)
-            
-            # --- FIXED: Use OrderActor ---
-            vix_hist = None
-            vix_params = {
-                "instrument_token": self.vix_token,
-                "from_date": vix_from_date,
-                "to_date": to_date,
-                "interval": "day"
-            }
-            vix_reply_q = queue.Queue()
-            self.trader.order_actor.q.put({
-                "type": "historical_data",
-                "params": vix_params,
-                "reply_q": vix_reply_q
-            })
-            try:
-                vix_resp = vix_reply_q.get(timeout=30.0)
-                if vix_resp['ok']:
-                    vix_hist = vix_resp['res']
-                else:
-                    L.error(f"VIX hist failed: {vix_resp.get('error')}")
+                            self.micro_monitor.update_tfi_score(t)
+                        except Exception as e:
+                             L.error(f"SignalWorker Logic Error: {e}", exc_info=True)
             except queue.Empty:
-                L.error("Timeout on VIX hist request")
-            # --- END FIX ---
-            
-            if vix_hist:
-                self.vix_long_history_df = pd.DataFrame(vix_hist)
-                L.info(f"Successfully primed {len(self.vix_long_history_df)} days of VIX data.")
-            else:
-                L.error("Failed to prime VIX history. IV Rank filter will be disabled.")
-
-    def process_ticks(self, ticks: List[Dict]):
-        for tick in ticks:
-            self.bars.add_tick(tick)
-
-    def _reconcile_bars(self):
-        with self.bars.lock:
-            try:
-                now = now_ist()
-                if not (self.timings_config["market_open"] < now.time() < self.timings_config["eod_flatten_time"]):
-                    return
-
-                with self.bars.lock:
-                    for token in [self.nifty_token, self.bn_token]:
-                        if not token:
-                            continue
-                        
-                        # --- FIXED: Use OrderActor ---
-                        hist_data = None
-                        params = {
-                            "instrument_token": token,
-                            "from_date": now - timedelta(minutes=5),
-                            "to_date": now,
-                            "interval": "minute"
-                        }
-                        reply_q = queue.Queue()
-                        self.trader.order_actor.q.put({
-                            "type": "historical_data",
-                            "params": params,
-                            "reply_q": reply_q
-                        })
-                        try:
-                            resp = reply_q.get(timeout=10.0)
-                            if resp['ok']:
-                                hist_data = resp['res']
-                        except queue.Empty:
-                            L.warning("Timeout reconciling bars")
-                        # --- END FIX ---
-                        
-                        if not hist_data:
-                            continue
-
-                        hist_df = pd.DataFrame(hist_data)
-                        bar_df = self.bars.data.get(token, {}).get(1)
-                        if bar_df is None or bar_df.empty:
-                            continue
-
-                        hist_df['timestamp'] = pd.to_datetime(hist_df['date']).dt.tz_convert(IST)
-
-                        current_bar_ts = now.replace(second=0, microsecond=0)
-                        for _, row in hist_df.iterrows():
-                            ts = row['timestamp']
-                            if ts < current_bar_ts and ts in bar_df.index:
-                                bar_df.loc[ts, ['open', 'high', 'low', 'close', 'volume']] = row[['open', 'high', 'low', 'close', 'volume']]
-            except Exception as e:
-                L.warning(f"Bar reconciliation failed: {e}")
-
-    def _get_iv_rank(self) -> Optional[float]:
-        if self.vix_long_history_df.empty or not self.vix_token:
-            return None
-
-        current_vix_ltp = self.prices.ltp(self.vix_token)
-        if not current_vix_ltp:
-            return None
-
-        vix_history = self.vix_long_history_df['close']
-        min_vix = vix_history.min()
-        max_vix = vix_history.max()
-
-        if max_vix == min_vix:
-            return 50.0
-
-        iv_rank = ((current_vix_ltp - min_vix) / (max_vix - min_vix)) * 100
-        return iv_rank
-
-    def _get_oi_barriers(self, underlying_name: str, expiry: date, spot: float) -> Tuple[Optional[float], Optional[float]]:
-        try:
-            chain = self.book.get_option_chain(underlying_name, expiry)
-            if chain.empty:
-                return None, None
-
-            calls = chain[chain['instrument_type'] == 'CE']
-            puts = chain[chain['instrument_type'] == 'PE']
-
-            resistance_strike = calls[calls['strike'] > spot].sort_values('open_interest', ascending=False).head(1)
-            support_strike = puts[puts['strike'] < spot].sort_values('open_interest', ascending=False).head(1)
-
-            res = resistance_strike.iloc[0]['strike'] if not resistance_strike.empty else None
-            sup = support_strike.iloc[0]['strike'] if not support_strike.empty else None
-            return res, sup
-        except Exception as e:
-            L.warning(f"Could not get OI barriers: {e}")
-            return None, None
-
-    
-    def _run_strategic_planner(self):
-        """
-        The Planner loop: Checks halts, scans strategies, scores signals,
-        picks the best candidate, performs final sizing, checks risk, and queues the trade.
-        Runs at a faster interval (e.g., 2 seconds).
-        """
-        start_time = time.perf_counter() # Timer starts *before* lock
-            
-        with self.master_lock:
-            logic_start_time = time.perf_counter() # Timer for logic starts *after* lock
-            now = now_ist()
-
-            # --- 0. Check/Update Daily State ---
-            is_trading_day = self.nse_calendar.valid_days(start_date=now.date(), end_date=now.date()).size > 0
-            if self.last_trading_day is None or (now.date() >= self.last_trading_day and is_trading_day):
-                 if self.last_trading_day is None or now.date() > self.last_trading_day:
-                     self._reset_daily_state()
-            elif not is_trading_day:
-                 if self.last_trading_day is not None: self._reset_daily_state()
-                 return # Not a trading day
-
-
-            # --- 1. Theta Filter (Master Guard Clause) ---
-            theta_filter_active = self.trading_config.get("activate_theta_filter", True)
-            theta_filter_iv_rank_threshold = self.trading_config.get("theta_filter_iv_rank_threshold", 25.0)
-            is_theta_halt_condition_met = False
-            if theta_filter_active:
-                iv_rank = self._get_iv_rank()
-                if self.regime == Regime.CHOP and iv_rank is not None and iv_rank < theta_filter_iv_rank_threshold:
-                    is_theta_halt_condition_met = True
-                    if not getattr(self, '_theta_halt_active', False):
-                        L.warning(f"THETA FILTER ENGAGED: Regime=CHOP, IV Rank ({iv_rank:.1f}%) < Threshold ({theta_filter_iv_rank_threshold}%). Setting REGIME halt.")
-                        send_alert(f"⚠️ THETA FILTER ENGAGED: CHOP & Low IV Rank ({iv_rank:.1f}%). Halting regime-specific trades.")
-                        # --- FIX: Use regime_halt ---
-                        self.regime_halt = True
-                        self._theta_halt_active = True
-                        if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
-
-            # Check for resumption separately
-            if getattr(self, '_theta_halt_active', False) and not is_theta_halt_condition_met:
-                if not os.path.exists(KILL_SWITCH_FILE): 
-                    L.info("Theta Filter conditions cleared. Resuming regime-specific trading.")
-                    send_alert("✅ Theta Filter conditions cleared. Resuming.")
-                    # --- FIX: Use regime_halt ---
-                    self.regime_halt = False
-                    self._theta_halt_active = False
-                    # Only set global halt to 0 if master_halt is ALSO false
-                    if G_HALTED_STATUS and not self.master_halt: G_HALTED_STATUS.set(0)
-                else:
-                    self._theta_halt_active = False
-                    L.warning("Theta Filter cleared, but Kill Switch active. Trading remains halted.")
-
-            # --- 2. Update Regime Classification (Needed for scoring even if halted) ---
-            self.run_regime_classification(now)
-            # --- 2a. Regime Stability/Confidence Check ---
-            low_conf_thresh = self.trading_config.get("low_regime_confidence_threshold", 0.0)
-            flip_rate_thresh = self.trading_config.get("high_regime_flip_rate_threshold", 99)
-            
-            flips_last_hour = 0
-            if self.regime_change_history:
-                one_hour_ago = now - timedelta(hours=1)
-                flips_last_hour = sum(1 for ts in self.regime_change_history if ts > one_hour_ago)
-            
-            is_unstable = False
-            if self.regime_confidence < low_conf_thresh:
-                L.warning(f"REGIME STABILITY HALT: Confidence ({self.regime_confidence:.2f}) is below threshold ({low_conf_thresh}). Setting REGIME halt.")
-                is_unstable = True
-                
-            if flips_last_hour > flip_rate_thresh:
-                L.warning(f"REGIME STABILITY HALT: Flip rate ({flips_last_hour}/hr) is above threshold ({flip_rate_thresh}). Setting REGIME halt.")
-                is_unstable = True
-
-            if is_unstable:
-                if not self.regime_halt: # Only log/alert on the transition
-                     send_alert(f"⚠️ REGIME UNSTABLE: Confidence {self.regime_confidence:.2f}, Flip Rate {flips_last_hour}/hr. Halting regime-specific entries.", "warning")
-                # --- FIX: Use regime_halt ---
-                self.regime_halt = True
-                if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
-            elif not is_theta_halt_condition_met: # Don't resume if theta filter is still on
-                if self.regime_halt and not os.path.exists(KILL_SWITCH_FILE):
-                    L.info("Regime has stabilized. Resuming regime-specific trading.")
-                    send_alert("✅ Regime stabilized. Resuming regime-specific trades.")
-                self.regime_halt = False
-                if G_HALTED_STATUS and not self.master_halt: G_HALTED_STATUS.set(0)
-
-
-            # --- 3. Master Halt Check (Blocks EVERYTHING) ---
-            if self.master_halt:
-                # L.debug("MASTER halt active. Skipping all strategy evaluation.")
-                pass # Allow function to exit and run profiling
-            else:
-                # --- 4. Timing & Cooldown Guard Clauses ---
-                now_time = now.time()
-                final_entry_time = self.timings_config["final_entry_time"]
-                is_expiry_day = self.book.find_nearest_expiry_date("NIFTY") == now.date()
-                if is_expiry_day and self.timings_config.get("final_expiry_entry_time"):
-                     final_entry_time = self.timings_config["final_expiry_entry_time"]
-
-                if not (self.timings_config["market_settling_time"] <= now_time < final_entry_time):
-                    pass # Allow function to exit
-                else:
-                    cooldown_ok = not self.last_trade_timestamp or (now - self.last_trade_timestamp) > timedelta(minutes=self.trading_config["trade_cooldown_minutes"])
-                    if not cooldown_ok:
-                        pass # Allow function to exit
-                    else:
-                        # --- 5. Universe Scan ---
-                        strategies_to_run = []
-                        if self.regime in self.strategies: strategies_to_run.extend(self.strategies[self.regime])
-                        if "AGNOSTIC" in self.strategies: strategies_to_run.extend(self.strategies["AGNOSTIC"])
-                        
-                        if not strategies_to_run:
-                            pass # Allow function to exit
-                        else:
-                            universe_tokens = [self.nifty_token, self.bn_token]
-                            all_potential_signals = [] 
-
-                            for token in universe_tokens:
-                                if not token: continue
-                                
-                                cooldown_minutes = self.trading_config.get("trade_cooldown_minutes", 1)
-                                last_trade_time = self.underlying_cooldown.get(token)
-                                if last_trade_time and (now - last_trade_time) < timedelta(minutes=cooldown_minutes):
-                                    continue
-                                
-                                for strategy in strategies_to_run:
-                                
-                                    # --- FIX 1: Apply Halt Logic ---
-                                    # If regime_halt is on, only allow agnostic strategies
-                                    if self.regime_halt and not strategy.is_agnostic:
-                                        continue # Skip this regime-specific strategy
-                                    # --- END FIX 1 ---
-
-                                    try:
-                                        if signal := strategy.evaluate(token, self.regime, now):
-                                            all_potential_signals.append({"signal": signal, "token": token})
-                                    except Exception as e:
-                                         L.error(f"Error evaluating strategy {strategy.name.value} on token {token}: {e}", exc_info=True)
-
-
-                            # --- REFACTOR START (FIX 4: Biased Signal Selection) ---
-                            
-                            if not all_potential_signals:
-                                pass # No signals found
-                            else:
-                                # --- 6. Score All Signals (Gets Preliminary Params) ---
-                                scored_trades = []
-                                for potential in all_potential_signals:
-                                    signal, token = potential["signal"], potential["token"]
-                                    try:
-                                        trade_package = self._score_and_size_trade(signal, token)
-                                        if trade_package:
-                                            scored_trades.append({
-                                                "package": trade_package,
-                                                "signal": signal,
-                                                "token": token
-                                            })
-                                    except Exception as e:
-                                        L.error(f"Error scoring signal {signal.strategy_name.value} on token {token}: {e}", exc_info=True)
-
-                                if not scored_trades:
-                                    pass # No signals passed min score
-                                else:
-                                    # --- 7. Perform Final Sizing for ALL Candidates ---
-                                    fully_sized_candidates = []
-                                    for candidate in scored_trades:
-                                        signal = candidate["signal"]
-                                        token = candidate["token"]
-                                        score = candidate["package"]["score"]
-                                        
-                                        try:
-                                            final_sized_params = self.get_trade_params(
-                                                token=token,
-                                                side=signal.side,
-                                                risk_points_on_underlying=signal.risk_points,
-                                                reward_points_on_underlying=signal.reward_points,
-                                                strategy=signal.strategy_name.value,
-                                                regime=self.regime,
-                                                confidence_score=score # Use the REAL score
-                                            )
-                                            
-                                            if final_sized_params and final_sized_params.get('lots', 0) > 0:
-                                                fully_sized_candidates.append({
-                                                    "score": score, 
-                                                    "params": final_sized_params,
-                                                    "is_agnostic": candidate["package"]["is_agnostic"]
-                                                })
-                                            else:
-                                                L.debug(f"Signal {signal.strategy_name.value} dropped at final sizing (0 lots).")
-
-                                        except Exception as e:
-                                            L.error(f"Error during final sizing for {signal.strategy_name.value}: {e}", exc_info=True)
-
-                                    if not fully_sized_candidates:
-                                        pass # All candidates sized to 0 lots
-                                    else:
-                                        # --- 8. Final Risk Check on ALL Sized Candidates ---
-                                        risk_approved_candidates = []
-                                        for candidate in fully_sized_candidates:
-                                            try:
-                                                if self.risk_manager.risk_ok(hypothetical_params=candidate['params']):
-                                                    risk_approved_candidates.append(candidate)
-                                                else:
-                                                    L.debug(f"Signal {candidate['params']['strategy']} dropped by master risk controls.")
-                                            except Exception as e:
-                                                L.error(f"Error during final risk check for {candidate['params']['strategy']}: {e}", exc_info=True)
-                                    
-                                    if not risk_approved_candidates:
-                                        pass # All viable signals blocked by risk manager
-                                    else:
-                                        # --- 9. Pick the BEST from the final, approved list ---
-                                        # Sort by score (desc), prefer non-agnostic in ties
-                                        best_trade = max(risk_approved_candidates, key=lambda x: (x['score'], not x['is_agnostic']))
-                                        
-                                        # --- 10. Queue the single best trade ---
-                                        L.info(f"==> Queuing trade for {best_trade['params']['strategy']} on {best_trade['params']['opt']['tradingsymbol']} ({best_trade['params']['lots']} lots, Score: {best_trade['score']:.2f})")
-                                        self.trade_signal_queue.put(best_trade['params'])
-                                        self.last_trade_timestamp = now
-                                        self.underlying_cooldown[best_trade['params']['opt']['instrument_token']] = now
-                            
-                            # --- REFACTOR END ---
-        
-        # --- PROFILING LOGIC (runs outside the master_lock) ---
-        logic_end_time = time.perf_counter()
-        
-        exec_time_ms = (logic_end_time - logic_start_time) * 1000.0
-        lock_wait_ms = (logic_start_time - start_time) * 1000.0
-        
-        try:
-            interval_s = self.scheduler["strategic_planner"][1]
-            interval_ms = interval_s * 1000.0
-            warn_threshold_ms = interval_ms * 0.5 # 50% threshold
-        except (AttributeError, KeyError, IndexError, TypeError):
-            interval_ms = 2000.0 # Fallback
-            warn_threshold_ms = 1000.0 
-        
-        if exec_time_ms > warn_threshold_ms:
-            L.warning(f"PERF WARN: _run_strategic_planner logic took {exec_time_ms:.2f}ms. (Threshold: {warn_threshold_ms:.2f}ms, Lock Wait: {lock_wait_ms:.2f}ms)")
-        else:
-            L.debug(f"Strategic planner executed. Logic: {exec_time_ms:.2f}ms, Lock Wait: {lock_wait_ms:.2f}ms.")
-
-    def _trade_executor_worker(self):
-        L.info("Trade executor worker started.")
-        while self.running.is_set():
-            try:
-                trade_params = self.trade_signal_queue.get(timeout=1)
-
-                if not self.risk_manager.risk_ok(hypothetical_params=trade_params):
-                    L.warning(f"Trade for {trade_params['strategy']} rejected by final risk check just before execution.")
-                    continue
-
-                L.info(f"Executor received signal for {trade_params['strategy']}. Executing trade.")
-                if self.trader.open_position(trade_params):
-                    with self.master_lock:
-                        self.last_trade_timestamp = now_ist()
-
-            except Empty:
                 continue
             except Exception as e:
-                L.error(f"FATAL Error in trade executor worker: {e}", exc_info=True)
+                L.critical(f"🔥 FATAL SignalWorker Crash: {e}", exc_info=True)
+                time.sleep(1)
 
-    def _handle_entry_fill(self, pos: Position, order: Dict):
-        with self.master_lock:
-            filled_qty = order.get('filled_quantity', 0)
-
-        if order.get('status') == 'OPEN' and filled_qty > 0:
-            pos.is_entry_order_open = True
-        elif order.get('status') in ['COMPLETE', 'CANCELLED', 'REJECTED']:
-            pos.is_entry_order_open = False
-
-        if filled_qty > pos.qty:
-            new_fills = filled_qty - pos.qty
-            L.info(f"✅ Entry fill received for {pos.tradingsymbol}. Qty: {new_fills}. Total Filled: {filled_qty}.")
-
-            if pos.status == PositionStatus.PENDING_ENTRY.value:
-                # This method (trader._get_order_avg_price) is already refactored
-                avg_price = self.trader._get_order_avg_price(pos.entry_order_id) 
-                if not avg_price:
-                    send_alert(f"CRITICAL: Could not get avg price for entry {pos.entry_order_id}. Closing position.", "critical")
-                    self.trader.close_position(pos, "AVG_PRICE_FAILURE")
-                    return
-
-                pos.entry_price = avg_price
-                pos.qty = filled_qty
-                pos.high_price_since_entry = avg_price
-                pos.opened_at = now_ist()
-                pos.initial_sl_price = avg_price - pos.option_sl_points
-                pos.sl_price = pos.initial_sl_price
-                pos.tp_price = avg_price + pos.option_tp_points
-                self.risk_manager.initialize_position_greeks(pos)
-
-            pos.qty = filled_qty
-            pos.status = PositionStatus.OPEN_AWAITING_BRACKETS
-            
-            # --- FIXED: Use StoreActor ---
-            self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-            # --- END FIX ---
-
-        if order.get('status') in ['COMPLETE', 'CANCELLED', 'REJECTED']:
-            if pos.qty == 0:
-                L.warning(f"Entry order {pos.entry_order_id} for {pos.tradingsymbol} {order.get('status')} with no fills. Removing position.")
-                self.trader.positions.pop(pos.id, None)
-            else:
-                L.info(f"Entry order for {pos.tradingsymbol} is final. Total filled: {pos.qty}/{pos.initial_qty}.")
-                pos.status = PositionStatus.OPEN_AWAITING_BRACKETS
-                
-                # --- FIXED: Use StoreActor ---
-                self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-                # --- END FIX ---
-                self.risk_manager.verify_position_risk(pos)
-
-    def _handle_exit_fill(self, pos: Position, order: Dict):
-        with self.master_lock:
-            if pos.status == PositionStatus.CLOSED.value:
-                L.info(f"Ignoring duplicate fill for already closed position {pos.tradingsymbol}")
+    def health_check(self):
+        """Checks if threads are alive (crashes) and heartbeats are recent (freezes)."""
+        now = time.time()
+        MAX_THREAD_SILENCE = 60.0 
+        
+        # 1. Check Thread Liveness (Detects Crashes)
+        threads = {
+            "OrderProcessor": self.order_thread,
+            "TradeExecutor": self.trade_executor_thread,
+            "StoreActor": self.store_actor,
+            "OrderActor": self.trader.order_actor
+        }
+        if hasattr(self, 'signal_thread'): threads["SignalWorker"] = self.signal_thread
+        if hasattr(self, 'bar_thread'): threads["BarWorker"] = self.bar_thread
+        
+        for name, t in threads.items():
+            if t is None: continue
+            if not t.is_alive():
+                L.critical(f"💀 THREAD DIED: {name}. HALTING BOT.")
+                send_alert(f"💀 CRITICAL: {name} DIED (Crash). HALTING.", "critical")
+                self.fatal_error_event.set()
+                self.master_halt = True
                 return
 
-        reason = pos.exit_reason or "EXIT_FILL"
-        L.info(f"Exit order {order.get('order_id')} ({reason}) complete for {pos.id}.")
-        # This method (trader._cancel_all_open_orders_for_pos) is already refactored
-        self.trader._cancel_all_open_orders_for_pos(pos, cancel_entry=pos.is_entry_order_open)
+        # 2. Check Heartbeats (Detects Deadlocks)
+        for name, last_beat in self.heartbeats.items():
+            if name not in threads: continue 
+            if (now - last_beat) > MAX_THREAD_SILENCE:
+                L.critical(f"💀 THREAD FROZEN: {name}. Last beat {now - last_beat:.1f}s ago. HALTING.")
+                send_alert(f"💀 CRITICAL: {name} FROZEN (Deadlock). HALTING.", "critical")
+                self.fatal_error_event.set()
+                self.master_halt = True
+                return
 
-        # This method (trader._get_order_avg_price) is already refactored
-        exit_price = self.trader._get_order_avg_price(order.get('order_id')) or self.prices.ltp(pos.token)
-        if not exit_price and reason == "TP_HIT":
-            exit_price = pos.tp_price
-        if not exit_price:
-            L.error(f"Could not determine exit price for {pos.tradingsymbol}!")
-            return
-
-        final_filled_qty = order.get('filled_quantity', 0)
-        pnl_for_this_exit = 0.0 # Initialize PnL for this specific exit
-
-        if final_filled_qty > 0:
-            pnl_for_this_exit = (exit_price - pos.entry_price) * final_filled_qty
-            self.trader.daily_realized_pnl += pnl_for_this_exit # Add only the PnL from this final chunk
-            
-            # --- FIXED: Use StoreActor ---
-            self.store_actor.q.put({
-                "type": "log_strategy_performance",
-                "name": pos.strategy,
-                "pnl": pnl_for_this_exit
-            })
-            # --- END FIX ---
-            
-            L.info(f"Final exit fill PnL contribution: {pnl_for_this_exit:.2f} for {final_filled_qty} qty.")
-        else:
-            L.warning(f"Final exit order {order.get('order_id')} for {pos.tradingsymbol} completed with 0 fills? PnL contribution is 0.")
-
-        pos.status = PositionStatus.CLOSED.value
-        pos.exit_price = exit_price # Store the final average exit price
-
-        with self.risk_manager.lock:
-            if final_filled_qty > 0 and pos.greeks: 
-                delta_change = pos.greeks.get("delta", 0.0) * final_filled_qty
-                vega_change = pos.greeks.get("vega", 0.0) * final_filled_qty
-                gamma_change = pos.greeks.get("gamma", 0.0) * final_filled_qty
-                theta_change = pos.greeks.get("theta", 0.0) * final_filled_qty
-
-                self.risk_manager.portfolio_greeks["net_delta"] -= delta_change
-                self.risk_manager.portfolio_greeks["net_vega"] -= vega_change
-                self.risk_manager.portfolio_greeks["net_gamma"] -= gamma_change
-                self.risk_manager.portfolio_greeks["net_theta"] -= theta_change
-                L.info(f"Removed greeks for final {final_filled_qty} qty of {pos.tradingsymbol}. "
-                    f"Δ: {-delta_change:.2f}, V: {-vega_change:.2f}, Γ: {-gamma_change:.4f}, Θ: {-theta_change:.2f}")
-            elif final_filled_qty == 0:
-                L.warning(f"Skipping greek removal for {pos.tradingsymbol} as final filled qty is 0.")
-            elif not pos.greeks:
-                L.warning(f"Skipping greek removal for {pos.tradingsymbol} as pos.greeks is empty.")
-
-        pos.greeks = {}
-
-        # --- FIXED: Use StoreActor ---
-        self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-        self.store_actor.q.put({
-            "type": "log_closed_trade",
-            "pos": pos,
-            "price": exit_price,
-            "reason": reason
-        })
-        # --- END FIX ---
+    def _execute_flash_signal(self, flash):
+        """Zero-latency execution path bypassing strategy loop."""
+        u_name = "NIFTY" if flash['token'] == self.nifty_token else "BANKNIFTY" if flash['token'] == self.bn_token else None
+        if not u_name: return
         
-        self.risk_manager.update_performance_metrics(pnl_for_this_exit)
-        self.trader.positions.pop(pos.id, None)
-        send_alert(f"❌ CLOSED {pos.tradingsymbol} ({reason}). Final Piece PnL: {pnl_for_this_exit:.2f}. Daily PnL: {self.trader.daily_realized_pnl:.2f}")
+        # Grab pre-calc contract from Hot Chamber
+        key = f"{u_name}_{'CE' if flash['side'] == OrderSide.BUY else 'PE'}"
+        with self.hot_chamber_lock: pre = self.hot_chamber.get(key)
+        if not pre: return
 
+        # Cooldown Check
+        now = now_ist()
+        if (now - self.underlying_cooldown.get(flash['token'], datetime.min.replace(tzinfo=IST))).total_seconds() < 60: return
+        
+        L.info(f"⚡ FLASH TRIGGER: {u_name} TFI {flash['score']:.0f}. Firing {key} IOC.")
+        
+        # Direct Injection into Executor
+        self.trade_signal_queue.put({
+            "opt": pre['opt'], "lots": self.trading_config['max_lots_per_trade'], 
+            "strategy": "GAMMA_BURST_FLASH", "regime": self.regime.name,
+            "option_sl_points": pre['ltp'] * 0.10, "option_tp_points": pre['ltp'] * 0.30,
+            "total_trade_risk": 0.0, "underlying_sl": 0.0, "greeks": pre['greeks'],
+            "max_trade_duration_minutes": 10, "oi_profit_target": None, "intended_risk_rupees": 0.0
+        })
+        self.underlying_cooldown[flash['token']] = now
+        
+    def check_oi_pressure(self, token: int) -> str:
+        """
+        Checks for 'Short Covering' (Bullish) or 'Long Unwinding' (Bearish).
+        Returns: 'CALL_COVERING', 'PUT_UNWINDING', or None.
+        """
+        try:
+            # Get underlying symbol name
+            u_sym = self.book.get_symbol(token)
+            u_name = _get_underlying(u_sym)
+            spot = self.prices.ltp(token)
+            if not spot: return None
+            
+            # Get Option Chain for nearest expiry
+            expiry = self.book.find_nearest_expiry_date(u_name)
+            chain = self.book.get_option_chain(u_name, expiry)
+            
+            # Filter for ATM strikes (Spot +/- 2%) where the "battle" is
+            atm_chain = chain[
+                (chain['strike'] >= spot * 0.98) & 
+                (chain['strike'] <= spot * 1.02)
+            ]
+            
+            # Aggregated OI Change
+            ce_oi_change = atm_chain[atm_chain['instrument_type'] == 'CE']['oi_change'].sum()
+            pe_oi_change = atm_chain[atm_chain['instrument_type'] == 'PE']['oi_change'].sum()
+            
+            # Threshold: e.g., -200,000 contracts unwinding (Configurable)
+            UNWIND_THRESHOLD = self.technical_config.get("oi_unwind_threshold", -200000)
+            
+            if ce_oi_change < UNWIND_THRESHOLD:
+                L.info(f"🔥 SHORT COVERING DETECTED on {u_name}! Call Writers fleeing.")
+                return "CALL_COVERING"
+            
+            if pe_oi_change < UNWIND_THRESHOLD:
+                L.info(f"🔥 LONG UNWINDING DETECTED on {u_name}! Put Writers fleeing.")
+                return "PUT_UNWINDING"
+
+        except Exception as e:
+            L.error(f"OI Pressure Check Failed: {e}")
+            
+        return None
+
+    def _score_and_size_trade(self, signal: TradeSignal, token: int) -> Optional[Dict]:
+        """
+        The 'Brain' of the Engine.
+        Applies Institutional Gatekeepers, Scores Confluence, and Sizes based on GEX.
+        """
+        score = 1.0
+        is_agnostic = False
+        score_log = ["Base: 1.0"]
+        
+        # --- 1. VIX CHAOS & VPIN FILTER (The Shield) ---
+        vix = self.prices.ltp(self.vix_token) or 15.0
+        chaos_reduction = 0.5 if vix > 30.0 and signal.strategy_name != StrategyName.VOLATILITY_MEAN_REVERSION else 1.0
+        
+        # VPIN: If Flow is Toxic, Disable Mean Reversion
+        is_toxic = self.vpin_monitor.is_toxic(token) if hasattr(self, 'vpin_monitor') else False
+        if is_toxic and signal.strategy_name in [StrategyName.VOLATILITY_MEAN_REVERSION, StrategyName.TREND_PULLBACK]:
+            L.warning(f"🛑 Trade Blocked: Toxic Flow (VPIN) detected. Mean Reversion disabled.")
+            return None
+
+        # --- 2. VWAP FORTRESS (The Trend Lock) ---
+        df_5m = self.get_ohlc(token, 5)
+        vwap = 0.0
+        if not df_5m.empty:
+            # Robust VWAP Calc: Sum(P*V) / Sum(V)
+            cum_pv = (df_5m['close'] * df_5m['volume']).cumsum()
+            cum_vol = df_5m['volume'].cumsum()
+            vwap = (cum_pv / cum_vol).iloc[-1] if cum_vol.iloc[-1] > 0 else df_5m['close'].iloc[-1]
+            curr_price = self.prices.ltp(token) or df_5m['close'].iloc[-1]
+            
+            # Rule: Never buy below VWAP, Never sell above VWAP
+            if signal.side == OrderSide.BUY and curr_price < vwap:
+                L.info(f"🛡️ VWAP Block: Price {curr_price:.2f} < VWAP {vwap:.2f}. Longs denied.")
+                return None
+            if signal.side == OrderSide.SELL and curr_price > vwap:
+                L.info(f"🛡️ VWAP Block: Price {curr_price:.2f} > VWAP {vwap:.2f}. Shorts denied.")
+                return None
+
+        # --- 3. TWIN ENGINE & KINGPIN LOCK (The Confirmation) ---
+        other_token = self.bn_token if token == self.nifty_token else self.nifty_token
+        # Tokens: RELIANCE (738561) / HDFCBANK (341249) - Verify these in your instrument list
+        kingpin_token = 738561 if token == self.nifty_token else 341249 
+
+        # A. Twin Engine Check (Index Sync)
+        other_df = self.get_ohlc(other_token, 1)
+        other_ltp = self.prices.ltp(other_token)
+        if not other_df.empty and other_ltp:
+            other_open = other_df.iloc[-min(len(other_df), 2)]['open']
+            other_change = (other_ltp - other_open) / other_open
+            
+            # If divergence > 0.03%, Block it.
+            if signal.side == OrderSide.BUY and other_change < -0.0003:
+                L.warning(f"🛑 Twin Engine Fail: Target BUY, but Peer Index down {other_change*100:.3f}%")
+                return None
+            elif signal.side == OrderSide.SELL and other_change > 0.0003:
+                L.warning(f"🛑 Twin Engine Fail: Target SELL, but Peer Index up {other_change*100:.3f}%")
+                return None
+            score_log.append("Twin Engine: OK")
+
+        # B. Kingpin Lock (Constituent Check)
+        if kingpin_token:
+            kp_df = self.get_ohlc(kingpin_token, 5)
+            if not kp_df.empty:
+                kp_vwap = ((kp_df['close'] * kp_df['volume']).cumsum() / kp_df['volume'].cumsum()).iloc[-1]
+                kp_ltp = self.prices.ltp(kingpin_token)
+                if kp_ltp and kp_vwap > 0:
+                    if signal.side == OrderSide.BUY and kp_ltp < kp_vwap:
+                        L.warning(f"🛑 Kingpin Lock: General is WEAK (< VWAP). Cannot Buy Index.")
+                        return None
+                    if signal.side == OrderSide.SELL and kp_ltp > kp_vwap:
+                        L.warning(f"🛑 Kingpin Lock: General is STRONG (> VWAP). Cannot Sell Index.")
+                        return None
+
+        # --- 4. EFFORT vs RESULT (Volume Efficiency) ---
+        if len(df_5m) > 2:
+            curr_bar = df_5m.iloc[-1]
+            vol, rng = curr_bar['volume'], curr_bar['high'] - curr_bar['low']
+            if vol > 0:
+                efficiency = rng / vol
+                avg_eff = ((df_5m['high'] - df_5m['low']).rolling(10).sum() / df_5m['volume'].rolling(10).sum()).iloc[-1]
+                
+                # High Vol + Low Range = CHURN (Trap)
+                if avg_eff > 0 and efficiency < (avg_eff * 0.5): 
+                    L.warning(f"🛑 Churn Detected: High Vol / Low Range.")
+                    return None
+                score_log.append("Vol Eff: OK")
+
+        # --- 5. CONFLUENCE SCORING ---
+        
+        # Regime Match
+        if "AGNOSTIC" in self.strategies and signal.strategy_name in [s.name.value for s in self.strategies.get("AGNOSTIC", [])]:
+             is_agnostic = True; score_log.append("Agnostic")
+        else:
+             good_combos = {
+                 Regime.TRENDING_UP: [StrategyName.TREND_PULLBACK, StrategyName.SLINGSHOT],
+                 Regime.TRENDING_DOWN: [StrategyName.TREND_PULLBACK, StrategyName.SLINGSHOT],
+                 Regime.COMPRESSION: [StrategyName.MOMENTUM_IGNITION],
+                 Regime.CHAOS: [StrategyName.VOLATILITY_MEAN_REVERSION]
+             }
+             if signal.strategy_name in good_combos.get(self.regime, []): 
+                 score += 1.0; score_log.append("Regime Match: +1.0")
+
+        # Radar (Kingmaker)
+        if self.radar:
+            idx = "BANKNIFTY" if token == self.bn_token else "NIFTY"
+            radar_score = self.radar.get_weighted_momentum(idx)
+            if (signal.side == OrderSide.BUY and radar_score > 20) or (signal.side == OrderSide.SELL and radar_score < -20): 
+                score += 2.0; score_log.append(f"Radar ({radar_score:.0f}): +2.0")
+            elif (signal.side == OrderSide.BUY and radar_score < -10) or (signal.side == OrderSide.SELL and radar_score > 10): 
+                return None # Block if constituents disagree
+
+        # StatArb
+        if self.nifty_bn_zscore is not None:
+            z = self.nifty_bn_zscore
+            if (token == self.nifty_token and ((signal.side==OrderSide.BUY and z < -1.5) or (signal.side==OrderSide.SELL and z > 1.5))) or \
+               (token == self.bn_token and ((signal.side==OrderSide.BUY and z > 1.5) or (signal.side==OrderSide.SELL and z < -1.5))):
+                score += 1.0; score_log.append("StatArb: +1.0")
+
+        # Market Breadth
+        if self.market_breadth != 0:
+            thr = self.technical_config.get("breadth_score_threshold", 10)
+            if (signal.side == OrderSide.BUY and self.market_breadth > thr) or (signal.side == OrderSide.SELL and self.market_breadth < -thr): 
+                score += 1.0; score_log.append("Breadth: +1.0")
+            elif (signal.side == OrderSide.BUY and self.market_breadth < -thr) or (signal.side == OrderSide.SELL and self.market_breadth > thr): 
+                score -= 1.0
+
+        # OI Pressure (The Decoupler)
+        oi_signal = self.check_oi_pressure(token)
+        if oi_signal:
+            if (signal.side == OrderSide.BUY and oi_signal == "CALL_COVERING") or \
+               (signal.side == OrderSide.SELL and oi_signal == "PUT_UNWINDING"):
+                score += 3.0; score_log.append("🔥 OI Pressure: +3.0")
+
+        # --- 6. FINAL THRESHOLD CHECK ---
+        if score < self.trading_config.get("min_trade_score", 1.0): 
+            return None
+        
+        # --- 7. PARAMETER CALCULATION (Rent-to-Speed Selection) ---
+        # This calls _find_best_option_contract which now uses Gamma/Theta efficiency
+        prelim = self.get_trade_params(token, signal.side, signal.risk_points, signal.reward_points, signal.strategy_name.value, self.regime, score)
+        if not prelim: return None
+
+        # --- 8. GEX SIZING (The Multiplier) ---
+        u_sym = self.book.get_symbol(token)
+        gex_data = self.gex_matrix.gamma_profile.get(_get_underlying(u_sym))
+        
+        gex_multiplier = 1.0
+        if gex_data:
+            if gex_data['is_accelerating']: # Negative GEX
+                gex_multiplier = 2.0
+                score_log.append("Neg GEX: Size x2")
+            elif gex_data['is_suppressing']: # Positive GEX
+                gex_multiplier = 0.5
+                score_log.append("Pos GEX: Size x0.5")
+
+        prelim['lots'] = max(1, int(prelim['lots'] * gex_multiplier))
+        prelim['intended_risk_rupees'] *= gex_multiplier
+        prelim['chaos_reduction'] = chaos_reduction
+        
+        L.info(f"✅ Trade Scored: {score:.1f} | Size Mult: {gex_multiplier} | Logic: {', '.join(score_log)}")
+        return {"score": max(0, score), "params": prelim, "is_agnostic": is_agnostic}
+    
     def _handle_order_update_from_queue(self, order: Dict):
         oid, status = str(order.get('order_id')), order.get('status')
         pos_id = f"LIVE_{oid}"
 
         with self.trader.lock:
+            # Try to find position by Entry ID first, then by other IDs
             pos = self.trader.positions.get(pos_id)
             if not pos:
                 pos = next((p for p in self.trader.positions.values() if oid in [p.tp_order_id, p.exit_order_id, p.slm_order_id] or oid in p.partial_exit_order_ids), None)
                 if not pos:
-                    L.debug(f"Received order update for {oid} but no matching position found.")
+                    # L.debug(f"Received order update for {oid} but no matching position found.")
                     return
 
+            # --- 1. ENTRY UPDATES ---
             if oid == pos.entry_order_id:
-                self._handle_entry_fill(pos, order)
+                if status == 'COMPLETE':
+                    self._handle_entry_fill(pos, order)
+                
+                elif status == 'CANCELLED':
+                    # [CRITICAL FIX] IOC orders that don't fill are CANCELLED by exchange.
+                    # We must kill the position object immediately.
+                    L.warning(f"⛔ Entry Order {oid} CANCELLED (IOC/Timeout). Killing Position {pos.tradingsymbol}.")
+                    pos.status = PositionStatus.REJECTED.value
+                    pos.exit_reason = "ENTRY_CANCELLED_IOC"
+                    
+                    # Update DB and Remove from Memory
+                    self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+                    self.trader.positions.pop(pos.id, None)
 
-            elif (oid in [pos.tp_order_id, pos.exit_order_id, pos.slm_order_id] or oid in pos.partial_exit_order_ids) and status == 'COMPLETE':
-                if oid in pos.partial_exit_order_ids:
-                    # This method (trader._handle_partial_exit_fill) is already refactored
-                    self.trader._handle_partial_exit_fill(pos, order)
-                else:
-                    if oid == pos.slm_order_id:
-                        pos.exit_reason = "SL_HIT_BROKER"
-                    elif oid == pos.tp_order_id:
-                        pos.exit_reason = "TP_HIT_BROKER"
-                    self._handle_exit_fill(pos, order)
-            
-            elif status == 'REJECTED':
-                if oid == pos.entry_order_id:
-                    L.error(f"Entry order {oid} for {pos.tradingsymbol} REJECTED. Reason: {order.get('status_message')}")
+                elif status == 'REJECTED':
+                    L.error(f"Entry order {oid} REJECTED. Reason: {order.get('status_message')}")
                     pos.status = PositionStatus.REJECTED.value
                     pos.exit_reason = f"ENTRY_REJECTED: {order.get('status_message')}"
-                    
-                    # --- FIXED: Use StoreActor ---
                     self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-                    # --- END FIX ---
-                    
                     self.trader.positions.pop(pos.id, None)
-                elif oid in [pos.tp_order_id, pos.slm_order_id]:
-                    L.critical(f"Bracket order {oid} ({'TP' if oid == pos.tp_order_id else 'SL'}) for {pos.tradingsymbol} REJECTED: {order.get('status_message')}")
-                    send_alert(f"🔥 CRITICAL: BRACKET ORDER REJECTED for {pos.tradingsymbol}. Closing position!", "critical")
-                    self.trader.close_position(pos, "BRACKET_REJECTED")
-            
-            elif status == 'CANCELLED':
-                L.info(f"Order {oid} for {pos.tradingsymbol} was CANCELLED.")
-                # This is informational. The fill handlers manage state.
-                pass
 
-    # Insert this method inside the Engine class in main1.py
-    def run_regime_classification(self, current_time: datetime):
-            """
-            Runs the classifier and applies hysteresis to prevent "flip-flopping".
-            The official regime only changes after the new signal is confirmed
-            for `regime_confirmation_threshold` consecutive cycles.
-            """
+            # --- 2. EXIT/BRACKET UPDATES ---
+            elif (oid in [pos.tp_order_id, pos.exit_order_id, pos.slm_order_id] or oid in pos.partial_exit_order_ids):
+                if status == 'COMPLETE':
+                    if oid in pos.partial_exit_order_ids:
+                        self.trader._handle_partial_exit_fill(pos, order)
+                    else:
+                        if oid == pos.slm_order_id:
+                            pos.exit_reason = "SL_HIT_BROKER"
+                        elif oid == pos.tp_order_id:
+                            pos.exit_reason = "TP_HIT_BROKER"
+                        self._handle_exit_fill(pos, order)
+                
+                elif status == 'CANCELLED':
+                     L.info(f"ℹ️ Exit/Bracket Order {oid} for {pos.tradingsymbol} was CANCELLED.")
+                     # If a main exit order (Panic/Market) is cancelled, we are in trouble.
+                     if oid == pos.exit_order_id:
+                         L.warning(f"⚠️ CRITICAL: Main Exit Order {oid} Cancelled! Position {pos.tradingsymbol} might be stuck.")
+                         # Reset status to allow retry
+                         pos.status = PositionStatus.ACTIVE.value
+                         self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+
+                elif status == 'REJECTED':
+                    if oid in [pos.tp_order_id, pos.slm_order_id]:
+                        L.critical(f"Bracket order {oid} REJECTED: {order.get('status_message')}")
+                        send_alert(f"🔥 CRITICAL: BRACKET ORDER REJECTED for {pos.tradingsymbol}. Closing position!", "critical")
+                        self.trader.close_position(pos, "BRACKET_REJECTED")
+
+    def _order_processor_worker(self):
+        L.info("Order processor worker started.")
+        while self.running.is_set():
+            self.heartbeats["OrderProcessor"] = time.time()
             try:
-                # 1. Get the RAW, unconfirmed signal from the classifier
-                raw_regime, active_token, raw_confidence = self.classifier.get_raw_classification(self.regime)
-                
-                # 2. Apply Hysteresis (Confirmation) Logic
-                if raw_regime == self.potential_regime:
-                    # Signal is the same as last cycle, increment counter
-                    self.potential_regime_count += 1
-                else:
-                    # Signal is new, reset the potential regime and counter
-                    self.potential_regime = raw_regime
-                    self.potential_regime_count = 1
-                    L.debug(f"Regime Hysteresis: New potential regime {raw_regime.name}. Awaiting confirmation...")
+                order = self.prices.order_update_queue.get(timeout=1)
+                self._handle_order_update_from_queue(order)
+            except Empty: continue
+            except Exception as e: L.error(f"Error in order processor worker: {e}", exc_info=True)
+            
+    def _update_gex(self):
+        """Background task to update Dealer Gamma Exposure."""
+        for t in [self.nifty_token, self.bn_token]:
+            if t: self.gex_matrix.calculate_gex(t)
 
-                # 3. Check for Official Regime Change
-                is_confirmed = self.potential_regime_count >= self.regime_confirmation_threshold
-                is_new_regime = self.potential_regime != self.regime
-                
-                if is_confirmed and is_new_regime:
-                    # --- This is the official change ---
-                    old_regime_name = self.regime.name
-                    self.regime = self.potential_regime
-                    self.regime_confidence = raw_confidence # Use the latest confidence
-                    
-                    # Track change for flip rate
-                    self.regime_change_history.append(current_time)
-                    
-                    # Update Prometheus Metric
-                    if G_CURRENT_REGIME:
-                        try:
-                            G_CURRENT_REGIME.clear()
-                            G_CURRENT_REGIME.labels(regime_name=self.regime.name).set(self.regime.value)
-                        except Exception as e:
-                            L.warning(f"Failed to set Prometheus regime gauge: {e}")
+    def start(self):
+        if not all([self.trader, self.risk_manager, self.micro_monitor, self.pos_manager, self.radar]):
+            raise SystemExit("FATAL: Dependencies not set.")
 
-                    self.last_regime_change_time = current_time
-                    log_msg = f"REGIME CHANGE CONFIRMED: {old_regime_name} -> {self.regime.name} (Conf: {self.regime_confidence:.2f})"
-                    L.info(log_msg)
-                    send_alert(log_msg)
-                
-                elif self.regime == self.potential_regime:
-                    # Regime is stable, just update the confidence score
-                    self.regime_confidence = raw_confidence
-
-                # Handle the active token (this can update every cycle)
-                if active_token:
-                    self.active_underlying_token = active_token
-
-            except Exception as e:
-                L.error(f"FATAL Error in regime classification: {e}", exc_info=True)
-                self.regime = Regime.UNCLEAR
-                self.regime_confidence = 0.0
-
-    def _find_best_option_contract(self, underlying_token: int, expiry: date, option_type: OptionType, strategy: str, regime: Regime) -> Optional[Dict]:
-        spot = self.prices.ltp(underlying_token)
-        if not spot:
-            return None
-
-        strategy_obj = next((s for s_list in self.strategies.values() for s in s_list if s.name.value == strategy), None)
-        if not strategy_obj:
-            return None
-
-        now = now_ist()
-        market_close_time = self.timings_config["market_close"]
-        expiry_date = expiry.date() if isinstance(expiry, pd.Timestamp) else expiry
-        T = _calculate_time_to_expiry(expiry_date, now, market_close_time)
-        dte = (expiry_date - now.date()).days
-
-        strike_cfg = self.trading_config['strike_selection']
+        self.warm_up()
+        self.prices.start()
+        if not self.prices.connected.wait(10): raise SystemExit("FATAL: PriceBus WebSocket failed.")
+        threading.Thread(target=self._signal_worker, daemon=True, name="SignalWorker").start()
+        threading.Thread(target=self._bar_worker, daemon=True, name="BarWorker").start()
         
-        if dte <= 1: # Expiry day or day before
-             target_delta = strike_cfg.get('expiry_delta', 0.65)
-        elif dte <= 3: # Expiry week
-             target_delta = strike_cfg.get('expiry_week_delta', 0.55)
-        elif regime in [Regime.TRENDING_UP, Regime.TRENDING_DOWN]:
-             target_delta = strike_cfg.get('trend_delta', 0.45)
-        elif regime == Regime.CHOP:
-             target_delta = strike_cfg.get('chop_delta', 0.60)
-        else: # COMPRESSION
-             target_delta = strike_cfg.get('compression_delta', 0.50)
+        self.signal_thread = threading.Thread(target=self._signal_worker, daemon=True, name="SignalWorker")
+        self.signal_thread.start()
+        
+        self.bar_thread = threading.Thread(target=self._bar_worker, daemon=True, name="BarWorker")
+        self.bar_thread.start()
 
-        underlying_symbol = self.book.get_symbol(underlying_token)
-        underlying_name = _get_underlying(underlying_symbol)
+        self.prices.subscribe([self.nifty_token, self.bn_token, self.vix_token])
+        self.running.set()
 
-        step = self.book.step_size(underlying_name)
-        num_strikes = 5
+        for t_name, t_func in [("OrderProcessor", self._order_processor_worker), 
+                               ("TradeExecutor", self._trade_executor_worker)]:
+            t = threading.Thread(target=t_func, name=t_name, daemon=True)
+            t.start()
+            if t_name == "OrderProcessor": self.order_thread = t
+            else: 
+                self.trade_executor_thread = t
 
-        otm_strikes_chain = self.book.get_option_chain(underlying_name, expiry)
-        otm_calls = otm_strikes_chain[(otm_strikes_chain['instrument_type'] == 'CE') & (otm_strikes_chain['strike'] > spot)].sort_values('strike').head(num_strikes)
-        otm_puts = otm_strikes_chain[(otm_strikes_chain['instrument_type'] == 'PE') & (otm_strikes_chain['strike'] < spot)].sort_values('strike', ascending=False).head(num_strikes)
+        for name, (func, interval) in self.scheduler.items():
+            t = threading.Thread(target=self._run_task_in_loop, args=(func, interval, name), name=name, daemon=True)
+            t.start()
+            self.scheduler_threads[name] = t
+            L.info(f"Started scheduler thread for '{name}' with {interval}s interval.")
 
-        iv_analysis_chain = pd.concat([otm_calls, otm_puts])
-        if iv_analysis_chain.empty:
-            return None
+        self.loop()
 
-        now = now_ist()
-        market_close_time = self.timings_config["market_close"]
-        underlying_bars = self.bars.get_ohlc(underlying_token, 1)
-        hv = calculate_historical_volatility(underlying_bars['close'], timeframe_minutes=1) if not underlying_bars.empty else 0.3
+    def _run_task_in_loop(self, func: Callable, interval: int, name: str):
+        while self.running.is_set():
+            try:
+                check = False
+                if name == "strategic_planner":
+                    with self.master_lock: check = self.master_halt
+                if not check: func()
+            except Exception as e: L.error(f"Error in task '{name}': {e}", exc_info=True)
+            time.sleep(interval)
 
-        avg_iv = self._calculate_atm_iv(underlying_token, spot, expiry, T, hv)
-        if not avg_iv:
-    # Fallback if helper fails
-            L.warning(f"ATM IV calculation failed for {underlying_name}. Using HV {hv} as fallback.")
-            avg_iv = hv or 0.3
+    def _send_eod_report(self):
+        if now_ist().time() > self.timings_config["market_close"] and not self.eod_report_sent:
+            L.info("Sending EOD report...")
+            q = queue.Queue()
+            self.store_actor.q.put({"type": "get_todays_trades_stats", "reply_q": q})
+            try:
+                resp = q.get(timeout=10)
+                wins, losses = resp['res'] if resp['ok'] else (0, 0)
+            except: wins, losses = 0, 0
+            
+            total = wins + losses
+            rate = (wins/total*100) if total > 0 else 0
+            msg = f"📊 EOD Report\nPnL: ₹{self.trader.daily_realized_pnl:,.2f}\nTrades: {total} (W:{wins} L:{losses})\nWin Rate: {rate:.1f}%"
+            send_alert(msg)
+            self.eod_report_sent = True
 
-# Use the cached IV if it's available, otherwise use the one we just calculated
-        avg_iv = self.atm_iv_cache.get(underlying_name, avg_iv)
+    def loop(self):
+        send_alert("🛡️ SENTINEL PRIME ENGAGED.")
+        while now_ist().time() < self.timings_config["market_open"] and self.running.is_set(): time.sleep(60)
+        if not self.running.is_set(): self.stop(); return
 
-        if underlying_token not in self.historical_avg_iv:
-            self.historical_avg_iv[underlying_token] = pd.Series(dtype=float)
+        send_alert("🔔 Market OPEN.")
+        try:
+            while self.running.is_set():
+                now = now_ist()
+                if now.time() >= self.timings_config["market_close"]: break
 
-        s = self.historical_avg_iv[underlying_token]
-        self.historical_avg_iv[underlying_token] = pd.concat([s, pd.Series([avg_iv], index=[now])])
-        self.historical_avg_iv[underlying_token] = self.historical_avg_iv[underlying_token].last('4H')
-        lookback = self.technical_config.get("iv_contraction_lookback", 120)
-        iv_series = self.historical_avg_iv[underlying_token]
+                if self.fatal_error_event.is_set():
+                    with self.master_lock: self.master_halt = True
+                    send_alert("🔥 FATAL ERROR. HALTING.", "critical")
+                    self.fatal_error_event.clear()
 
-        is_in_contraction = False
-        if len(iv_series) > lookback:
-            iv_percentile = iv_series.rolling(lookback).rank(pct=True).iloc[-1]
-            if iv_percentile < self.technical_config.get("iv_contraction_threshold_pct", 10) / 100.0:
-                is_in_contraction = True
-                L.info(f"VOLATILITY CONTRACTION DETECTED for {underlying_name}. Avg IV Pct Rank: {iv_percentile*100:.2f}%")
+                with self.master_lock:
+                    if os.path.exists(KILL_SWITCH_FILE) and not self.master_halt:
+                        self.master_halt = True
+                        if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
+                        send_alert("⛔ KILL SWITCH DETECTED.", "critical")
 
-        if strategy == StrategyName.MOMENTUM_BREAKOUT.value and not is_in_contraction:
-            L.info(f"MomentumBreakout signal for {underlying_name} skipped. Not in IV contraction phase.")
-            return None
+                    if not self.eod_flatten_triggered and now.time() >= self.timings_config["eod_flatten_time"]:
+                        self.master_halt = True; self.eod_flatten_triggered = True
+                        if G_HALTED_STATUS: G_HALTED_STATUS.set(1)
+                        with self.trader.lock:
+                            for p in [pos for pos in self.trader.positions.values() if pos.status not in ["CLOSED", "PENDING_CLOSURE"]]:
+                                self.trader.close_position(p, "EOD_FLATTEN")
+                time.sleep(10)
+        except KeyboardInterrupt: self.stop(); return
 
-        full_chain = self.book.get_option_chain(underlying_name, expiry)
-        trade_chain = full_chain[full_chain['instrument_type'] == option_type.value].copy()
-        atm_strike = round(spot / step) * step
-        search_range = 15 * step
-        trade_chain = trade_chain[(trade_chain['strike'] >= atm_strike - search_range) & (trade_chain['strike'] <= atm_strike + search_range)]
-        if trade_chain.empty:
-            return None
+        if not self.eod_report_sent: self._send_eod_report()
+        if self.last_trading_day:
+            self.store_actor.q.put({"type": "set_kv", "key": f"daily_pnl_{self.last_trading_day}", "value": str(self.trader.daily_realized_pnl)})
+        
+        send_alert(f"💤 Shutdown. PnL: ₹{self.trader.daily_realized_pnl:,.2f}")
+        self.stop()
 
-        min_volume = self.trading_config['option_selection_filters']['min_option_volume']
-        min_oi = self.trading_config['option_selection_filters']['min_option_oi']
-        options_with_metrics = []
+    def _load_strategies(self):
+        strats = {r: [] for r in Regime}
+        strats["AGNOSTIC"] = []
+        
+        cfg = self.config["strategies"]
+        
+        # 1. COMPRESSION: MOMENTUM IGNITION
+        # We reuse 'MomentumBreakout' config params if available, or default dict
+        if "MomentumBreakout" in cfg: 
+             ignition = MomentumIgnitionStrategy(StrategyName.MOMENTUM_IGNITION, self, cfg['MomentumBreakout'])
+             strats[Regime.COMPRESSION].append(ignition)
+
+        # 2. TRENDING: TREND PULLBACK & SLINGSHOT (Bear/Bull Traps)
+        if "TrendPullback" in cfg: 
+            tp = TrendPullbackStrategy(StrategyName.TREND_PULLBACK, self, cfg['TrendPullback'])
+            strats[Regime.TRENDING_UP].append(tp)
+            strats[Regime.TRENDING_DOWN].append(tp)
+        
+        # Slingshot catches reversals/traps in trends
+        slingshot = SlingshotStrategy(StrategyName.SLINGSHOT, self, {}) 
+        strats[Regime.TRENDING_UP].append(slingshot)
+        strats[Regime.TRENDING_DOWN].append(slingshot)
+
+        # 3. CHOP: SLINGSHOT ONLY (Replaces MeanReversion)
+        # Slingshot is safer in chop than standard mean reversion
+        strats[Regime.CHOP].append(slingshot)
+
+        # 4. CHAOS: VOLATILITY MEAN REVERSION
+        if "VolatilityMeanReversion" in cfg: 
+            vmr = VolatilityMeanReversionStrategy(StrategyName.VOLATILITY_MEAN_REVERSION, self, cfg['VolatilityMeanReversion'])
+            strats[Regime.CHAOS].append(vmr)
+
+        # 5. AGNOSTIC: ORB & GAMMA BURST
+        if "OpeningRangeBreakout" in cfg:
+             orb = OpeningRangeBreakout(StrategyName.OPENING_RANGE_BREAKOUT, self, cfg['OpeningRangeBreakout'])
+             orb.is_agnostic = True
+             strats["AGNOSTIC"].append(orb)
+        
+        if "GammaBurst" in cfg:
+            gb = GammaBurstStrategy(StrategyName.GAMMA_BURST, self, cfg['GammaBurst'])
+            strats["AGNOSTIC"].append(gb) 
+
+        return strats
+
+    def _setup_scheduler(self):
+        tasks = {
+            "strategic_planner": (self._run_strategic_planner, 2),
+            "hot_chamber_reload": (self._update_hot_chamber, 30),
+            "position_management": (self.pos_manager.manage_positions, 1),
+            "pnl_updater": (self.risk_manager.update_pnl_metrics, 2),
+            "circuit_breaker": (self.risk_manager.check_circuit_breaker, 5),
+            "reconciliation": (self.reconcile, 300),
+            "health_check": (self.health_check, 60),
+            "garbage_collector": (self._run_gc, 300),
+            "strategy_weighting": (self.risk_manager._update_strategy_weights, 3600),
+            "eod_report": (self._send_eod_report, 300),
+            "data_persistence": (self._persist_bar_data, 3600),
+            "bar_reconciliation": (self._reconcile_bars, 900),
+            "pnl_reconciliation": (self.risk_manager.reconcile_broker_pnl, 900),
+            "atm_iv_cache": (self._update_atm_iv_cache, 10),
+            "market_breadth": (self._update_market_breadth, 300)
+        }
+        if METRICS_APP: tasks["prometheus_metrics"] = (self._update_prometheus_metrics, 15)
+        return tasks
+    
+    def _run_gc(self):
+        """Upgrade #8: Aggressive Memory Management."""
+        # Trim BarStore
+        with self.bars.lock:
+            for token in self.bars.data:
+                for tf in self.bars.data[token]:
+                    # Keep only last 2000 candles
+                    if len(self.bars.data[token][tf]) > 2000:
+                        self.bars.data[token][tf] = self.bars.data[token][tf].iloc[-2000:]
+        
+        # Force Python GC
+        collected = gc.collect()
+        L.info(f"Garbage Collector ran. Freed {collected} objects.")
+
+    def _reset_daily_state(self):
+        L.info("Resetting daily state."); self.risk_manager.reset_daily_state(self.last_trading_day)
+        with self.master_lock:
+            self.master_halt = False; self.regime_halt = False; self.last_trade_timestamp = None
+            if os.path.exists(KILL_SWITCH_FILE): os.remove(KILL_SWITCH_FILE)
+            if G_HALTED_STATUS: G_HALTED_STATUS.set(0)
+        self.eod_flatten_triggered = False; self.eod_report_sent = False; self.last_trading_day = now_ist().date()
+
+    def warm_up(self):
+        L.info("Warming up...")
+        self.last_trading_day = now_ist().date()
+        self.risk_manager.load_persistent_state(self.last_trading_day)
+        
+        try:
+            path = self.technical_config.get("nifty_50_constituents_file")
+            if path and os.path.exists(path):
+                with open(path, 'r') as f: self.nifty_50_tokens = json.load(f)
+        except: pass
+        
+        to_date = self.last_trading_day
+        from_date = to_date - timedelta(days=self.technical_config["warmup_days"])
+        
+        for token in [self.nifty_token, self.bn_token]:
+            if not token: continue
+            q = queue.Queue()
+            self.trader.order_actor.q.put({"type": "historical_data", "params": {"instrument_token": token, "from_date": from_date, "to_date": to_date, "interval": "minute"}, "reply_q": q})
+            try:
+                res = q.get(timeout=30)
+                if res['ok'] and res['res']: self.bars.prime(token, pd.DataFrame(res['res']))
+            except: L.error(f"Warmup failed for {token}")
+
+        if self.vix_token:
+            q = queue.Queue()
+            self.trader.order_actor.q.put({"type": "historical_data", "params": {"instrument_token": self.vix_token, "from_date": to_date - timedelta(days=365), "to_date": to_date, "interval": "day"}, "reply_q": q})
+            try:
+                res = q.get(timeout=30)
+                if res['ok'] and res['res']: self.vix_long_history_df = pd.DataFrame(res['res'])
+            except: pass
+            
+    def reconcile(self):
+        if PAPER_TRADING:
+            return
+        L.info("--- Starting State Reconciliation with Broker ---")
+        try:
+            # 1. Get Real Positions from Broker (OrderActor)
+            pos_reply_q = queue.Queue()
+            self.trader.order_actor.q.put({"type": "positions", "reply_q": pos_reply_q})
+            
+            broker_positions_data = None
+            try:
+                pos_resp = pos_reply_q.get(timeout=10.0)
+                if pos_resp['ok']:
+                    broker_positions_data = pos_resp['res']
+            except queue.Empty:
+                L.error("Reconcile: Timeout getting broker positions.")
+                return
+
+            if not broker_positions_data: return
+
+            # 2. Get Bot's Internal Positions (StoreActor)
+            db_reply_q = queue.Queue()
+            self.store_actor.q.put({"type": "load_open_positions", "reply_q": db_reply_q})
+            
+            db_positions = {}
+            try:
+                db_resp = db_reply_q.get(timeout=10.0)
+                if db_resp['ok']:
+                    db_positions = db_resp['res']
+            except queue.Empty: return
+
+            # 3. Compare and Kill Rogues
+            broker_positions_raw = broker_positions_data.get('net', [])
+            # Filter for open MIS (Intraday) positions
+            broker_positions_map = {
+                pos['tradingsymbol']: pos 
+                for pos in broker_positions_raw 
+                if pos.get('product') == 'MIS' and abs(pos.get('quantity', 0)) > 0
+            }
+            
+            broker_symbols = set(broker_positions_map.keys())
+            db_symbols = {p.tradingsymbol for p in db_positions.values()}
+
+            # CASE A: Bot thinks it's open, Broker says it's closed -> Mark Closed in DB
+            for symbol in db_symbols - broker_symbols:
+                pos = next((p for p in db_positions.values() if p.tradingsymbol == symbol), None)
+                if pos:
+                    L.warning(f"RECONCILE: Ghost position {symbol} detected. Marking CLOSED.")
+                    pos.status = PositionStatus.CLOSED.value
+                    pos.exit_reason = "RECONCILE_GHOST_CLOSE"
+                    self.store_actor.q.put({"type": "upsert_position", "pos": pos})
+
+            # CASE B: Broker has a position, Bot knows nothing -> FLATTEN IMMEDIATELY (Safety Net)
+            for symbol in broker_symbols - db_symbols:
+                rogue_pos_data = broker_positions_map[symbol]
+                qty = rogue_pos_data['quantity']
+                send_alert(f"🔥 ROGUE POSITION FOUND: {symbol} (Qty: {qty}). Auto-flattening!", "critical")
+                
+                transaction_type = "SELL" if qty > 0 else "BUY"
+                
+                L.info(f"Reconcile: Placing market order to flatten rogue {symbol}...")
+                place_params = {
+                    "variety": "regular", 
+                    "exchange": "NFO", 
+                    "tradingsymbol": symbol,
+                    "transaction_type": transaction_type, 
+                    "quantity": abs(qty),
+                    "product": "MIS", 
+                    "order_type": "MARKET"
+                }
+        except Exception as e:
+            L.error(f"Reconciliation logic failed: {e}", exc_info=True)
+
+    def _get_iv_rank(self) -> Optional[float]:
+        if self.vix_long_history_df.empty or not self.vix_token: return None
+        curr = self.prices.ltp(self.vix_token)
+        if not curr: return None
+        mn, mx = self.vix_long_history_df['close'].min(), self.vix_long_history_df['close'].max()
+        return ((curr - mn) / (mx - mn)) * 100 if mx > mn else 50.0
+
+    def _get_oi_barriers(self, name, expiry, spot):
+        try:
+            chain = self.book.get_option_chain(name, expiry)
+            if chain.empty: return None, None
+            calls = chain[chain['instrument_type'] == 'CE']
+            puts = chain[chain['instrument_type'] == 'PE']
+            res = calls[calls['strike'] > spot].sort_values('open_interest', ascending=False).head(1)
+            sup = puts[puts['strike'] < spot].sort_values('open_interest', ascending=False).head(1)
+            return (res.iloc[0]['strike'] if not res.empty else None, sup.iloc[0]['strike'] if not sup.empty else None)
+        except: return None, None
+        
+    def _find_best_option_contract(
+        self, 
+        underlying_token: int, 
+        expiry: date, 
+        option_type: OptionType, 
+        strategy: str, 
+        regime: Regime, 
+        skip_filters: bool = False 
+    ) -> Optional[Dict]:
+        """
+        UPGRADE: 'Rent-to-Speed' Optimizer + 'Delta Shifter' + 'Microstructure Gatekeeper'.
+        Selects options based on Gamma Efficiency while respecting DTE physics and Order Book reality.
+        """
+        spot = self.prices.ltp(underlying_token)
+        if not spot: return None
+        
+        now, close_time = now_ist(), self.timings_config["market_close"]
+        T = calculate_trading_time_to_expiry(now, expiry, self.timings_config["market_open"], close_time, self.nse_calendar)
+        dte = (expiry - now.date()).days
+
+        # --- UPGRADE 1: DELTA SHIFTER ---
+        # Adapts target Delta based on Days to Expiry (DTE)
+        if dte > 1: 
+            # Mon-Wed: Buy ITM (Stock Replacement) to shield against Theta
+            min_delta, max_delta = 0.55, 0.85
+        elif dte == 1:
+            # Wed: Transition Day
+            min_delta, max_delta = 0.45, 0.75
+        else: 
+            # Thu: Expiry Day. Max Gamma.
+            min_delta, max_delta = 0.30, 0.65
+
+        # Fetch Chain
+        u_sym = self.book.get_symbol(underlying_token)
+        chain = self.book.get_option_chain(_get_underlying(u_sym), expiry)
+        
+        # Filter Liquidity Zone (Spot +/- 3% to save CPU cycles)
+        trade_chain = chain[
+            (chain['instrument_type'] == option_type.value) & 
+            (chain['strike'] >= spot * 0.97) & 
+            (chain['strike'] <= spot * 1.03)
+        ].copy()
+        
+        candidates = []
+        is_call = (option_type == OptionType.CE)
+        
+        # Get HV for fallback if IV calculation fails
+        bars = self.bars.get_ohlc(underlying_token, 1)
+        hv = calculate_historical_volatility(bars['close']) if not bars.empty else 0.3
+
         for _, row in trade_chain.iterrows():
-            token = int(row['instrument_token'])
-            tick = self.prices.get_full_tick(token)
-            if not tick:
-                continue
-            if tick.get('volume', 0) < min_volume or tick.get('open_interest', 0) < min_oi:
-                continue
-            ltp = tick.get('last_price')
-            if not ltp or ltp < self.trading_config['min_option_price']:
-                continue
-            depth = tick.get('depth')
-            if not depth or not depth.get('buy') or not depth.get('sell'):
-                continue
-            bid_price, ask_price = depth['buy'][0]['price'], depth['sell'][0]['price']
-            spread = (ask_price - bid_price) / ask_price if ask_price > 0 else float('inf')
-            if spread > self.trading_config['max_bid_ask_spread_pct'] / 100.0:
-                continue
+             tick = self.prices.get_full_tick(int(row['instrument_token']))
+             if not tick: continue
+             
+             ltp = tick.get('last_price', 0)
+             if ltp < 10.0: continue # Filter penny options
 
-            iv = calculate_iv(ltp, spot, row['strike'], T, 0.05, option_type == OptionType.CE, hv_fallback=hv)
-            greeks = calculate_greeks(spot, row['strike'], T, 0.05, iv, option_type == OptionType.CE)
-            options_with_metrics.append({'delta_diff': abs(abs(greeks['delta']) - target_delta), 'opt': row.to_dict(), 'ltp': ltp, 'greeks': greeks})
+             # --- UPGRADE 2: MICROSTRUCTURE GATEKEEPER ---
+             # Veto bad spreads and thin books before doing math
+             depth = tick.get('depth')
+             if depth:
+                 bid = depth['buy'][0]['price']
+                 ask = depth['sell'][0]['price']
+                 
+                 if bid > 0 and ask > 0:
+                     spread_pct = (ask - bid) / ltp
+                     # REJECT if spread > 1.0% (Retail cannot afford this tax)
+                     if spread_pct > 0.01: 
+                         continue
+                 
+                 # REJECT if Best Ask Quantity is too low to fill us (Assumes < 500 is thin)
+                 if depth['sell'][0]['quantity'] < 500: 
+                     continue
 
-        if not options_with_metrics:
-            return None
-        return min(options_with_metrics, key=lambda x: x['delta_diff'])
+             # JIT Greeks Calculation
+             iv = implied_vol_jit(ltp, spot, row['strike'], T, 0.05, is_call)
+             if iv <= 0.01 or iv > 5.0: iv = hv 
+             _, delta, vega, gamma, theta = fast_greeks_jit(spot, row['strike'], T, 0.05, iv, is_call)
+             
+             # Delta Guardrails (The Shifter)
+             if abs(delta) < min_delta or abs(delta) > max_delta:
+                 continue
 
+             # --- UPGRADE 3: RENT-TO-SPEED RATIO ---
+             # Formula: (Gamma * 10000) / (Rent + epsilon)
+             # We want maximum Acceleration (Gamma) for minimum Rent (Theta)
+             rent_cost = abs(theta) + 1e-9
+             efficiency_score = (gamma * 10000) / rent_cost 
+             
+             # Liquidity Penalty: Don't pick efficient options if they have no volume
+             if not skip_filters and tick.get('volume', 0) < 5000:
+                 efficiency_score *= 0.1 
+             
+             candidates.append({
+                 'score': efficiency_score, 
+                 'opt': row.to_dict(), 
+                 'ltp': ltp, 
+                 'greeks': {'delta': delta, 'gamma': gamma, 'theta': theta, 'vega': vega, 'iv': iv}
+             })
+             
+        if not candidates: return None
+        
+        # Select Winner (Highest Rent-to-Speed Score)
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+        return candidates[0]
+    
     def get_trade_params(
         self,
         token: int,
@@ -5618,353 +5378,151 @@ class Engine:
         regime: Regime,
         confidence_score: float
     ) -> Optional[Dict]:
-        underlying_symbol = self.book.get_symbol(token)
-        if not underlying_symbol:
-            return None
+        u_sym = self.book.get_symbol(token)
+        if not u_sym: return None
+        u_name = _get_underlying(u_sym)
+        expiry = self.book.find_nearest_expiry_date(u_name)
+        if not expiry: return None
+        
+        otype = OptionType.CE if side == OrderSide.BUY else OptionType.PE
+        
+        # UPGRADE #5: Uses the new Gamma-Efficiency logic internally
+        best = self._find_best_option_contract(token, expiry, otype, strategy, regime)
+        if not best: return None
+        
+        opt, ltp, greeks = best['opt'], best['ltp'], best['greeks']
+        spot = self.prices.ltp(token)
+        if not spot: return None
 
-        underlying_name = _get_underlying(underlying_symbol)
-        lot_size = self.book.lot_size(underlying_name)
-        expiry = self.book.find_nearest_expiry_date(underlying_name)
+        # --- UPGRADE #2: FVG LIQUIDITY VACUUM SNIPER ---
+        # Instead of blindly entering at market, check for a Fair Value Gap (FVG).
+        # If an FVG exists, we calculate a specific LIMIT price to "snipe" the retest.
+        
+        df_5m = self.get_ohlc(token, 5)
+        limit_underlying_price = 0.0
+        
+        if len(df_5m) >= 3:
+            curr = df_5m.iloc[-1]
+            prev_2 = df_5m.iloc[-3]
+            
+            if side == OrderSide.BUY:
+                # Bullish FVG: Gap exists between Candle 1 High and Candle 3 Low
+                if curr['low'] > prev_2['high']:
+                    # We want to buy the retest of Candle 1 High
+                    fvg_support = prev_2['high']
+                    # Add 0.02% buffer to ensure fill
+                    limit_underlying_price = fvg_support + (spot * 0.0002)
+                    L.info(f"🎯 FVG SNIPER (BUY): Detected gap. Targeting retest @ {limit_underlying_price:.2f} (Spot: {spot:.2f})")
 
-        if not all([lot_size, expiry]):
-            return None
-        option_type = OptionType.CE if side == OrderSide.BUY else OptionType.PE
-        best_option_data = self._find_best_option_contract(underlying_token=token, expiry=expiry, option_type=option_type, strategy=strategy, regime=regime)
-        if not best_option_data:
-            return None
+            elif side == OrderSide.SELL:
+                # Bearish FVG: Gap exists between Candle 1 Low and Candle 3 High
+                if curr['high'] < prev_2['low']:
+                    # We want to sell the retest of Candle 1 Low
+                    fvg_resistance = prev_2['low']
+                    # Subtract 0.02% buffer to ensure fill
+                    limit_underlying_price = fvg_resistance - (spot * 0.0002)
+                    L.info(f"🎯 FVG SNIPER (SELL): Detected gap. Targeting retest @ {limit_underlying_price:.2f} (Spot: {spot:.2f})")
 
-        option_contract, option_ltp, greeks = best_option_data['opt'], best_option_data['ltp'], best_option_data['greeks']
+        # If FVG detected, use that limit price. Otherwise, use current Spot.
+        underlying_ref_price = limit_underlying_price if limit_underlying_price > 0 else spot
 
-        estimated_delta = greeks['delta']
-        spot_price = self.prices.ltp(token)
-        if not spot_price:
-            return None
-
-        resistance, support = self._get_oi_barriers(underlying_name, expiry, spot_price)
-        oi_profit_target = None
-        min_dist_pct = self.trading_config['option_selection_filters'].get('min_dist_from_oi_wall_pct', 0.25)
-        if side == OrderSide.BUY and resistance and (resistance - spot_price < (spot_price * (min_dist_pct / 100))):
-            L.warning(f"Trade blocked. Too close to Call OI wall at {resistance}.")
-            return None
-        elif side == OrderSide.SELL and support and (spot_price - support < (spot_price * (min_dist_pct / 100))):
-            L.warning(f"Trade blocked. Too close to Put OI wall at {support}.")
-            return None
-        oi_profit_target = resistance if side == OrderSide.BUY else support
-        final_sl_points_on_option = risk_points_on_underlying * abs(estimated_delta)
-        max_sl_pct = self.trading_config["max_sl_pct_of_premium"]
-        if (option_ltp > 0) and (final_sl_points_on_option / option_ltp) > (max_sl_pct / 100.0):
-            L.warning(f"Trade REJECTED: Calculated SL ({final_sl_points_on_option:.2f}) exceeds max {max_sl_pct}% of premium ({option_ltp}).")
-            return None
-        risk_per_lot = final_sl_points_on_option * lot_size
-        number_of_lots = self.risk_manager.calculate_position_size(
+        # --- Sizing & Risk Calculation ---
+        delta = greeks['delta']
+        
+        # Calculate Stop Loss points on Option based on Underlying Risk points
+        # Option_SL = Underlying_Points * Delta
+        sl_pts_opt = risk_points_on_underlying * abs(delta)
+        
+        lot_size = self.book.lot_size(u_name)
+        risk_per_lot = sl_pts_opt * lot_size
+        
+        # Final Sizing
+        lots = self.risk_manager.calculate_position_size(
             token, 
             risk_per_lot, 
-            vega_per_lot=greeks['vega'] * lot_size,
-            confidence_score=confidence_score,  # <-- PASS
-            strategy_name=strategy                # <-- PASS
+            vega_per_lot=greeks['vega'] * lot_size, 
+            confidence_score=confidence_score, 
+            strategy_name=strategy
         )
-
-        if number_of_lots <= 0:
-            L.warning(f"Trade REJECTED: Calculated lot size is {number_of_lots}.")
+        
+        if lots <= 0: return None
+        
+        total_trade_risk = risk_per_lot * lots
+        if total_trade_risk > (self.risk_manager.dynamic_account_equity * 0.05): 
+            # Hard cap 5% equity risk per trade
             return None
 
-        total_trade_risk = risk_per_lot * number_of_lots
-        if total_trade_risk > (self.risk_manager.dynamic_account_equity * 0.05):
-            L.critical(f"Trade REJECTED: Calculated risk ₹{total_trade_risk:.2f} exceeds 5% of equity. Risk logic error?")
-            return None
-
-        underlying_sl_level = (spot_price - risk_points_on_underlying) if side == OrderSide.BUY else (spot_price + risk_points_on_underlying)
-        final_tp_points_on_option = reward_points_on_underlying * abs(estimated_delta)
-        strategy_config = self.config['strategies'].get(strategy, {})
+        # Calculate Underlying SL Level
+        u_sl = (underlying_ref_price - risk_points_on_underlying) if side == OrderSide.BUY else (underlying_ref_price + risk_points_on_underlying)
+        
+        # Calculate Option TP Points
+        tp_pts_opt = reward_points_on_underlying * abs(delta)
+        
+        # --- Option Price Estimation ---
+        # If we are sniping an FVG (Limit Order), we need to estimate what the Option Price
+        # will be when the Underlying hits our limit price.
+        # Est_Price = Current_Opt + (Target_Underlying - Current_Spot) * Delta
+        option_entry_price = ltp
+        if limit_underlying_price > 0:
+            diff = limit_underlying_price - spot
+            option_entry_price = ltp + (diff * delta)
+            # Ensure positive price
+            option_entry_price = max(0.05, option_entry_price)
 
         return {
-            "opt": option_contract, "ltp_opt": option_ltp, "lots": number_of_lots,
-            "strategy": strategy, "regime": regime.name, "option_sl_points": final_sl_points_on_option,
-            "option_tp_points": final_tp_points_on_option, "total_trade_risk": total_trade_risk,
-            "underlying_sl": underlying_sl_level, "greeks": greeks,
-            "max_trade_duration_minutes": strategy_config.get('max_duration_minutes', 90),
-            "oi_profit_target": oi_profit_target, "intended_risk_rupees": total_trade_risk
+            "opt": opt, 
+            "ltp_opt": option_entry_price, # Estimated Limit Price or Current LTP
+            "lots": lots, 
+            "strategy": strategy, 
+            "regime": regime.name,
+            "option_sl_points": sl_pts_opt, 
+            "option_tp_points": tp_pts_opt, 
+            "total_trade_risk": total_trade_risk,
+            "underlying_sl": u_sl, 
+            "greeks": greeks, 
+            "max_trade_duration_minutes": 90,
+            "oi_profit_target": None, 
+            "intended_risk_rupees": total_trade_risk,
+            "underlying_price": underlying_ref_price,
+            "is_fvg_entry": (limit_underlying_price > 0) # Flag for Execution Logic
         }
 
-    def reconcile(self):
-        if PAPER_TRADING:
-            return
-        L.info("--- Starting State Reconciliation with Broker ---")
-        try:
-            # --- FIXED: Use OrderActor ---
-            L.debug("Reconcile: Fetching broker positions...")
-            pos_reply_q = queue.Queue()
-            self.trader.order_actor.q.put({"type": "positions", "reply_q": pos_reply_q})
-            
-            broker_positions_data = None
+    def _trade_executor_worker(self):
+         while self.running.is_set():
+            self.heartbeats["TradeExecutor"] = time.time() # <--- ADD THIS
             try:
-                pos_resp = pos_reply_q.get(timeout=10.0)
-                if pos_resp['ok']:
-                    broker_positions_data = pos_resp['res']
-                else:
-                    raise Exception(pos_resp.get('error'))
-            except Exception as e:
-                L.error(f"Reconcile: Failed to get broker positions from OrderActor: {e}")
-                return
-            # --- END FIX ---
-
-            if not broker_positions_data:
-                L.warning("Could not get broker positions for reconciliation.")
-                return
-
-            # --- FIXED: Use StoreActor ---
-            L.debug("Reconcile: Fetching DB positions...")
-            db_reply_q = queue.Queue()
-            self.store_actor.q.put({"type": "load_open_positions", "reply_q": db_reply_q})
-            
-            db_positions = {}
-            try:
-                db_resp = db_reply_q.get(timeout=10.0)
-                if db_resp['ok']:
-                    db_positions = db_resp['res']
-                else:
-                    raise Exception(db_resp.get('error'))
-            except Exception as e:
-                L.error(f"Reconcile: Failed to get DB positions from StoreActor: {e}")
-                return
-            # --- END FIX ---
-
-            broker_positions_raw = broker_positions_data.get('net', [])
-            broker_positions_map = {pos['tradingsymbol']: pos for pos in broker_positions_raw if pos.get('product') == 'MIS' and abs(pos.get('quantity', 0)) > 0}
-            broker_symbols, db_symbols = set(broker_positions_map.keys()), {p.tradingsymbol for p in db_positions.values()}
-
-            for symbol in db_symbols - broker_symbols:
-                pos = next((p for p in db_positions.values() if p.tradingsymbol == symbol), None)
-                if pos:
-                    send_alert(f"RECONCILE: DB has {symbol} but broker does not. Marking as closed.", "warning")
-                    pos.status = PositionStatus.CLOSED.value
-                    pos.exit_reason = "RECONCILE_GHOST_CLOSE"
-                    
-                    # --- FIXED: Use StoreActor ---
-                    self.store_actor.q.put({"type": "upsert_position", "pos": pos})
-                    # --- END FIX ---
-
-            for symbol in broker_symbols - db_symbols:
-                rogue_pos_data = broker_positions_map[symbol]
-                qty = rogue_pos_data['quantity']
-                send_alert(f"🔥 RECONCILE: Rogue position for {symbol} (Qty: {qty}) found at broker! Auto-flattening.", "critical")
-                transaction_type = self.trader.TRANSACTION_TYPE_SELL if qty > 0 else self.trader.TRANSACTION_TYPE_BUY
-                
-                # --- FIXED: Use OrderActor ---
-                L.info(f"Reconcile: Placing market order to flatten rogue {symbol}...")
-                place_params = {
-                    "variety": self.trader.VARIETY_REGULAR, "exchange": "NFO", "tradingsymbol": symbol,
-                    "transaction_type": transaction_type, "quantity": abs(qty),
-                    "product": self.trader.PRODUCT_MIS, "order_type": self.trader.ORDER_TYPE_MARKET
-                }
-                reply_q = queue.Queue()
-                self.trader.order_actor.q.put({
-                    "type": "place_order",
-                    "params": place_params,
-                    "reply_q": reply_q
-                })
-                
-                oid = None
-                try:
-                    resp = reply_q.get(timeout=10.0)
-                    if resp['ok'] and resp['res']:
-                        oid = resp['res'].get('order_id')
-                except queue.Empty:
-                    L.error("Timeout placing flatten order")
-                # --- END FIX ---
-
-                if oid is None:
-                    send_alert(f"🔥🔥 FATAL: FAILED to auto-flatten rogue position {symbol}. MANUAL INTERVENTION REQUIRED!", "critical")
-                else:
-                    L.info(f"Placed market order {oid} to flatten rogue position {symbol}.")
-
-            L.info("--- Reconciliation Complete ---")
-            
-            # --- FIXED: Use StoreActor (to reload) ---
-            L.debug("Reconcile: Reloading trader positions from DB...")
-            reload_reply_q = queue.Queue()
-            self.store_actor.q.put({"type": "load_open_positions", "reply_q": reload_reply_q})
-            try:
-                reload_resp = reload_reply_q.get(timeout=10.0)
-                if reload_resp['ok']:
-                    with self.trader.lock:
-                        self.trader.positions = reload_resp['res']
-                else:
-                    raise Exception(reload_resp.get('error'))
-            except Exception as e:
-                L.error(f"Reconcile: Failed to reload trader positions: {e}")
-            # --- END FIX ---
-
-        except Exception as e:
-            L.error(f"Reconciliation failed: {e}", exc_info=True)
-
-    def health_check(self):
-        if not self.prices.connected.is_set():
-            send_alert("🔥 CRITICAL: PriceBus WebSocket is disconnected!", "critical")
-            if G_WS_CONNECTED:
-                G_WS_CONNECTED.set(0)
-            return
-        else:
-            if G_WS_CONNECTED:
-                G_WS_CONNECTED.set(1)
-
-        now = now_ist()
-        if self.timings_config["market_open"] < now.time() < self.timings_config["market_close"]:
-            stale_feed = False
-            for token in [self.nifty_token, self.bn_token]:
-                if not token:
-                    continue
-                last_tick_time = self.prices.last_tick_reception_time_per_token.get(token)
-                symbol_name = self.book.get_symbol(token) or f"Token {token}"
-                if last_tick_time:
-                    age = (now - last_tick_time).total_seconds()
-                    if G_LAST_TICK_AGE_SECONDS:
-                        G_LAST_TICK_AGE_SECONDS.set(age)
-                    if age > 120:
-                        send_alert(f"🔥 CRITICAL: Stale Feed for {symbol_name}! No ticks for {age:.0f}s.", "critical")
-                        stale_feed = True
-                else:
-                    send_alert(f"🔥 CRITICAL: No ticks *ever* received for {symbol_name}.", "critical")
-                    stale_feed = True
-
-            with self.master_lock:
-                if stale_feed:
-                    if not self.master_halt:
-                        L.warning("Stale data protocol activated. Halting new entries.")
-                        send_alert("🔥 CRITICAL: Stale Feed! Halting new trades.", "critical")
-                        self.master_halt = True
-                        if G_HALTED_STATUS:
-                            G_HALTED_STATUS.set(1)
-                else:
-                    # Feed is healthy
-                    # Check master_halt, but only resume if regime_halt is ALSO false
-                    if self.master_halt and not self.regime_halt and not os.path.exists(KILL_SWITCH_FILE):
-                        L.info("Data feed is healthy. Resuming trading.")
-                        send_alert("✅ Data feed healthy. Resuming new trades.", "info")
-                        self.master_halt = False
-                        if G_HALTED_STATUS:
-                            G_HALTED_STATUS.set(0)
-            if self.running.is_set():
-                critical_threads_to_check = {
-                "TickProcessor": self.tick_thread,
-                "OrderProcessor": self.order_thread,
-                "TradeExecutor": self.trade_executor_thread,
-                "position_management": self.scheduler_threads.get("position_management"),
-                "strategic_planner": self.scheduler_threads.get("strategic_planner")
-            }
-
-        for name, thread_obj in critical_threads_to_check.items():
-            if thread_obj and not thread_obj.is_alive():
-                with self.master_lock:
-                    if self.running.is_set() and not self.fatal_error_event.is_set():
-                        msg = f"🔥 CRITICAL: Worker thread '{name}' appears dead! Initiating shutdown."
-                        L.critical(msg)
-                        send_alert(msg, "critical")
-                        self.fatal_error_event.set() 
-                        return 
-
-        L.debug("Worker thread liveness check passed.")
-
-    # Insert this method inside the Engine class in main1.py
-
-def _update_prometheus_metrics(self):
-    """
-    Updates all configured Prometheus gauges with the current system state.
-    This function is intended to be called periodically by the scheduler.
-    """
-    # Check if Prometheus gauges were initialized (e.g., G_PNL_REALIZED is a good proxy)
-    if not G_PNL_REALIZED:
-        return # Skip if Prometheus is disabled
-
-    try:
-        # --- PnL Metrics ---
-        G_PNL_REALIZED.set(self.trader.daily_realized_pnl)
-        G_PNL_UNREALIZED.set(self.risk_manager.last_unrealized_pnl) # Assumes risk_manager updates this
-
-        # --- Trading Status ---
-        with self.master_lock:
-            G_HALTED_STATUS.set(1 if self.master_halt or self.regime_halt else 0)
-
-        # --- Regime Metrics ---
-        # Ensure gauges exist before setting
-        if G_REGIME_CONFIDENCE:
-            G_REGIME_CONFIDENCE.set(self.regime_confidence)
-
-        if G_REGIME_FLIP_RATE:
-            flips_last_hour = 0
-            if self.regime_change_history: # Check if the deque exists and is not empty
-                now = now_ist()
-                one_hour_ago = now - timedelta(hours=1)
-                # Count timestamps within the last hour
-                flips_last_hour = sum(1 for ts in self.regime_change_history if ts > one_hour_ago)
-            G_REGIME_FLIP_RATE.set(flips_last_hour)
-
-        # --- WebSocket & Tick Age ---
-        # Assuming G_WS_CONNECTED and G_LAST_TICK_AGE_SECONDS are updated elsewhere
-        # (e.g., PriceBus callbacks and health_check) - No direct update needed here unless logic changes.
-
-        # --- Portfolio Greeks ---
-        with self.risk_manager.lock:
-            if G_PORTFOLIO_DELTA:
-                G_PORTFOLIO_DELTA.set(self.risk_manager.portfolio_greeks.get("net_delta", 0.0))
-            if G_PORTFOLIO_VEGA:
-                G_PORTFOLIO_VEGA.set(self.risk_manager.portfolio_greeks.get("net_vega", 0.0))
-            if G_PORTFOLIO_GAMMA:
-                G_PORTFOLIO_GAMMA.set(self.risk_manager.portfolio_greeks.get("net_gamma", 0.0))
-            if G_PORTFOLIO_THETA:
-                G_PORTFOLIO_THETA.set(self.risk_manager.portfolio_greeks.get("net_theta", 0.0))
-
-        L.debug("Prometheus metrics updated.")
-
-    except Exception as e:
-        L.warning(f"Failed to update Prometheus metrics: {e}", exc_info=True)
+                p = self.trade_signal_queue.get(timeout=1)
+                if self.risk_manager.risk_ok(p):
+                    L.info(f"Executor: Opening {p['strategy']} on {p['opt']['tradingsymbol']}")
+                if self.trader.open_position(p):
+                    with self.master_lock: self.last_trade_timestamp = now_ist()
+            except Empty: continue
+            except Exception as e: L.error(f"Executor Error: {e}")
 
     def _persist_bar_data(self):
         try:
-            L.info("Persisting in-memory 1-minute bars to disk...")
             os.makedirs(DATA_LOG_DIR, exist_ok=True)
-            today_str = date.today().isoformat()
+            today = date.today().isoformat()
+            for t, fname in {self.nifty_token: f"nifty_{today}.csv", self.bn_token: f"bn_{today}.csv", self.vix_token: f"vix_{today}.csv"}.items():
+                if t:
+                    df = self.bars.get_ohlc(t, 1)
+                    if not df.empty: df.to_csv(os.path.join(DATA_LOG_DIR, fname))
+            L.info("Bar data persisted.")
+        except: pass
 
-            tokens_to_log = {
-                self.nifty_token: f"nifty_fut_1min_{today_str}.csv",
-                self.bn_token: f"banknifty_fut_1min_{today_str}.csv",
-                self.vix_token: f"india_vix_1min_{today_str}.csv"
-            }
-
-            for token, filename in tokens_to_log.items():
-                if token is None:
-                    continue
-                bar_df = self.bars.get_ohlc(token, 1)
-                if not bar_df.empty:
-                    filepath = os.path.join(DATA_LOG_DIR, filename)
-                    bar_df.to_csv(filepath)
-
-            L.info("Bar data persistence complete.")
-        except Exception as e:
-            L.error(f"Failed to persist bar data: {e}", exc_info=True)
+    def _update_prometheus_metrics(self):
+        if not G_PNL_REALIZED: return
+        try:
+            G_PNL_REALIZED.set(self.trader.daily_realized_pnl)
+            with self.master_lock: G_HALTED_STATUS.set(1 if self.master_halt else 0)
+            with self.risk_manager.lock:
+                G_PORTFOLIO_DELTA.set(self.risk_manager.portfolio_greeks.get("net_delta", 0.0))
+        except: pass
 
     def stop(self):
-        if self.running.is_set():
-            L.info("Disengaging Sentinel...")
-            self.running.clear()
-            if hasattr(self, 'prices') and self.prices.ws:
-                self.prices.ws.close()
-
-            L.info("Performing final data persistence before shutdown...")
-            self._persist_bar_data()
-
-            if self.last_trading_day:
-                # --- FIXED: Use StoreActor ---
-                self.store_actor.q.put({
-                    "type": "set_kv",
-                    "key": f"daily_pnl_{self.last_trading_day}",
-                    "value": str(self.trader.daily_realized_pnl)
-                })
-                # --- END FIX ---
-                
-            send_alert("🛑 Sentinel PRIME disengaged.")
-            L.info("Shutdown complete.")
-
+        self.running.clear()
+        if hasattr(self, 'prices') and self.prices.ws: self.prices.ws.close()
+        self._persist_bar_data()
 # ==================================================================================================
 # APPLICATION ENTRY POINT
 # ==================================================================================================
@@ -6089,8 +5647,6 @@ def main():
 
     PAPER_TRADING = config['trading'].get('paper_trading', True) or APP_ENV != "PRODUCTION"
     L.warning(f"--- PAPER TRADING MODE IS {'ENABLED' if PAPER_TRADING else 'DISABLED'} ---")
-    if not PAPER_TRADING and APP_ENV != "PRODUCTION":
-        L.warning("WARNING: Live trading enabled but APP_ENV is not PRODUCTION!")
 
     try:
         kite_raw, access_token = login_or_reuse()
@@ -6098,60 +5654,25 @@ def main():
         L.critical(f"Login failed: {e}")
         return
 
-    # --- REFACTOR START ---
-
-    # 1. Create original objects
-    store = Store()
-    kite_gov = GovernedKite(kite_raw) # This is now ONLY for actors
-
-    # 2. Create Actors (These will be the *only* things that use the objects above)
-    order_actor = OrderActor(kite_gov)
-    store_actor = StoreActor(store)
-    
-    # 3. Pass ACTORS as dependencies
-    
-    # FIXED: InstrumentBook now receives actors, not the original objects.
-    # This forces it to use the actor model for all its DB/API calls.
-    # NOTE: This requires you to update InstrumentBook's __init__
+    store, kite_gov = Store(), 
+    GovernedKite(kite_raw)
+    order_actor, store_actor = OrderActor(kite_gov), StoreActor(store)
     book = InstrumentBook(store_actor, order_actor).load()
-    
-    # PriceBus is OK: It *only* manages the WebSocket, not state-changing API calls.
     prices = PriceBus(kite_gov, access_token)
+    engine = Engine(store_actor, book, prices, config) # Now has hot chamber
 
-    # Inject the ACTORS
-    risk_manager = RiskManager(None, None, book, prices, store_actor, config)
-    micro_monitor = Micromonitor(prices, config)
-    pos_manager = PositionManager(None, None, book, prices, store_actor, risk_manager, config)
+    risk_manager = RiskManager(engine, None, book, prices, store_actor, config)
+    micro_monitor = MicrostructureMonitor(prices, config)
+    radar = ConstituentRadar(book, prices) # Kingmaker
+    pos_manager = PositionManager(engine, None, book, prices, store_actor, risk_manager, config)
 
-    # Initialize Trader based on mode, injecting actors (This part was already correct)
-    if PAPER_TRADING:
-        trader = PaperTrader(None, book, prices, store_actor, config, risk_manager.update_performance_metrics)
-    else:
-        # Pass original `store` for startup-read, and actors for runtime I/O
-        trader = Trader(None, store, store_actor, order_actor, book, prices, config, risk_manager.update_performance_metrics)
+    trader = PaperTrader(engine, book, prices, store_actor, config, risk_manager.update_performance_metrics) if PAPER_TRADING else \
+             Trader(engine, store, store_actor, order_actor, book, prices, config, risk_manager.update_performance_metrics)
 
-    # Inject dependencies back into RiskManager and PositionManager
-    risk_manager.trader = trader
-    pos_manager.trader = trader
+    risk_manager.trader, pos_manager.trader, risk_manager.engine = trader, trader, engine
+    engine.set_dependencies(trader, risk_manager, micro_monitor, pos_manager, radar)
+    _engine_instance = engine 
 
-    # FIXED: Engine no longer receives the kite_gov object.
-    # This forces it to use self.trader.order_actor for all API calls.
-    # NOTE: This requires you to update Engine's __init__
-    engine = Engine(store_actor, book, prices, config)
-    
-    # This injection is now CRITICAL, as Engine relies on it for all broker access.
-    engine.set_dependencies(trader, risk_manager, micro_monitor, pos_manager)
-
-    # Inject Engine dependency into modular components that need it
-    risk_manager.engine = engine
-    pos_manager.engine = engine
-    trader.engine = engine # <-- Important injection
-
-    # --- REFACTOR END ---
-
-    _engine_instance = engine # Make engine accessible to signal handler
-
-    # Setup signal handling for graceful shutdown
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
@@ -6159,14 +5680,13 @@ def main():
         start_metrics_server(port=config.get("metrics_port", 9095))
 
     try:
-        # 4. Start Actors BEFORE engine
         L.info("Starting StoreActor...")
         store_actor.start()
         if not PAPER_TRADING:
             L.info("Starting OrderActor...")
             order_actor.start()
         
-        engine.start() # This blocks until engine stops or is interrupted
+        engine.start() 
     
     except KeyboardInterrupt:
         L.info("Keyboard interrupt received in main. Stopping engine...")
@@ -6176,20 +5696,17 @@ def main():
         L.critical(f"Unhandled FATAL exception in main execution: {e}", exc_info=True)
         send_alert(f"🔥 FATAL ERROR: Unhandled exception caused bot crash: {e}", "critical")
     finally:
-        # 5. Add stop/join calls for actors in finally block for clean shutdown
         L.info("Shutting down... Stopping actors.")
         store_actor.stop()
         if not PAPER_TRADING:
             order_actor.stop()
         
-        if _engine_instance: # Ensure engine exists before trying to stop
+        if _engine_instance: 
             _engine_instance.stop() 
 
-        # Wait for actors to finish their queues
-        L.info("Waiting for StoreActor to join...")
+        L.info("Waiting for actors to join...")
         store_actor.join(timeout=5.0)
         if not PAPER_TRADING:
-            L.info("Waiting for OrderActor to join...")
             order_actor.join(timeout=5.0)
         L.info("Shutdown complete.")
 

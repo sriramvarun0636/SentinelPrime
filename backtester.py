@@ -1,921 +1,707 @@
-import pandas as pd
+"""
+╔══════════════════════════════════════════════════════════════════════════════╗
+║        NIFTY GAMMA SCALPING SYSTEM  v2.0  —  PRODUCTION GRADE              ║
+║                                                                              ║
+║  Features:                                                                   ║
+║  1.  DTE guard  — skip entries within 2 days of expiry, roll to next week    ║
+║  2.  Hybrid 1min/3min — 3min for hedge timing, 1min for SL/spike detection   ║
+║  3.  Data cleaning — only ATM, ATM±1..±3 kept                                ║
+║  4.  Regime classifier — Kaufman Efficiency Ratio (ER)                       ║
+║  5.  Options-only hedging — buy CE/PE to hedge, no futures                   ║
+║  6.  Realistic exits — 15% straddle TP/SL, 5% IV expansion/crush             ║
+║  7.  Dynamic hedge SL/TP via ATR                                             ║
+║  8.  Risk-to-Reward ratio as tunable hyperparameter                          ║
+║  9.  Hedge capital TP — exit hedge at X% of deployed capital                 ║
+║  10. 6 named exit reasons (gamma_win, vega_win, iv_crush, theta_bleed...)    ║
+║  11. OPTUNA Hyperparameter tuning engine (TPE Sampler)                       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  IMPORTS
+# ─────────────────────────────────────────────────────────────────────────────
+import os, glob, warnings, itertools, time, json, random, sys
+from datetime import date, timedelta
+from dataclasses import dataclass, field, asdict
+from typing import Optional, List, Dict, Any, Tuple
+
 import numpy as np
-import json
-import uuid
-import os
-import math
-from datetime import datetime, time as dtime
-from dataclasses import dataclass, field
-from queue import Queue, Empty
-import logging
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import matplotlib.dates as mdates
+from matplotlib.ticker import FuncFormatter
+from scipy.stats import norm
+import optuna
+from optuna.visualization.matplotlib import plot_optimization_history, plot_param_importances
 
-# ==================================================================================================
-# --- IMPORT SENTINEL-PRIME CORE COMPONENTS ---
-# ==================================================================================================
-try:
-    from main1 import (
-        AbstractTrader, Position, PositionStatus, OrderSide, OptionType,
-        RiskManager, PositionManager, MicrostructureMonitor, RegimeClassifier,
-        BarStore, InstrumentBook, Engine, StoreActor, OrderActor,
-        BaseStrategy, MomentumBreakoutStrategy, TrendPullbackStrategy,
-        MeanReversionStrategy, VolatilityMeanReversionStrategy, OpeningRangeBreakout,
-        StrategyName, Regime, Clock,
-        load_config, now_ist, _get_underlying,
-        black_scholes_price, bs_delta, calculate_greeks,
-        calculate_historical_volatility, calculate_iv, _calculate_time_to_expiry,
-        PERSIST_DIR, IST
+warnings.filterwarnings('ignore')
+pd.options.mode.chained_assignment = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ① HYPERPARAMETER CONFIG  ← Baseline params (Optuna will tune these)
+# ─────────────────────────────────────────────────────────────────────────────
+PARAMS: Dict[str, Any] = {
+    # ── Entry filters ────────────────────────────────────────────────────────
+    "IVR_ENTRY_MAX"       : 40.0,   
+    "IV_HV_RATIO_MAX"     : 0.85,   
+    "MIN_ER_FOR_TREND"    : 0.35,   
+    "ER_WINDOW"           : 14,     
+
+    # ── DTE handling ─────────────────────────────────────────────────────────
+    "DTE_MIN"             : 2,      
+
+    # ── Hedge parameters (options-only) ──────────────────────────────────────
+    "HEDGE_INTERVAL_3MIN" : 3,      
+    "DELTA_THRESHOLD"     : 0.08,   
+    "HEDGE_TP_PCT"        : 0.08,   
+    "HEDGE_SL_ATR_MULT"   : 2.0,    
+    "ATR_WINDOW"          : 14,     
+    "RR_RATIO"            : 0.5,    
+
+    # ── Straddle exit thresholds ─────────────────────────────────────────────
+    "STRADDLE_TP_PCT"     : 0.15,   
+    "STRADDLE_SL_PCT"     : 0.15,   
+    "IV_EXPAND_PCT"       : 0.05,   
+    "IV_CRUSH_PCT"        : 0.05,   
+    "THETA_BLEED_MINS"    : 120,    
+
+    # ── Session timings ──────────────────────────────────────────────────────
+    "ENTRY_START"         : "09:30",
+    "ENTRY_END"           : "14:00",
+    "SESSION_END"         : "15:15",
+
+    # ── Position / cost ──────────────────────────────────────────────────────
+    "LOT_SIZE"            : 75,     
+    "NUM_LOTS"            : 1,
+    "TX_COST_PER_LOT"     : 30.0,   
+    "SLIPPAGE_PER_HEDGE"  : 2.0,    
+
+    # ── Volatility / signal ──────────────────────────────────────────────────
+    "RV_WINDOW"           : 20,     
+    "IVR_LOOKBACK_DAYS"   : 20,
+
+    # ── Constants ────────────────────────────────────────────────────────────
+    "RISK_FREE_RATE"      : 0.065,
+    "MINS_PER_DAY"        : 375,
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PATH CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+DATA_1MIN  = '/content/drive/MyDrive/1MIN'
+DATA_3MIN  = '/content/drive/MyDrive/3MIN'
+OUTPUT_DIR = '/content/drive/MyDrive/gamma_scalp_output'
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 1 — DATA LOADER
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _clean_date(s: str) -> str:
+    return str(s).replace('="', '').replace('"', '').replace('=', '').strip()
+
+def _parse_offset(s: str) -> Optional[int]:
+    """'ATM' → 0, 'ATM+3' → 3, 'ATM-2' → -2"""
+    import re
+    s = str(s).strip().upper()
+    if s == 'ATM': return 0
+    m = re.search(r'ATM([+-]\d+)', s)
+    return int(m.group(1)) if m else None
+
+def load_files(folder: str, label: str = '') -> pd.DataFrame:
+    files = sorted(glob.glob(os.path.join(folder, '*.csv')))
+    if not files:
+        raise FileNotFoundError(f"No CSV files in: {folder}")
+    print(f"\nLOADING {len(files)} FILES  ({label})")
+    print(f"Data folder: {folder}")
+    frames =[]
+    for fp in files:
+        df = pd.read_csv(fp, dtype={'date': str, 'time': str}, low_memory=False)
+        df.columns =[c.strip().lower() for c in df.columns]
+        df['_src'] = os.path.basename(fp)
+        frames.append(df)
+        print(f"  ✓ {os.path.basename(fp):30s} {len(df):>10,} rows")
+    raw = pd.concat(frames, ignore_index=True)
+    print(f"  Total rows: {len(raw):,}")
+
+    raw['date_c']  = raw['date'].apply(_clean_date)
+    raw['datetime'] = pd.to_datetime(
+        raw['date_c'] + ' ' + raw['time'].str.strip(),
+        dayfirst=True, errors='coerce')
+    raw = raw.dropna(subset=['datetime']).sort_values('datetime').reset_index(drop=True)
+    
+    for col in['open','high','low','close','volume','oi','iv','spot']:
+        if col in raw.columns:
+            raw[col] = pd.to_numeric(raw[col], errors='coerce')
+
+    raw['option_type']   = raw['option_type'].str.upper().str.strip()
+    raw['strike_offset'] = raw['strike_offset'].str.upper().str.strip()
+    raw['_offset_num']   = raw['strike_offset'].apply(_parse_offset)
+    return raw
+
+def clean_strikes(raw: pd.DataFrame, keep_range: int = 3) -> pd.DataFrame:
+    """Keep only ATM±keep_range — discard far OTM/ITM noise."""
+    raw = raw[raw['_offset_num'].notna()].copy()
+    raw['_offset_num'] = raw['_offset_num'].astype(int)
+    kept = raw[raw['_offset_num'].abs() <= keep_range].copy()
+    print(f"  [Clean] Kept ATM±{keep_range}: {len(kept):,} / {len(raw):,} rows")
+    return kept
+
+def build_straddle(raw: pd.DataFrame) -> pd.DataFrame:
+    """Merge ATM call + put into one row per timestamp."""
+    atm = raw[raw['_offset_num'] == 0].copy()
+    calls = atm[atm['option_type'] == 'CALL']
+    puts  = atm[atm['option_type'] == 'PUT']
+
+    cmap = {c: f'c_{c}' for c in['open','high','low','close','volume','oi','iv','spot']}
+    pmap = {c: f'p_{c}' for c in ['open','high','low','close','volume','oi','iv','spot']}
+
+    c = calls[['datetime'] + list(cmap)].rename(columns=cmap)
+    p = puts [['datetime'] + list(pmap)].rename(columns=pmap)
+
+    if c.empty and p.empty: raise ValueError("No ATM rows found after cleaning.")
+    if c.empty:
+        m = p.copy(); m['c_close']=m['p_close']; m['c_iv']=m['p_iv']; m['c_spot']=m['p_spot']
+    elif p.empty:
+        m = c.copy(); m['p_close']=m['c_close']; m['p_iv']=m['c_iv']; m['p_spot']=m['c_spot']
+    else:
+        m = pd.merge(c, p, on='datetime', how='inner')
+
+    m['spot']           = m['c_spot']
+    m['straddle_price'] = m['c_close'] + m['p_close']
+    m['mid_iv']         = (m['c_iv'] + m['p_iv']) / 2.0
+    m['date']           = m['datetime'].dt.date
+    m['hour_min']       = m['datetime'].dt.strftime('%H:%M')
+    m = m.sort_values('datetime').reset_index(drop=True)
+    print(f"  ATM straddle rows: {len(m):,}")
+    return m
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 2 — INDICATORS & SIGNALS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def rv_close(close: pd.Series, window: int, annual_mins: int) -> pd.Series:
+    return np.log(close/close.shift(1)).rolling(window).std() * np.sqrt(annual_mins)
+
+def iv_rank(iv: pd.Series, lookback_days: int, mins_per_day: int) -> pd.Series:
+    lb = lookback_days * mins_per_day
+    lo = iv.rolling(lb, min_periods=50).min()
+    hi = iv.rolling(lb, min_periods=50).max()
+    return (iv - lo) / (hi - lo + 1e-10) * 100
+
+def kaufman_er(close: pd.Series, window: int) -> pd.Series:
+    net_move  = (close - close.shift(window)).abs()
+    bar_moves = close.diff().abs().rolling(window).sum()
+    return (net_move / bar_moves.clip(lower=1e-10)).clip(0, 1)
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int) -> pd.Series:
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low  - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(window).mean()
+
+def _next_thursday(dt: pd.Timestamp) -> date:
+    days_ahead = (3 - dt.weekday()) % 7
+    if days_ahead == 0: days_ahead = 7
+    return (dt + timedelta(days=days_ahead)).date()
+
+def dte_from_dt(dt: pd.Timestamp) -> int:
+    nxt = _next_thursday(dt)
+    return (nxt - dt.date()).days
+
+def generate_signals(df: pd.DataFrame, p: dict) -> pd.DataFrame:
+    df = df.copy()
+    annual = p['MINS_PER_DAY'] * 252
+
+    df['iv_dec']     = df['mid_iv'] / 100.0
+    df['rv']         = rv_close(df['spot'], int(p['RV_WINDOW']), annual)
+    df['ivr']        = iv_rank(df['iv_dec'], int(p['IVR_LOOKBACK_DAYS']), p['MINS_PER_DAY'])
+    df['iv_rv_ratio']= df['iv_dec'] / df['rv'].clip(lower=0.005)
+    df['er']         = kaufman_er(df['spot'], int(p['ER_WINDOW']))
+    df['dte']        = df['datetime'].apply(dte_from_dt)
+
+    df['straddle_atr'] = atr(
+        df['straddle_price'] * 1.01,
+        df['straddle_price'] * 0.99,
+        df['straddle_price'],
+        int(p['ATR_WINDOW'])
     )
-except ImportError as e:
-    print(f"FATAL: Could not import core classes from main1.py. Make sure this file is in the same directory.")
-    print(f"Error: {e}")
-    exit(1)
 
-L = logging.getLogger("SENTINEL-PRIME-BACKTESTER")
-L.setLevel(logging.INFO)
-if not L.handlers:
-    L.addHandler(logging.StreamHandler())
+    in_window = (df['hour_min'] >= p['ENTRY_START']) & (df['hour_min'] <= p['ENTRY_END'])
+    cheap_iv  = df['ivr'] < p['IVR_ENTRY_MAX']
+    rv_edge   = df['iv_rv_ratio'] < p['IV_HV_RATIO_MAX']
+    dte_ok    = df['dte'] >= p['DTE_MIN']         
 
-# ==================================================================================================
-# --- 1. SIMULATED "SENSES" (HIGH-FIDELITY PRICEBUS) ---
-# ==================================================================================================
-
-class SimulatedPriceBus:
-    """
-    A high-fidelity "fake" PriceBus. It serves real futures data
-    and dynamically estimates option prices on-the-fly when asked.
-    """
-    def __init__(self, book: InstrumentBook, engine: 'BacktestEngine'):
-        self.book = book
-        self.engine = engine # To get IV cache, config, etc.
-        self._current_futures_ticks = {}
-        self._current_futures_bar = None
-        self._risk_free_rate = 0.05 # Hardcoded for BS
-        self._market_close_time = dtime.fromisoformat("15:30:00")
-        
-        # Cache for estimated prices to avoid re-calculating 5x per bar
-        self._bar_option_cache = {}
-
-    def update_futures_bar(self, bar: pd.Series):
-        """Called by the BacktestEngine on each new bar."""
-        self._current_futures_bar = bar
-        self._bar_option_cache = {} # Clear cache on new bar
-        
-        # We only update the FUTURES ticks
-        for token, prefix in [(256265, "NIFTY"), (260105, "BN"), (257281, "VIX")]:
-            if f"{prefix}_open" in bar.index:
-                self._current_futures_ticks[token] = {
-                    "instrument_token": token,
-                    "last_price": bar[f"{prefix}_close"],
-                    "open": bar[f"{prefix}_open"],
-                    "high": bar[f"{prefix}_high"],
-                    "low": bar[f"{prefix}_low"],
-                    "close": bar[f"{prefix}_close"],
-                    "volume": bar[f"{prefix}_volume"],
-                    "depth": { # Simulate basic depth
-                        "buy": [{"price": bar[f"{prefix}_close"] * 0.999, "quantity": 100}],
-                        "sell": [{"price": bar[f"{prefix}_close"] * 1.001, "quantity": 100}]
-                    }
-                }
-    
-    def ltp(self, token: int) -> float | None:
-        """Gets the Last Traded Price (simulated)."""
-        if token in self._current_futures_ticks:
-            return self._current_futures_ticks[token]["last_price"]
-        
-        # If it's an option, estimate its LTP
-        tick = self.get_full_tick(token)
-        return tick.get("last_price") if tick else None
-
-    def get_full_tick(self, token: int) -> dict | None:
-        """
-        --- THIS IS THE CORE OF THE SIMULATION ---
-        If a future is requested, returns the bar data.
-        If an option is requested, it calculates its price *on-the-fly*.
-        """
-        # 1. Check if it's a future
-        if token in self._current_futures_ticks:
-            return self._current_futures_ticks[token]
-            
-        # 2. Check if it's an option we've already priced this bar
-        if token in self._bar_option_cache:
-            return self.get_estimated_option_ohlc(token) # Returns full bar dict
-
-        # 3. If it's a new option request, estimate its price (LTP)
-        try:
-            opt_details = self.book.df_by_token.loc[token]
-            strike = opt_details['strike']
-            is_call = opt_details['instrument_type'] == 'CE'
-            expiry_date = opt_details['expiry'].date()
-            
-            underlying_name = _get_underlying(opt_details['name'])
-            underlying_token = 256265 if "NIFTY" in underlying_name else 260105
-            
-            spot = self.ltp(underlying_token)
-            if not spot: return None # Can't price
-                
-            T = _calculate_time_to_expiry(expiry_date, now_ist(), self._market_close_time)
-            
-            # Get IV from the *real* engine's cache
-            sigma = self.engine.engine.atm_iv_cache.get(underlying_name, 0.2) # Default 20% IV
-            
-            price = black_scholes_price(spot, strike, T, self._risk_free_rate, sigma, is_call)
-            
-            # Return a "fake" tick
-            return {
-                "instrument_token": token,
-                "last_price": price,
-                "volume": 100000, # Fake
-                "open_interest": 100000, # Fake
-                "depth": { # Return a perfectly neutral book so OBI is 0
-                    "buy": [{"price": price * 0.999, "quantity": 100}],
-                    "sell": [{"price": price * 1.001, "quantity": 100}]
-                }
-            }
-        except Exception as e:
-            # L.warning(f"Failed to estimate price for token {token}: {e}")
-            return None
-            
-    def get_estimated_option_ohlc(self, token: int) -> dict | None:
-        """
-        Estimates the OHLC for an option token based on the
-        underlying futures bar AND the VIX bar.
-        """
-        if token in self._bar_option_cache:
-            return self._bar_option_cache[token]
-            
-        try:
-            # --- THIS IS THE NEW CODE ---
-            # Get the fudge factor from the config, defaulting to 0%
-            backtest_cfg = self.engine.config.get("backtester", {})
-            fudge_factor = backtest_cfg.get("volatility_fudge_factor_pct", 0.0) / 100.0
-            # --- END NEW CODE ---
-
-            opt_details = self.book.df_by_token.loc[token]
-            strike = opt_details['strike']
-            is_call = opt_details['instrument_type'] == 'CE'
-            expiry_date = opt_details['expiry'].date()
-            
-            underlying_name = _get_underlying(opt_details['name'])
-            underlying_token = 256265 if "NIFTY" in underlying_name else 260105
-            
-            fut_bar = self._current_futures_ticks.get(underlying_token)
-            if not fut_bar: return None
-                
-            T = _calculate_time_to_expiry(expiry_date, now_ist(), self._market_close_time)
-
-            # --- MODIFICATION START ---
-            # REMOVED: sigma = self.engine.engine.atm_iv_cache.get(underlying_name, 0.2)
-            
-            # 1. Get the VIX bar for dynamic IV
-            #    (257281 is the INDIA VIX token, which update_futures_bar already processes)
-            vix_bar = self._current_futures_ticks.get(257281) 
-            
-            if not vix_bar:
-                # Fallback if VIX data is missing for this bar
-                L.warning(f"VIX bar not found for IV simulation. Falling back to 20% flat IV.")
-                sigma_open = sigma_high = sigma_low = sigma_close = 0.20
-            else:
-                # 2. Use VIX OHLC for dynamic IV, ensuring a floor of 1%
-                sigma_open = max(0.01, vix_bar['open'] / 100.0)
-                sigma_high = max(0.01, vix_bar['high'] / 100.0)
-                sigma_low = max(0.01, vix_bar['low'] / 100.0)
-                sigma_close = max(0.01, vix_bar['close'] / 100.0)
-
-            # 3. Calculate OHLC prices using the corresponding dynamic IV
-            opt_open = black_scholes_price(fut_bar['open'], strike, T, self._risk_free_rate, sigma_open, is_call)
-            opt_high = black_scholes_price(fut_bar['high'], strike, T, self._risk_free_rate, sigma_high, is_call)
-            opt_low = black_scholes_price(fut_bar['low'], strike, T, self._risk_free_rate, sigma_low, is_call)
-            opt_close = black_scholes_price(fut_bar['close'], strike, T, self._risk_free_rate, sigma_close, is_call)
-            # --- MODIFICATION END ---
+    df['buy_signal'] = in_window & cheap_iv & rv_edge & dte_ok & df['rv'].notna()
+    return df
 
 
-            # Handle call/put high/low inversion
-            if is_call:
-                o_h, o_l = opt_high, opt_low
-            else:
-                # Inverted for puts: a drop in underlying (fut_bar['low'])
-                # combined with a spike in IV (sigma_high) creates the
-                # *highest* price for the put option.
-                o_h, o_l = opt_low, opt_high # Inverted for puts
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 3 — BS ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
 
-            # --- APPLY THE FUDGE FACTOR ---
-            # Artificially widen the bar to simulate real-world gamma/vega risk
-            # We add a % to the high and subtract a % from the low.
-            o_h = o_h * (1.0 + fudge_factor)
-            o_l = o_l * (1.0 - fudge_factor)
-            o_l = max(0.01, o_l) # Ensure low price doesn't go to or below zero
-            # --- END MODIFICATION ---
+def _d1(S, K, T, r, sigma):
+    if T < 1e-9 or sigma < 1e-9: return np.nan
+    return (np.log(S/K) + (r + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
 
-            bar_dict = {
-                "instrument_token": token,
-                "last_price": opt_close,
-                "open": opt_open,
-                "high": o_h,  # <-- Use modified high
-                "low": o_l,   # <-- Use modified low
-                "close": opt_close,
-                "volume": 100000, # Fake
-                "last_traded_quantity": 100, # Fake
-                "exchange_timestamp": now_ist()
-            }
-            self._bar_option_cache[token] = bar_dict # Cache it
-            return bar_dict
-            
-        except Exception as e:
-            # L.warning(f"Failed to estimate OHLC for token {token}: {e}")
-            return None
-    
-    def subscribe(self, tokens: list[int]):
-        pass # Not needed for simulation
+def bs_delta(S, K, T, r, sigma, flag='call'):
+    d = _d1(S, K, T, r, sigma)
+    if np.isnan(d): return 1.0 if (flag=='call' and S>K) else 0.0
+    return norm.cdf(d) if flag=='call' else norm.cdf(d) - 1.0
 
-# ==================================================================================================
-# --- 2. SIMULATED "LIMBS" (FAKE TRADER) ---
-# ==================================================================================================
+def straddle_delta(S, K, T, r, sigma):
+    return bs_delta(S,K,T,r,sigma,'call') + bs_delta(S,K,T,r,sigma,'put')
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 4 — BACKTESTER
+# ═════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class ClosedTradeLog:
-    id: str
-    tradingsymbol: str
-    strategy: str
-    regime: str
-    entry_time: datetime
-    exit_time: datetime
+class HedgePosition:
+    entry_time : pd.Timestamp
+    entry_spot : float
+    strike     : float
+    flag       : str
     entry_price: float
-    exit_price: float
-    qty: int
-    pnl: float
-    exit_reason: str
+    lots       : int
+    lot_size   : int
+    sl_price   : float
+    tp_price   : float
+    status     : str = 'open'
+    exit_price : float = 0.0
+    exit_reason: str  = ''
+    pnl        : float = 0.0
+
+@dataclass
+class StraddleTrade:
+    entry_dt       : pd.Timestamp
+    entry_spot     : float
+    entry_iv       : float
+    entry_straddle : float
+    strike         : float
+    dte_at_entry   : int
+    lots           : int
+    lot_size       : int
+    er_at_entry    : float
+    hedge_pnl      : float = 0.0
+    hedge_costs    : float = 0.0
+    hedge_count    : int   = 0
+    last_hedge_dt  : Optional[pd.Timestamp] = None
+    last_hedge_spot: float = 0.0
+    last_straddle_delta: float = 0.0
+    hedges         : List[HedgePosition] = field(default_factory=list)
+    exit_dt        : Optional[pd.Timestamp] = None
+    exit_spot      : float = 0.0
+    exit_straddle  : float = 0.0
+    exit_reason    : str   = ''
+    straddle_pnl   : float = 0.0
+    total_pnl      : float = 0.0
+    duration_mins  : float = 0.0
+
+
+def _find_hedge_option_price(df_1min, dt, target_strike_offset, flag):
+    option_type = flag.upper()
+    offset_str  = f'ATM+{target_strike_offset}' if target_strike_offset > 0 \
+                  else (f'ATM-{abs(target_strike_offset)}' if target_strike_offset < 0 else 'ATM')
+
+    mask = ((df_1min['datetime'] == dt) & (df_1min['option_type'] == option_type) & 
+            (df_1min['strike_offset'] == offset_str))
+    rows = df_1min[mask]
+    if rows.empty: return 0.0
+    return float(rows.iloc[0]['close'])
+
+
+def _close_open_hedges(hedges, spot_now, df_1min, dt, p):
+    pnl_sum, cost_sum = 0.0, 0.0
+    for h in hedges:
+        if h.status != 'open': continue
+        atm_strike    = round(h.entry_spot / 50) * 50
+        strike_offset = round((h.strike - atm_strike) / 50)
+        current_price = _find_hedge_option_price(df_1min, dt, strike_offset, h.flag)
+        if current_price <= 0: current_price = h.entry_price
+
+        should_close, reason = False, ''
+        if current_price >= h.tp_price:
+            should_close, reason = True, 'hedge_tp'
+        elif current_price <= h.sl_price:
+            should_close, reason = True, 'hedge_sl'
+
+        if should_close:
+            h.exit_price, h.exit_reason, h.status = current_price, reason, 'closed'
+            h.pnl     = (current_price - h.entry_price) * h.lots * h.lot_size
+            pnl_sum  += h.pnl
+            cost_sum += p['TX_COST_PER_LOT'] * h.lots
+    return pnl_sum, cost_sum
+
+
+def run_backtest(df_1min_straddle, df_1min_raw, df_3min_straddle, p, verbose=True):
+    p1 = df_1min_straddle.reset_index(drop=True)
+    p3 = df_3min_straddle.sort_values('datetime').reset_index(drop=True)
+
+    trades, open_t = [], None
+    dt3_set = set(p3['datetime'].values)
+    p3_idx  = {row.datetime: row for row in p3.itertuples()}
+
+    r, lot, n = p['RISK_FREE_RATE'], p['LOT_SIZE'], p['NUM_LOTS']
+
+    if verbose: print(f"  BACKTEST — {len(p1):,} 1-min bars")
+
+    for i, row1 in p1.iterrows():
+        dt, spot, iv, hm = row1['datetime'], row1['spot'], row1['iv_dec'], row1['hour_min']
+        if pd.isna(spot) or pd.isna(iv) or iv <= 0 or spot <= 0: continue
+
+        if open_t is not None:
+            t = open_t
+            elapsed_mins = (dt - t.entry_dt).total_seconds() / 60.0
+            c_close = row1.get('c_close', t.entry_straddle / 2)
+            p_close = row1.get('p_close', t.entry_straddle / 2)
+            straddle_now = c_close + p_close
+            straddle_ret = (straddle_now / t.entry_straddle) - 1.0
+            iv_ratio     = iv / t.entry_iv if t.entry_iv > 0 else 1.0
+
+            exit_reason = None
+            if straddle_ret >= p['STRADDLE_TP_PCT']:       exit_reason = 'gamma_win'
+            elif iv_ratio >= (1.0 + p['IV_EXPAND_PCT']):     exit_reason = 'vega_win'
+            elif iv_ratio <= (1.0 - p['IV_CRUSH_PCT']):      exit_reason = 'iv_crush'
+            elif elapsed_mins > p['THETA_BLEED_MINS'] and straddle_now < t.entry_straddle: exit_reason = 'theta_bleed'
+            elif straddle_ret <= -p['STRADDLE_SL_PCT']:      exit_reason = 'max_drawdown'
+            elif hm >= p['SESSION_END']:                     exit_reason = 'eod'
+
+            h_pnl, h_cost = _close_open_hedges(t.hedges, spot, df_1min_raw, dt, p)
+            t.hedge_pnl   += h_pnl
+            t.hedge_costs += h_cost
+
+            is_3min_bar = dt in dt3_set
+            if is_3min_bar and exit_reason is None:
+                mins_since_hedge = ((dt - t.last_hedge_dt).total_seconds() / 60.0 if t.last_hedge_dt else 999)
+                row3 = p3_idx.get(dt)
+                if row3 is not None:
+                    iv3   = getattr(row3, 'iv_dec', iv)
+                    dte_r = max(dte_from_dt(dt) / 365.0, 1e-5)
+                    s_delta = straddle_delta(spot, t.strike, dte_r, r, iv3 if iv3 > 0 else t.entry_iv)
+
+                    if (abs(s_delta) > p['DELTA_THRESHOLD'] or mins_since_hedge >= p['HEDGE_INTERVAL_3MIN'] * 3) and abs(spot - t.last_hedge_spot) > 0:
+                        _execute_hedge(t, dt, spot, s_delta, df_1min_raw, p, row1)
+                        t.last_hedge_dt, t.last_hedge_spot, t.last_straddle_delta = dt, spot, s_delta
+
+            if exit_reason:
+                t.straddle_pnl = (straddle_now - t.entry_straddle) * n * lot
+                for h in t.hedges:
+                    if h.status == 'open':
+                        atm_s    = round(t.entry_spot / 50) * 50
+                        hp_now   = _find_hedge_option_price(df_1min_raw, dt, round((h.strike - atm_s) / 50), h.flag)
+                        if hp_now <= 0: hp_now = h.entry_price
+                        h.exit_price, h.exit_reason, h.status = hp_now, 'straddle_closed', 'closed'
+                        h.pnl         = (hp_now - h.entry_price) * h.lots * lot
+                        t.hedge_pnl  += h.pnl
+                        t.hedge_costs+= p['TX_COST_PER_LOT'] * h.lots
+
+                t.total_pnl = t.straddle_pnl + t.hedge_pnl - (p['TX_COST_PER_LOT']*2*n) - t.hedge_costs
+                t.exit_dt, t.exit_spot, t.exit_straddle, t.exit_reason, t.duration_mins = dt, spot, straddle_now, exit_reason, elapsed_mins
+                trades.append(t)
+                open_t = None
+            continue
+
+        if row1.get('buy_signal', False):
+            strad = row1.get('c_close', 0) + row1.get('p_close', 0)
+            if strad > 0:
+                open_t = StraddleTrade(
+                    entry_dt=dt, entry_spot=spot, entry_iv=iv, entry_straddle=strad, strike=round(spot/50)*50,
+                    dte_at_entry=dte_from_dt(dt), lots=n, lot_size=lot, er_at_entry=row1.get('er', 0.0),
+                    hedge_costs=p['TX_COST_PER_LOT']*2*n, last_hedge_spot=spot, last_hedge_dt=dt
+                )
+
+    if open_t and len(p1) > 0:
+        last = p1.iloc[-1]
+        strad_now = last.get('c_close', open_t.entry_straddle/2) + last.get('p_close', open_t.entry_straddle/2)
+        open_t.straddle_pnl = (strad_now - open_t.entry_straddle) * n * lot
+        open_t.total_pnl    = open_t.straddle_pnl + open_t.hedge_pnl - p['TX_COST_PER_LOT']*2*n - open_t.hedge_costs
+        open_t.exit_dt, open_t.exit_reason, open_t.exit_straddle = last['datetime'], 'end_of_data', strad_now
+        trades.append(open_t)
+
+    return _trades_to_df(trades, verbose)
+
+
+def _execute_hedge(t, dt, spot, s_delta, df_1min, p, row1):
+    atm_strike = round(spot / 50) * 50
+    atr_val    = row1.get('straddle_atr', spot * 0.002)
+
+    flag, offset = ('put', 0) if s_delta > p['DELTA_THRESHOLD'] else ('call', 0)
+    h_price = _find_hedge_option_price(df_1min, dt, offset, flag)
+    if h_price <= 0: return
+
+    sl_dist  = p['HEDGE_SL_ATR_MULT'] * atr_val
+    sl_price = max(h_price - sl_dist, h_price * 0.50)
+    tp_price = min(h_price + sl_dist * p['RR_RATIO'], h_price * (1 + p['HEDGE_TP_PCT']))
+
+    t.hedges.append(HedgePosition(dt, spot, atm_strike + (offset * 50), flag, h_price, p['NUM_LOTS'], p['LOT_SIZE'], sl_price, tp_price))
+    t.hedge_count += 1
+    t.hedge_costs += p['TX_COST_PER_LOT'] * p['NUM_LOTS'] + p['SLIPPAGE_PER_HEDGE']
+
+
+def _trades_to_df(trades, verbose):
+    if not trades: return pd.DataFrame()
+    df = pd.DataFrame([asdict(t) for t in trades])
+    df['realized_pnl'] = df['total_pnl']
+    df['cumulative_pnl'] = df['realized_pnl'].cumsum()
+    df['num_hedges'] = df['hedges'].apply(len)
+    df.drop(columns=['hedges'], inplace=True)
+    if verbose:
+        print(f"  Trades: {len(df)} | Win rate: {(df['realized_pnl']>0).mean()*100:.1f}% | Total P&L: ₹{df['realized_pnl'].sum():,.0f}")
+    return df
+
+
+def compute_metrics(df):
+    if df.empty or 'realized_pnl' not in df.columns: return {'n_trades': 0, 'sharpe': -99, 'total_pnl': 0, 'win_rate': 0}
+    pnl  = df['realized_pnl']
+    wins, loss = pnl[pnl > 0], pnl[pnl <= 0]
+    daily = df.groupby(pd.to_datetime(df['entry_dt']).dt.date)['realized_pnl'].sum()
     
-class SimulatedTrader(AbstractTrader):
-    def __init__(self,
-                 engine: 'BacktestEngine',
-                 book: InstrumentBook,
-                 prices: SimulatedPriceBus,
-                 store: 'SimulatedStore',
-                 config: dict):
-        
-        super().__init__(engine, book, prices, store, config, perf_callback=None)
-        
-        self.engine = engine
-        self.prices = prices
-        self.store = store
-        
-        self.backtest_config = config.get("backtester", {})
-        self.slippage_pct = self.backtest_config.get("slippage_pct", 0.05) / 100.0
-        self.commission_per_lot = self.backtest_config.get("commission_per_lot", 40)
-        
-        self.positions: dict[str, Position] = {}
-        self.closed_trades_log: list[ClosedTradeLog] = []
-        self.trade_id_counter = 1
-        self.daily_realized_pnl = 0.0
+    return {
+        'n_trades': len(df),
+        'win_rate': (len(wins) / len(pnl) * 100) if len(pnl)>0 else 0,
+        'total_pnl': pnl.sum(),
+        'avg_win': wins.mean() if len(wins) else 0,
+        'avg_loss': loss.mean() if len(loss) else 0,
+        'profit_factor': (-wins.sum() / loss.sum()) if loss.sum() < 0 else (999 if wins.sum()>0 else 0),
+        'max_dd': (pnl.cumsum() - pnl.cumsum().cummax()).min(),
+        'sharpe': (daily.mean() / daily.std() * np.sqrt(252)) if len(daily) > 1 and daily.std() > 0 else 0,
+        'expectancy': pnl.mean(),
+        'avg_duration': df['duration_mins'].mean(),
+        'avg_hedges': df['hedge_count'].mean(),
+    }
 
-    def _get_lot_size(self, tradingsymbol: str) -> int:
-        underlying = _get_underlying(tradingsymbol)
-        return self.book.lot_size(underlying)
 
-    def _calculate_fill_price(self, target_price: float, side: OrderSide) -> float:
-        if side == OrderSide.BUY:
-            return target_price * (1 + self.slippage_pct)
-        else: # SELL
-            return target_price * (1 - self.slippage_pct)
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 5 — OPTUNA HYPERPARAMETER TUNING ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
 
-    def _calculate_commission(self, tradingsymbol: str, qty: int) -> float:
-        lot_size = self._get_lot_size(tradingsymbol)
-        if not lot_size or lot_size == 0:
-            L.warning(f"Could not find lot size for {tradingsymbol}, commission will be 0")
-            return 0
-        lots = qty / lot_size
-        return lots * self.commission_per_lot # Commission is for a round trip
+FIXED_PARAMS = {   
+    "DTE_MIN"             : 2,
+    "HEDGE_INTERVAL_3MIN" : 3,
+    "DELTA_THRESHOLD"     : 0.08,
+    "ATR_WINDOW"          : 14,
+    "ENTRY_START"         : "09:30",
+    "ENTRY_END"           : "14:00",
+    "SESSION_END"         : "15:15",
+    "LOT_SIZE"            : 75,
+    "NUM_LOTS"            : 1,
+    "TX_COST_PER_LOT"     : 30.0,
+    "SLIPPAGE_PER_HEDGE"  : 2.0,
+    "MINS_PER_DAY"        : 375,
+    "RISK_FREE_RATE"      : 0.065,
+    "MIN_ER_FOR_TREND"    : 0.35,
+    "THETA_BLEED_MINS"    : 120,
+}
 
-    def open_position(self, trade_params: dict) -> Position | None:
-        """
-        Simulates an immediate fill. The `trade_params` now contain
-        the *real* option contract chosen by the planner.
-        """
-        current_bar = self.prices._current_futures_bar
-        if current_bar is None: return None
-
-        opt = trade_params['opt']
-        
-        # Get the estimated fill price, which was already calculated by the
-        # planner and stored in `ltp_opt`. We'll use this as the "open" price.
-        target_price = trade_params['ltp_opt']
-        fill_price = self._calculate_fill_price(target_price, OrderSide.BUY)
-        
-        lot_size = self._get_lot_size(opt['tradingsymbol'])
-        if not lot_size: return None
-             
-        qty = trade_params['lots'] * lot_size
-        pos_id = f"BACKTEST_{self.trade_id_counter}"
-        self.trade_id_counter += 1
-
-        pos = Position(
-            id=pos_id,
-            tradingsymbol=opt['tradingsymbol'],
-            token=int(opt['instrument_token']),
-            option_type=opt['instrument_type'],
-            qty=qty,
-            initial_qty=qty,
-            entry_price=fill_price,
-            initial_sl_price=fill_price - trade_params['option_sl_points'],
-            sl_price=fill_price - trade_params['option_sl_points'],
-            tp_price=fill_price + trade_params['option_tp_points'],
-            opened_at=current_bar.name, # bar.name is the timestamp
-            strategy=trade_params['strategy'],
-            market_regime_at_entry=trade_params['regime'],
-            underlying_sl_level=trade_params['underlying_sl'],
-            status=PositionStatus.ACTIVE.value,
-            entry_order_id=pos_id,
-            scaled_out_qty=0,
-            trailing_sl_armed=False,
-            initial_risk_points=trade_params['option_sl_points'],
-            option_sl_points=trade_params['option_sl_points'],
-            option_tp_points=trade_params['option_tp_points'],
-            high_price_since_entry=fill_price,
-            scale_out_rules=trade_params['scale_out_rules'],
-            greeks=trade_params['greeks'],
-            max_trade_duration_minutes=trade_params.get('max_trade_duration_minutes', 90),
-            oi_profit_target=trade_params.get('oi_profit_target'),
-            intended_risk_rupees=trade_params.get('total_trade_risk', 0.0),
-        )
-        
-        self.positions[pos.id] = pos
-        self.store.upsert_position(pos)
-        
-        L.info(f"[{current_bar.name}] ✅ OPENED {pos.strategy} {pos.tradingsymbol} Qty={pos.qty} @ {pos.entry_price:.2f}")
-        return pos
-
-    def close_position(self, p: Position, reason: str, exit_price: float) -> bool:
-        if p.status == PositionStatus.CLOSED.value:
-            return True
-
-        p.status = PositionStatus.CLOSED.value
-        p.exit_reason = reason
-        
-        final_exit_price = self._calculate_fill_price(exit_price, OrderSide.SELL)
-        commission = self._calculate_commission(p.tradingsymbol, p.initial_qty)
-        
-        pnl = (final_exit_price - p.entry_price) * p.initial_qty - commission
-        self.daily_realized_pnl += pnl
-        
-        self.engine.risk_manager.update_performance_metrics(pnl)
-        
-        log_entry = ClosedTradeLog(
-            id=p.id, tradingsymbol=p.tradingsymbol,
-            strategy=p.strategy, regime=p.market_regime_at_entry,
-            entry_time=p.opened_at, exit_time=self.prices._current_futures_bar.name,
-            entry_price=p.entry_price, exit_price=final_exit_price,
-            qty=p.initial_qty, pnl=pnl, exit_reason=reason
-        )
-        
-        self.closed_trades_log.append(log_entry)
-        self.positions.pop(p.id, None)
-        self.store.log_closed_trade(p, final_exit_price, reason)
-        
-        L.info(f"[{self.prices._current_futures_bar.name}] ❌ CLOSED {p.tradingsymbol} @ {final_exit_price:.2f} ({reason}). PnL: {pnl:.2f}")
-        return True
-
-    def modify_sl(self, p: Position, new_trigger: float):
-        if new_trigger > p.sl_price:
-            L.debug(f"[{self.prices._current_futures_bar.name}] 📈 TSL {p.tradingsymbol} from {p.sl_price:.2f} to {new_trigger:.2f}")
-            p.sl_price = new_trigger
-            self.store.upsert_position(p)
-
-    def scale_out(self, p: Position, qty_to_close: int) -> bool:
-        if qty_to_close <= 0 or qty_to_close > p.qty:
-            return False
-            
-        # Estimate current price
-        current_price = self.prices.ltp(p.token)
-        if not current_price:
-            L.warning(f"Could not get LTP for {p.token} to scale out.")
-            return False
-            
-        exit_price = self._calculate_fill_price(current_price, OrderSide.SELL)
-        commission = self._calculate_commission(p.tradingsymbol, qty_to_close)
-        pnl = (exit_price - p.entry_price) * qty_to_close - commission
-        
-        self.daily_realized_pnl += pnl
-        self.engine.risk_manager.update_performance_metrics(pnl)
-        
-        L.info(f"[{self.prices._current_futures_bar.name}] 💰 SCALED OUT {qty_to_close} of {p.tradingsymbol} @ {exit_price:.2f}. PnL: {pnl:.2f}")
-        
-        p.qty -= qty_to_close
-        p.scaled_out_qty += qty_to_close
-        p.status = PositionStatus.PARTIALLY_CLOSED.value
-        self.store.upsert_position(p)
-        return True
-
-    def unrealized_pnl(self) -> float:
-        pnl = 0.0
-        for p in self.positions.values():
-            if p.status in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value]:
-                current_price = self.prices.ltp(p.token)
-                if current_price:
-                    pnl += (current_price - p.entry_price) * p.qty
-        return pnl
-
-    def place_bracket_orders(self, p: Position) -> bool:
-        p.status = PositionStatus.ACTIVE.value
-        return True
-    def cancel_pending_entry(self, p: Position) -> bool: return True
-    def execute_simulated_sl(self, p: Position) -> bool: return True
-
-# ==================================================================================================
-# --- 3. MODIFIED POSITION MANAGER (WITH FULL TSL) ---
-# ==================================================================================================
-
-class BacktestPositionManager(PositionManager):
-    """
-    Overrides the real PositionManager to work with historical bars
-    and includes the FULL TSL logic from main1.py.
-    """
+def optuna_objective(trial, base_params, df_1min_s, df_1min_raw, df_3min_s, score_metric):
+    p = base_params.copy()
     
-    # --- COPIED FROM main1.py ---
-    def _calculate_trailing_stop(self, p: Position) -> float | None:
-        try:
-            trail_params = self.trailing_sl_config
-            trail_tf = trail_params["timeframe_scaled_out"] if p.triggered_scale_out_targets else trail_params["timeframe"]
+    # ── Tunable Space ──
+    p['IVR_ENTRY_MAX']     = trial.suggest_float('IVR_ENTRY_MAX', 20.0, 55.0)
+    p['IV_HV_RATIO_MAX']   = trial.suggest_float('IV_HV_RATIO_MAX', 0.60, 1.00)
+    p['STRADDLE_TP_PCT']   = trial.suggest_float('STRADDLE_TP_PCT', 0.08, 0.25)
+    p['STRADDLE_SL_PCT']   = trial.suggest_float('STRADDLE_SL_PCT', 0.08, 0.25)
+    p['IV_EXPAND_PCT']     = trial.suggest_float('IV_EXPAND_PCT', 0.02, 0.15)
+    p['IV_CRUSH_PCT']      = trial.suggest_float('IV_CRUSH_PCT', 0.02, 0.15)
+    p['HEDGE_TP_PCT']      = trial.suggest_float('HEDGE_TP_PCT', 0.03, 0.20)
+    p['HEDGE_SL_ATR_MULT'] = trial.suggest_float('HEDGE_SL_ATR_MULT', 0.5, 4.0)
+    p['RR_RATIO']          = trial.suggest_float('RR_RATIO', 0.2, 1.5)
+    p['RV_WINDOW']         = trial.suggest_int('RV_WINDOW', 5, 40)
+    p['IVR_LOOKBACK_DAYS'] = trial.suggest_int('IVR_LOOKBACK_DAYS', 5, 40)
+    p['ER_WINDOW']         = trial.suggest_int('ER_WINDOW', 5, 30)
+
+    # Silence logs during 100+ trials to save memory/console
+    original_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        sig  = generate_signals(df_1min_s.copy(), p)
+        t_df = run_backtest(sig, df_1min_raw, df_3min_s, p, verbose=False)
+        
+        if t_df.empty or len(t_df) < 5: return -999.0
             
-            # This now reads the ESTIMATED option bar data from the BarStore
-            df = self.engine.get_ohlc(p.token, trail_tf) 
-
-            period = trail_params["chandelier_period"]
-            if len(df) < period:
-                return None
-
-            try:
-                import pandas_ta as ta
-                df.ta.atr(length=period, append=True)
-                atr_col = f'ATRr_{period}'
-                if atr_col not in df.columns:
-                     raise Exception(f"Failed to calculate ATR, column {atr_col} not found.")
-                atr = df[atr_col].iloc[-1]
-            except Exception as e:
-                L.warning(f"Could not get ATR for TSL: {e}. Install pandas-ta.")
-                return None
-
-            if pd.isna(atr):
-                return None
-
-            multiplier = trail_params["chandelier_multiplier_scaled_out"] if p.triggered_scale_out_targets else trail_params["chandelier_multiplier"]
-            high_over_period = df['high'].rolling(period).max().iloc[-1]
-            new_sl_price = high_over_period - atr * multiplier
-            return new_sl_price
-        except Exception as e:
-            L.warning(f"Could not calculate trailing stop for {p.tradingsymbol}: {e}")
-            return None
-    # --- END COPY ---
-
-    def update_option_bars_for_open_positions(self):
-        """
-        Estimates and adds the current bar's OHLC for all open
-        options to the BarStore. This is VITAL for the TSL.
-        """
-        for p in self.trader.positions.values():
-            if p.status in [PositionStatus.ACTIVE.value, PositionStatus.PARTIALLY_CLOSED.value]:
-                # Get the estimated OHLC bar for this option
-                opt_bar = self.prices.get_estimated_option_ohlc(p.token)
-                if opt_bar:
-                    # Add it to the BarStore so TSL can read it
-                    self.engine.bars.add_tick(opt_bar)
-
-    def manage_positions_backtest(self, bar_timestamp: datetime):
-        """
-        Checks for SL/TP hits against the estimated High/Low.
-        """
-        with self.trader.lock:
-            active_positions = list(self.trader.positions.values())
-
-        now = bar_timestamp
-
-        for p in active_positions:
-            with self.trader.lock:
-                if p.id not in self.trader.positions:
-                    continue
-            
-            # Get the estimated OHLC for this option
-            opt_bar = self.prices.get_estimated_option_ohlc(p.token)
-            if not opt_bar:
-                L.warning(f"Could not get estimated OHLC for {p.tradingsymbol}, skipping mgmt.")
-                continue
-                
-            bar_high = opt_bar['high']
-            bar_low = opt_bar['low']
-            ltp = opt_bar['close']
-
-            # --- CRITICAL HIT CHECKING ---
-            if bar_low <= p.sl_price:
-                L.debug(f"[{now}] SL HIT for {p.tradingsymbol} (BarLow: {bar_low:.2f} <= SL: {p.sl_price:.2f})")
-                self.trader.close_position(p, "SL_HIT_BACKTEST", p.sl_price)
-                continue
-
-            if bar_high >= p.tp_price and p.tp_price > 0:
-                L.debug(f"[{now}] TP HIT for {p.tradingsymbol} (BarHigh: {bar_high:.2f} >= TP: {p.tp_price:.2f})")
-                self.trader.close_position(p, "TP_HIT_BACKTEST", p.tp_price)
-                continue
-
-            if (now - p.opened_at).total_seconds() / 60 > p.max_trade_duration_minutes:
-                L.info(f"[{now}] TIME STOP for {p.tradingsymbol}. Closing at bar open.")
-                self.trader.close_position(p, "TIME_STOP_EXIT", opt_bar['open'])
-                continue
-
-            # --- IF NO HITS, run normal TSL logic ---
-            p.high_price_since_entry = max(p.high_price_since_entry, ltp)
-
-            # --- FULL TRAILING STOP LOGIC (from main1.py) ---
-            with self.trader.lock:
-                profit_points = ltp - p.entry_price
-                current_rr = profit_points / p.initial_risk_points if p.initial_risk_points > 0 else 0
-                highest_sl_floor = p.initial_sl_price
-
-                trailing_stages = self.trade_mgmt_config.get("trailing_stop_stages", [])
-                for stage in trailing_stages:
-                    if current_rr >= stage['rr_target']:
-                        new_floor = p.entry_price + (p.initial_risk_points * stage['trail_behind_rr'])
-                        highest_sl_floor = max(highest_sl_floor, new_floor)
-
-                final_new_sl = highest_sl_floor
-
-                if not p.trailing_sl_armed and profit_points >= p.initial_risk_points * self.trading_config['trailing_sl_activation_rr']:
-                    p.trailing_sl_armed = True
-                    L.info(f"[{now}] Chandelier TSL armed for {p.tradingsymbol}")
-
-                if p.trailing_sl_armed:
-                    if calculated_chandelier_sl := self._calculate_trailing_stop(p):
-                        final_new_sl = max(final_new_sl, calculated_chandelier_sl)
-
-                if final_new_sl > p.sl_price:
-                    if final_new_sl >= p.entry_price and p.tp_price > 0:
-                        L.info(f"[{now}] TSL for {p.tradingsymbol} is profitable, cancelling static TP.")
-                        p.tp_price = 0 # 0 means no TP
-                        
-                    self.trader.modify_sl(p, final_new_sl)
-
-            self.store_actor.upsert_position(p)
-
-# ==================================================================================================
-# --- 4. FAKE STORE & CLOCK (Dependencies) ---
-# ==================================================================================================
-
-class SimulatedStore:
-    """A fake, in-memory store that mimics the StoreActor's interface."""
-    def __init__(self):
-        self.positions = {}
-        self.closed_trades = []
-        self.kv = {}
-        L.info("SimulatedStore (in-memory) initialized.")
-
-    def upsert_position(self, pos: Position): self.positions[pos.id] = pos
-    def log_closed_trade(self, pos: Position, price: float, reason: str):
-        self.closed_trades.append(pos); self.positions.pop(pos.id, None)
-    def log_strategy_performance(self, name: str, pnl: float): pass
-    def get_strategy_performance(self, lookback_days: int) -> pd.DataFrame:
-        return pd.DataFrame(columns=["strategy_name", "pnl"])
-    def load_open_positions(self) -> dict[str, Position]: return {}
-    def get_todays_trades_stats(self) -> tuple[int, int]: return 0, 0
-    def set_kv(self, key: str, value: str): self.kv[key] = value
-    def get_kv(self, key: str, default: str | None = None) -> str | None:
-        return self.kv.get(key, default)
-
-class BacktestClock(Clock):
-    """A Clock that gets its time from the BacktestEngine."""
-    def __init__(self): self._now = datetime.now()
-    def set_time(self, new_time: datetime): self._now = new_time
-    def now(self) -> datetime: return self._now
-
-# ==================================================================================================
-# --- 5. THE BACKTEST ENGINE (The "Runner") ---
-# ==================================================================================================
-
-class BacktestEngine:
-    def __init__(self, config_dict: dict, historical_data_path: str): # <-- MODIFIED
-        L.info("Initializing BacktestEngine...")
-        self.config = config_dict # <-- MODIFIED
-        self.historical_data = self._load_data(historical_data_path)
-        
-        # --- Create FAKE Components ---
-        self.clock = BacktestClock()
-        self.store = SimulatedStore()
-        
-        global now_ist
-        now_ist = self.clock.now
-        
-        # --- Create REAL Components ---
-        self.book = self._load_real_book()
-        
-        # SimulatedPriceBus needs the book and engine
-        self.prices = SimulatedPriceBus(self.book, self)
-        
-        # The Engine is the "coordinator"
-        self.engine = Engine(None, self.book, self.prices, self.config)
-        
-        self.trader = SimulatedTrader(self, self.book, self.prices, self.store, self.config)
-        self.risk_manager = RiskManager(self.engine, self.trader, self.book, self.prices, self.store, self.config)
-        self.micro_monitor = MicrostructureMonitor(self.prices, self.config)
-        self.pos_manager = BacktestPositionManager(self.engine, self.trader, self.book, self.prices, self.store, self.risk_manager, self.config)
-
-        # --- Link all components together ---
-        self.engine.set_dependencies(self.trader, self.risk_manager, self.micro_monitor, self.pos_manager)
-        
-        # Set the (real) BarStore on the (real) Engine
-        self.engine.bars = BarStore(timeframes=[1, 3, 5, 15])
-        
-        # Set the (real) classifier on the (real) Engine
-        self.engine.nifty_token = 256265
-        self.engine.bn_token = 260105
-        self.engine.vix_token = 257281
-        self.engine.classifier = RegimeClassifier(self.engine, 256265, 260105, 257281, self.config["strategies"]["regime_classifier"])
-        
-        L.info("BacktestEngine initialized successfully.")
-        
-    # In backtester.py, add this new function inside the BacktestEngine class
-
-    def _generate_synthetic_microstructure(self, bar: pd.Series):
-        """
-        Generates plausible OBI/TFI scores based on the underlying bar
-        and injects them into the MicrostructureMonitor.
-        """
-        for token, prefix in [(256265, "NIFTY"), (260105, "BN")]:
-            if f"{prefix}_close" not in bar.index:
-                continue
-
-            bar_close = bar[f"{prefix}_close"]
-            bar_open = bar[f"{prefix}_open"]
-            bar_high = bar[f"{prefix}_high"]
-            bar_low = bar[f"{prefix}_low"]
-
-            if bar_close == bar_open:
-                continue # Do-nothing on a doji bar
-
-            # 1. Calculate bar "strength" (e.g., -1.0 to +1.0)
-            # This is a simple % of bar that was a green/red candle
-            bar_range = bar_high - bar_low
-            if bar_range == 0: continue
-            
-            body = bar_close - bar_open
-            strength = (body / bar_range) * 2.0 # Scale to roughly -2.0 to +2.0
-            strength = max(-1.0, min(1.0, strength)) # Clamp to -1.0 to +1.0
-
-            # 2. Get all option contracts for this underlying
-            underlying_name = _get_underlying(self.book.get_symbol(token))
-            expiry = self.book.find_nearest_expiry_date(underlying_name)
-            if not expiry: continue
-            
-            chain = self.book.get_option_chain(underlying_name, expiry)
-            if chain.empty: continue
-            
-            # 3. Inject synthetic data for ALL options in the chain
-            for opt_token in chain['instrument_token']:
-                # --- Fake TFI Score ---
-                # A strong up-bar (strength=1.0) creates a TFI score of +350
-                # A strong down-bar (strength=-1.0) creates a TFI score of -350
-                fake_tfi_score = strength * 350 # 350 is just below the 400 threshold
-                
-                # Add some randomness so it's not perfect
-                fake_tfi_score += np.random.normal(0, 50) 
-                
-                # Inject this fake score into the *real* monitor
-                if opt_token not in self.micro_monitor.tfi_score_history:
-                    self.micro_monitor.tfi_score_history[opt_token] = deque(maxlen=self.micro_monitor.persistence_window)
-                self.micro_monitor.tfi_score_history[opt_token].append(fake_tfi_score)
+        m = compute_metrics(t_df)
+        score = m.get(score_metric, 0)
+        if m['n_trades'] < 10: score *= (m['n_trades'] / 10.0)
+        return score
+    except Exception as e:
+        return -999.0
+    finally:
+        sys.stdout.close()
+        sys.stdout = original_stdout
 
 
-                # --- Fake OBI Score ---
-                # A strong up-bar (strength=1.0) creates OBI of 65% (0.65)
-                # A strong down-bar (strength=-1.0) creates OBI of 35% (0.35)
-                # 0.5 is the neutral mid-point
-                fake_obi_ratio = 0.5 + (strength * 0.15) # 0.15 maps to the 65/35 range
-                
-                # Add some randomness
-                fake_obi_ratio += np.random.normal(0, 0.05)
-                fake_obi_ratio = max(0.01, min(0.99, fake_obi_ratio)) # Clamp
-                
-                # Inject this fake score
-                if opt_token not in self.micro_monitor.obi_ratio_history:
-                    self.micro_monitor.obi_ratio_history[opt_token] = deque(maxlen=self.micro_monitor.persistence_window)
-                self.micro_monitor.obi_ratio_history[opt_token].append(fake_obi_ratio)
-        
-    def _load_real_book(self) -> InstrumentBook:
-        """Loads the real InstrumentBook from the cached CSV."""
-        L.info("Loading REAL InstrumentBook...")
-        instrument_file = os.path.join(PERSIST_DIR, "instruments_nfo.csv")
-        if not os.path.exists(instrument_file):
-            L.critical(f"CRITICAL: `instruments_nfo.csv` not found in `{PERSIST_DIR}`.")
-            L.critical("Please run `main1.py` once in live mode to generate this file.")
-            exit(1)
-            
-        try:
-            book = InstrumentBook(store_actor=None, order_actor=None)
-            book.df = pd.read_csv(instrument_file, parse_dates=["expiry"])
-            book.df['expiry'] = pd.to_datetime(book.df['expiry']).dt.tz_localize(IST) # Ensure TZ
-            book.df_by_token = book.df.set_index('instrument_token')
-            book.df_by_symbol = book.df.set_index('tradingsymbol')
-            L.info(f"Real InstrumentBook loaded with {len(book.df)} instruments.")
-            return book
-        except Exception as e:
-            L.critical(f"Failed to load real InstrumentBook: {e}", exc_info=True)
-            exit(1)
-
-
-    def _load_data(self, path: str) -> pd.DataFrame:
-        """
-        Loads and prepares the historical data.
-        NOTE: This NO LONGER creates fake OPT_ columns.
-        """
-        L.info(f"Loading historical data from {path}...")
-        try:
-            df = pd.read_csv(path, parse_dates=['timestamp'], index_col='timestamp')
-            df = df.tz_localize('UTC').tz_convert('Asia/Kolkata') # Ensure IST
-            
-            # Remove any fake columns if they exist
-            df = df.loc[:, ~df.columns.str.startswith('OPT_')]
-            
-            L.info(f"Data loaded. {len(df)} bars from {df.index[0]} to {df.index[-1]}")
-            return df
-        except Exception as e:
-            L.critical(f"Failed to load data: {e}")
-            exit(1)
-
-    def _prime_barstore(self):
-        """
-        PRE-LOADS THE ENTIRE DATASET for futures/VIX
-        to ensure indicators are fully "warmed up".
-        """
-        L.info(f"Pre-loading BarStore with {len(self.historical_data)} FUTURES bars...")
-        
-        # NIFTY
-        if 'NIFTY_open' in self.historical_data.columns:
-            prime_data_nifty = self.historical_data[['NIFTY_open', 'NIFTY_high', 'NIFTY_low', 'NIFTY_close', 'NIFTY_volume']].copy()
-            prime_data_nifty.columns = ['open', 'high', 'low', 'close', 'volume']
-            prime_data_nifty['date'] = prime_data_nifty.index
-            self.engine.bars.prime(256265, prime_data_nifty) # NIFTY
-        
-        # BANKNIFTY
-        if 'BN_open' in self.historical_data.columns:
-            prime_data_bn = self.historical_data[['BN_open', 'BN_high', 'BN_low', 'BN_close', 'BN_volume']].copy()
-            prime_data_bn.columns = ['open', 'high', 'low', 'close', 'volume']
-            prime_data_bn['date'] = prime_data_bn.index
-            self.engine.bars.prime(260105, prime_data_bn) # BN
-
-        # VIX
-        if 'VIX_open' in self.historical_data.columns:
-            prime_data_vix = self.historical_data[['VIX_open', 'VIX_high', 'VIX_low', 'VIX_close', 'VIX_volume']].copy()
-            prime_data_vix.columns = ['open', 'high', 'low', 'close', 'volume']
-            prime_data_vix['date'] = prime_data_vix.index
-            self.engine.bars.prime(257281, prime_data_vix) # VIX
-        
-        L.info("BarStore (Futures/VIX) pre-loading complete.")
-
-
-    def run_backtest(self):
-        L.info("--- STARTING HIGH-FIDELITY BACKTEST RUN ---")
-        
-        self._prime_barstore()
-        
-        warmup_period = 200 # Must match your longest indicator
-        L.info(f"Skipping first {warmup_period} bars for indicator warmup...")
-
-        for i, bar in enumerate(self.historical_data.iloc[warmup_period:].itertuples()):
-            try:
-                # 1. Update "Time" and "Senses" (Futures only)
-                self.clock.set_time(bar.Index)
-                self.prices.update_futures_bar(bar)
-                
-                # 2. Update BarStore (Futures only, for indicators)
-                for token, prefix in [(256265, "NIFTY"), (260105, "BN")]:
-                     if f"{prefix}_close" in bar.index:
-                         vol = bar[f"{prefix}_volume"]
-                         self.engine.bars.add_tick({
-                             "instrument_token": token,
-                             "exchange_timestamp": bar.Index,
-                             "last_price": bar[f"{prefix}_close"],
-                             "last_traded_quantity": vol / 10 if vol > 10 else 1,
-                         })
-
-                # 3. Run "Brain" - Phase 1 (Regime & IV)
-                self.engine.run_regime_classification(bar.Index)
-                self.engine._update_atm_iv_cache() # CRITICAL: Update IV
-                
-                self._generate_synthetic_microstructure(bar)
-                
-                # 4. Run "Brain" - Phase 2 (Planner)
-                # This runs the REAL planner. It will call the
-                # SimulatedPriceBus to get on-the-fly option prices.
-                self.engine._run_strategic_planner()
-                
-                # 5. Update Option Bars for TSL
-                # This feeds the *estimated* option OHLC to the BarStore
-                # so the PositionManager can calculate TSL.
-                self.pos_manager.update_option_bars_for_open_positions()
-                
-                # 6. Manage Open Trades (Check SL/TP)
-                self.pos_manager.manage_positions_backtest(bar.Index)
-                
-                # 7. Execute Queued Trades (Simulate Fills)
-                while not self.engine.trade_signal_queue.empty():
-                    try:
-                        trade_params = self.engine.trade_signal_queue.get_nowait()
-                        self.trader.open_position(trade_params)
-                    except Empty:
-                        break
-                
-                # 8. Update PnL for RiskManager
-                self.risk_manager.last_unrealized_pnl = self.trader.unrealized_pnl()
-
-            except Exception as e:
-                L.error(f"Error on bar {bar.Index}: {e}", exc_info=True)
-                
-            if i % 1000 == 0 and i > 0:
-                L.info(f"Processed {i} bars... Current PnL: {self.trader.daily_realized_pnl:.2f}")
-
-        L.info("--- BACKTEST RUN COMPLETE ---")
-        self.generate_report()
-
-    def generate_report(self, return_metrics: bool = False): # <-- MODIFIED
-        """Prints a final PnL and trade summary."""
-        L.info("--- Backtest Report ---")
-        
-        if not self.trader.closed_trades_log:
-            L.warning("No trades were executed.")
-            if return_metrics: # <-- ADDED
-                return {"total_pnl": 0, "total_trades": 0, "win_rate": 0, "profit_factor": 0}
-            return
-
-        df = pd.DataFrame(self.trader.closed_trades_log)
-        total_pnl = df['pnl'].sum()
-        total_trades = len(df)
-        wins = df[df['pnl'] > 0]
-        losses = df[df['pnl'] <= 0]
-        
-        win_rate = (len(wins) / total_trades) * 100 if total_trades > 0 else 0
-        avg_win = wins['pnl'].mean() if len(wins) > 0 else 0
-        avg_loss = losses['pnl'].mean() if len(losses) > 0 else 0
-        
-        total_loss = losses['pnl'].sum()
-        total_win = wins['pnl'].sum()
-        profit_factor = abs(total_win / total_loss) if total_loss != 0 else float('inf')
-        
-        print("\n" + "="*30)
-        print("PERFORMANCE SUMMARY")
-        print("="*30)
-        print(f"Total Net PnL:     {total_pnl:,.2f}")
-        print(f"Total Trades:      {total_trades}")
-        print(f"Win Rate:          {win_rate:.2f}%")
-        print(f"Profit Factor:     {profit_factor:.2f}")
-        print(f"Average Win:       {avg_win:,.2f}")
-        print(f"Average Loss:      {avg_loss:,.2f}")
-        
-        print("\n" + "="*30)
-        print("PNL BY STRATEGY")
-        print("="*30)
-        print(df.groupby('strategy')['pnl'].sum())
-        
-        print("\n" + "="*30)
-        print("PNL BY REGIME")
-        print("="*30)
-        print(df.groupby('regime')['pnl'].sum())
-        
-        if return_metrics:
-            return {
-                "total_pnl": total_pnl,
-                "total_trades": total_trades,
-                "win_rate": win_rate,
-                "profit_factor": profit_factor
-            }
-        
-        # Plotting (optional, but very useful)
-        try:
-            import matplotlib.pyplot as plt
-            df.set_index('exit_time')['pnl'].cumsum().plot(title='Cumulative PnL Over Time', grid=True)
-            plt.show()
-        except ImportError:
-            L.info("Install `matplotlib` to see a PnL equity curve.")
-
-# ==================================================================================================
-# --- 6. MAIN EXECUTION SCRIPT ---
-# ==================================================================================================
-
-if __name__ == "__main__":
-    CONFIG_FILE = "config.json"
+def optuna_search(n_trials: int, df_1min_s: pd.DataFrame, df_1min_raw: pd.DataFrame, 
+                  df_3min_s: pd.DataFrame, score_metric: str, output_dir: str):
+    print(f"\n  Optuna Search: {n_trials} trials maximizing '{score_metric}' …")
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
     
-    # --- !!! YOU MUST CREATE THIS FILE !!! ---
-    # This CSV needs to have (at minimum):
-    # timestamp,NIFTY_open,NIFTY_high,NIFTY_low,NIFTY_close,NIFTY_volume,BN_open,...
-    HISTORICAL_DATA_FILE = "historical_data.csv"
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42, multivariate=True))
+    study.optimize(
+        lambda trial: optuna_objective(trial, FIXED_PARAMS, df_1min_s, df_1min_raw, df_3min_s, score_metric),
+        n_trials=n_trials, show_progress_bar=True, n_jobs=1
+    )
     
-    # You will also need the 'instruments_nfo.csv' file in your 'PERSIST_DIR'
+    best = study.best_params
+    best.update(FIXED_PARAMS)
     
-    L.info("Starting High-Fidelity Backtester...")
+    print(f"\n  ✅ Optuna Complete | Best {score_metric}: {study.best_value:.3f}")
+    print(f"  Best Params:\n{json.dumps({k: round(v,4) for k,v in study.best_params.items()}, indent=4)}")
+    
+    tune_df = study.trials_dataframe()
+    tune_df = tune_df.rename(columns={'value': 'score'})
+    tune_df.columns =[col.replace('params_', '') for col in tune_df.columns]
     
     try:
-        backtester = BacktestEngine(
-            config_path=CONFIG_FILE,
-            historical_data_path=HISTORICAL_DATA_FILE
-        )
-        backtester.run_backtest()
-        
-    except FileNotFoundError as e:
-        L.critical(f"CRITICAL: Could not find file: {e.filename}")
-        L.critical(f"Please create {CONFIG_FILE}, {HISTORICAL_DATA_FILE}, and run `main1.py` to create `instruments_nfo.csv`")
+        fig_hist = plot_optimization_history(study)
+        fig_hist.figure.savefig(os.path.join(output_dir, 'optuna_history.png'), facecolor='#0d1117')
+        fig_imp = plot_param_importances(study)
+        fig_imp.figure.savefig(os.path.join(output_dir, 'optuna_importances.png'), facecolor='#0d1117')
+        print(f"  Optuna Insight Charts saved.")
     except Exception as e:
-        L.critical(f"An unhandled error occurred: {e}", exc_info=True)
+        pass # Visualizations can fail if backend constraints exist, we skip safely.
+
+    return best, tune_df
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 6 — CHARTS & EDA
+# ═════════════════════════════════════════════════════════════════════════════
+
+DARK = '#0d1117'; PANEL = '#161b22'; GREEN = '#39d353'; RED = '#f85149'
+BLUE = '#58a6ff'; ORANGE = '#e3b341'; PURPLE = '#bc8cff'; GRAY = '#8b949e'; TEXT = '#c9d1d9'
+
+def _sty(ax, title=''):
+    ax.set_facecolor(PANEL)
+    ax.tick_params(colors=GRAY, labelsize=8)
+    for sp in ax.spines.values(): sp.set_edgecolor('#30363d')
+    if title: ax.set_title(title, color=TEXT, fontsize=9, pad=6, fontweight='bold')
+    ax.grid(alpha=0.15, color=GRAY, lw=0.4)
+    ax.yaxis.label.set_color(GRAY); ax.xaxis.label.set_color(GRAY)
+
+def plot_backtest(df: pd.DataFrame, path: str):
+    if df.empty: return
+    m = compute_metrics(df)
+    pc = GREEN if m['total_pnl'] >= 0 else RED
+
+    fig = plt.figure(figsize=(24, 18), facecolor=DARK)
+    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.4, wspace=0.3, top=0.9, bottom=0.05, left=0.05, right=0.95)
+
+    fig.text(0.5, 0.95, f"NIFTY GAMMA SCALPING v2.0 | P&L: ₹{m['total_pnl']:,.0f} | Sharpe: {m['sharpe']:.2f} | Win: {m['win_rate']:.1f}%",
+             ha='center', color=pc, fontsize=14, fontweight='bold', fontfamily='monospace')
+
+    ax = fig.add_subplot(gs[0,:2])
+    cum = df['cumulative_pnl']
+    ax.plot(cum.values, color=pc, lw=1.8)
+    ax.fill_between(range(len(cum)), cum, where=cum>=0, color=GREEN, alpha=0.25)
+    ax.fill_between(range(len(cum)), cum, where=cum<0, color=RED, alpha=0.25)
+    _sty(ax, 'Cumulative P&L')
+
+    ax = fig.add_subplot(gs[0,2])
+    dd = cum - cum.cummax()
+    ax.plot(dd.values, color=RED, lw=0.8)
+    ax.fill_between(range(len(dd)), dd, color=RED, alpha=0.5)
+    _sty(ax, 'Drawdown')
+
+    ax = fig.add_subplot(gs[1,0])
+    pnl = df['realized_pnl'].values
+    ax.hist(pnl[pnl>=0], bins=30, color=GREEN, alpha=0.8)
+    ax.hist(pnl[pnl< 0], bins=30, color=RED,   alpha=0.8)
+    _sty(ax, 'P&L Distribution')
+
+    ax = fig.add_subplot(gs[1,1])
+    ax.scatter(df['straddle_pnl'], df['hedge_pnl'], c=df['realized_pnl'], cmap='RdYlGn', s=20, alpha=0.7)
+    _sty(ax, 'Straddle vs Hedge P&L')
+
+    ax = fig.add_subplot(gs[1,2])
+    ec = df['exit_reason'].value_counts()
+    ax.pie(ec.values, labels=ec.index, colors=[GREEN, ORANGE, RED, BLUE, PURPLE, GRAY, TEXT], 
+           autopct='%1.0f%%', textprops={'color': TEXT, 'fontsize': 8})
+    ax.set_title('Exit Reasons', color=TEXT)
+
+    plt.savefig(path, dpi=150, bbox_inches='tight', facecolor=DARK)
+    print(f"  Backtest Report saved → {path}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  SECTION 7 — MAIN ORCHESTRATOR
+# ═════════════════════════════════════════════════════════════════════════════
+
+def resample_to_3min(raw_1min: pd.DataFrame) -> pd.DataFrame:
+    raw_1min = raw_1min.copy().set_index('datetime')
+    groups = []
+    for (opt, off), grp in raw_1min.groupby(['option_type','strike_offset']):
+        r = grp[['open','high','low','close','volume','oi','iv','spot']].resample('3T').agg({
+            'open':'first','high':'max','low':'min','close':'last',
+            'volume':'sum','oi':'last','iv':'last','spot':'last'
+        }).dropna(subset=['close'])
+        r['option_type'], r['strike_offset'], r['_offset_num'] = opt, off, _parse_offset(off)
+        groups.append(r)
+    return pd.concat(groups).reset_index().rename(columns={'index':'datetime'}).sort_values('datetime').reset_index(drop=True)
+
+def run_full_pipeline(data_1min_folder=DATA_1MIN, data_3min_folder=DATA_3MIN, output_dir=OUTPUT_DIR,
+                      params=None, run_tuning=False, tuning_trials=100, score_metric='sharpe'):
+    
+    os.makedirs(output_dir, exist_ok=True)
+    p = params or PARAMS
+
+    raw_1min = load_files(data_1min_folder, '1MIN')
+    raw_1min = clean_strikes(raw_1min, keep_range=3)
+
+    try:
+        raw_3min = load_files(data_3min_folder, '3MIN')
+        raw_3min = clean_strikes(raw_3min, keep_range=3)
+    except FileNotFoundError:
+        print("  ⚠ 3MIN folder not found — resampling 1MIN to 3MIN …")
+        raw_3min = resample_to_3min(raw_1min)
+
+    print(f"\n{'═'*62}\n  BUILDING ATM STRADDLES\n{'═'*62}")
+    straddle_1min = build_straddle(raw_1min)
+    straddle_3min = build_straddle(raw_3min)
+
+    print(f"\n{'═'*62}\n  GENERATING SIGNALS\n{'═'*62}")
+    sig_1min = generate_signals(straddle_1min, p)
+    sig_3min = generate_signals(straddle_3min, p)
+
+    if run_tuning:
+        best_p, tune_df = optuna_search(tuning_trials, sig_1min, raw_1min, sig_3min, score_metric, output_dir)
+        tune_df.to_csv(os.path.join(output_dir, 'optuna_trials.csv'), index=False)
+        p = best_p
+        with open(os.path.join(output_dir, 'optuna_best_params.json'), 'w') as f:
+            json.dump({k: float(v) if isinstance(v, (np.floating, float)) else v for k, v in p.items()}, f, indent=4)
+
+    print(f"\n{'═'*62}\n  RUNNING FINAL BACKTEST\n{'═'*62}")
+    sig_final = generate_signals(straddle_1min, p)
+    trades_df = run_backtest(sig_final, raw_1min, sig_3min, p, verbose=True)
+
+    if not trades_df.empty:
+        trades_df.to_csv(os.path.join(output_dir, 'gamma_scalp_trades_v2.csv'), index=False)
+        plot_backtest(trades_df, os.path.join(output_dir, 'gamma_scalp_backtest_v2.png'))
+        
+        m = compute_metrics(trades_df)
+        print(f"\n{'═'*62}\n  FINAL PERFORMANCE METRICS\n{'═'*62}")
+        for k, v in m.items(): print(f"  {k:<22} : {v:>12.2f}" if isinstance(v, float) else f"  {k:<22} : {v:>12}")
+
+    return trades_df, sig_final, p
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ENTRY POINT
+# ═════════════════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+    trades_df, signals, final_params = run_full_pipeline(
+        data_1min_folder = DATA_1MIN,
+        data_3min_folder = DATA_3MIN,
+        output_dir       = OUTPUT_DIR,
+        params           = PARAMS,
+        run_tuning       = True,      # ← Triggers Optuna
+        tuning_trials    = 100,       # ← 100 trials is recommended for TPE to learn effectively
+        score_metric     = 'sharpe',  # ← Maximize the Sharpe Ratio
+    )

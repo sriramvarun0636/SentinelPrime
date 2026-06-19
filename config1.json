@@ -1,0 +1,204 @@
+{
+  "trading": {
+    "paper_trading": true,
+    "account_equity": 100000.0,
+    "max_concurrent_trades": 1,
+    "trade_cooldown_minutes": 3,
+    "commission_per_lot": 60.0,
+    "risk_tiers": {
+      "standard": 2.4,
+      "aggressive": 3.5,
+      "defensive": 1.0
+    },
+    "max_lots_per_trade": 2,
+    "max_daily_drawdown_pct": 5.0,
+    "weekly_drawdown_pct_limit": 12.0,
+    "max_sl_pct_of_premium": 30.0,
+    "consecutive_loss_adjustment": {
+      "reduction_per_loss": 0.2,
+      "min_factor": 0.2
+    },
+    "vix_adjustment": {
+      "low_threshold": 11.0,
+      "low_factor": 1.0,
+      "high_threshold": 20.0,
+      "high_factor": 0.6
+    },
+    "profit_lock_in": {
+      "min_profit_trigger": 3000.0,
+      "pct_to_risk": 40.0
+    },
+    "expiry_day_protocol_active": true,
+    "expiry_day_risk_reduction_factor": 0.6,
+    "chaos_risk_reduction_factor": 0.4,
+    "strategy_perf_lookback_days": 7,
+    "strategy_weight_min": 0.5,
+    "strategy_weight_max": 2.0,
+    "time_of_day_risk": {
+      "opening_range": "09:15:00",
+      "opening_end": "09:45:00",
+      "opening_multiplier": 1.0,
+      "midday_range": "11:30:00",
+      "midday_end": "13:00:00",
+      "midday_multiplier": 0.4,
+      "default_multiplier": 1.0
+    },
+    "min_trade_score": 2.2,
+    "standard_trade_score": 3.0,
+    "paper_trade_slippage_ticks": 2,
+    "sl_slippage_factor_pct": 1.5,
+    "adaptive_entry_stage2_ms": 250,
+    "adaptive_entry_stage3_ms": 800,
+    "momentum_slippage_tolerance_pct": 1.2,
+    "min_option_price": 45.0,
+    "max_bid_ask_spread_pct": 1.0,
+    "option_selection_filters": {
+      "min_option_volume": 75000,
+      "min_option_oi": 300000,
+      "max_iv_rank_entry": 65.0,
+      "min_dist_from_oi_wall_pct": 0.002
+    },
+    "strike_selection": {
+      "expiry_delta": 0.55,
+      "expiry_week_delta": 0.50,
+      "trend_delta": 0.45,
+      "chop_delta": 0.60,
+      "compression_delta": 0.55
+    },
+    "scale_out_rules": [
+      {
+        "rr_target": 2.0,
+        "pct_to_close": 50
+      },
+      {
+        "rr_target": 4.0,
+        "pct_to_close": 50
+      }
+    ],
+    "trailing_sl_activation_rr": 1.8,
+    "trailing_sl": {
+      "timeframe": 3,
+      "timeframe_scaled_out": 5,
+      "chandelier_period": 10,
+      "chandelier_multiplier": 2.0,
+      "chandelier_multiplier_scaled_out": 3.0
+    },
+    "trade_management": {
+      "trailing_stop_stages": [
+        {
+          "rr_target": 1.8,
+          "trail_behind_rr": 0.4
+        },
+        {
+          "rr_target": 3.0,
+          "trail_behind_rr": 0.8
+        }
+      ],
+      "velocity_trigger": {
+        "lookback_seconds": 4,
+        "time_to_sl_threshold_seconds": 1.5
+      }
+    },
+    "portfolio_limits": {
+      "max_portfolio_net_delta": 200,
+      "max_portfolio_net_vega": 3000,
+      "max_portfolio_negative_theta": 2000
+    },
+    "pnl_discrepancy_alert_threshold_rupees": 300.0,
+    "pnl_discrepancy_critical_threshold": 1500.0,
+    "low_regime_confidence_threshold": 0.50,
+    "high_regime_flip_rate_threshold": 5,
+    "regime_confidence_sizing_floor": 0.5,
+    "regime_confidence_sizing_cap": 1.5,
+    "activate_theta_filter": true,
+    "theta_filter_iv_rank_threshold": 30.0
+  },
+  "timings": {
+    "market_open": "09:15:00",
+    "market_settling_time": "09:16:30",
+    "final_entry_time": "15:00:00",
+    "final_expiry_entry_time": "14:30:00",
+    "eod_flatten_time": "15:10:00",
+    "market_close": "15:30:00"
+  },
+  "strategies": {
+    "regime_classifier": {
+      "resample_minutes": 5,
+      "bb_period": 20,
+      "adx_period": 14,
+      "dynamic_regime_lookback": 150,
+      "hysteresis_confirmation_count": 2,
+      "vix_chaos_threshold": 17.0,
+      "vix_spike_ma_period": 15,
+      "vix_spike_multiplier": 1.2,
+      "compression_rank_threshold_pct": 15.0,
+      "adx_trend_entry_percentile": 60.0,
+      "adx_trend_exit_percentile": 55.0,
+      "atr_expansion_percentile": 75.0,
+      "correlation_period": 30,
+      "correlation_threshold": 0.5
+    },
+    "Leviathan": {
+      "resample_minutes": 5,
+      "squeeze_period": 20,
+      "bb_period": 20,
+      "squeeze_factor": 0.0,
+      "volume_factor": 1.1,
+      "atr_sl_multiplier": 1.0,
+      "atr_tp_multiplier": 3.5,
+      "max_duration_minutes": 60
+    },
+    "TrendPullback": {
+      "primary_tf": 5,
+      "confirm_tf": 15,
+      "ema_period": 20,
+      "atr_sl_multiplier": 1.2,
+      "atr_tp_multiplier": 2.5,
+      "max_duration_minutes": 90
+    },
+    "Slingshot": {
+      "atr_sl_multiplier": 1.0,
+      "atr_tp_multiplier": 3.0,
+      "max_duration_minutes": 45
+    }
+  },
+  "technical": {
+    "warmup_days": 7,
+    "insane_tick_pct": 5.0,
+    "nifty_50_constituents_file": "nifty50_tokens.json",
+    "breadth_score_threshold": 15,
+    "oi_unwind_threshold": -300000,
+    "volatility_filter": {
+      "hv_period": 10,
+      "iv_hv_spread_threshold_low": -0.04,
+      "iv_hv_spread_threshold_high": 0.10
+    },
+    "microstructure": {
+      "tfi_window": 100,
+      "persistence_window": 8,
+      "tfi_persistence_mean_threshold": 250,
+      "obi_persistence_threshold_pct": 65,
+      "delta_rsi_period": 14
+    },
+    "constituent_weights": {
+      "NIFTY": {
+        "HDFCBANK": 0.130,
+        "RELIANCE": 0.100,
+        "ICICIBANK": 0.075,
+        "INFY": 0.060,
+        "ITC": 0.035,
+        "TCS": 0.045
+      },
+      "BANKNIFTY": {
+        "HDFCBANK": 0.285,
+        "ICICIBANK": 0.200,
+        "SBIN": 0.110,
+        "AXISBANK": 0.090,
+        "KOTAKBANK": 0.075
+      }
+    },
+    "iv_contraction_lookback": 150,
+    "iv_contraction_threshold_pct": 12,
+    "metrics_port": 9095
+  }
+}
