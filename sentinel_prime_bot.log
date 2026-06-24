@@ -1,3 +1,0 @@
-2026-06-19 23:54:48.501 INFO MainThread root: Loading configuration from: config.json
-2026-06-19 23:54:48.501 WARNING MainThread SENTINEL-PRIME: --- PAPER TRADING MODE IS ENABLED ---
-2026-06-19 23:54:48.501 INFO MainThread SENTINEL-PRIME: No valid access token found. Starting new login flow.
